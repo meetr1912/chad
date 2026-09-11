@@ -8,9 +8,13 @@
 > *Coding under supervision.*
 
 chad is a single-user coding agent that runs entirely on an Apple Silicon Mac via
-[MLX](https://github.com/ml-explore/mlx). One 27B model and no API key. Every other 
-harness assumes a datacenter on the other end of a socket; chad assumes a laptop, 
-and the whole design falls out of that. (Not affiliated with Anthropic.)
+[MLX](https://github.com/ml-explore/mlx). One 27B model and no API key. (Not affiliated
+with Anthropic.)
+
+Plenty of harnesses run local models now, and [pi](https://pi.dev) is a fantastic default
+for the same reason llama.cpp is: it works with everything. I was steering chad in the
+opposite direction. One model and one set of silicon, taken to the max. Swap out your
+`CHAD_MODEL` and it still runs, you just leave the drafter and the kernels behind.
 
 ## Try it
 
@@ -38,8 +42,8 @@ The PyPI package is `chad-code`. Bare `chad` is an unrelated squatted package.
 
 ## Same model, same Mac, stock engine
 
-The question worth answering: what do you gain over pointing a generic local-model tool at
-the same weights? Qwen3.8-27B at the same `UD-Q3_K_XL` recipe (Unsloth's GGUF for
+What do you gain over pointing a generic local-model tool at the same weights?
+Qwen3.8-27B at the same `UD-Q3_K_XL` recipe (Unsloth's GGUF for
 llama.cpp, chad's MLX conversion of the same bit map), the same M4 Pro (24 GB), one engine
 resident at a time, each measured with its own benchmark on a 512-token prompt and a
 128-token generation.
@@ -52,16 +56,15 @@ resident at a time, each measured with its own benchmark on a 512-token prompt a
 | **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
 | **chad**, default | 98 tok/s | **62 tok/s**¹ | DFlash2 block drafter |
 
-A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 62. That is the
-difference between a batch job and a pair programmer, and closing it is what the project is
-for.
+A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 62. You wait for
+the first one and you talk to the second.
 
 Ollama does not get its own row: it is llama.cpp underneath, measured without speculative
 decoding, and on the same GGUF (0.32.15, Modelfile `FROM` only) it measures 96 tok/s
 prefill and the same **10.9** decode.
 
 ¹ 62 is a ceiling: `chad-bench`'s prompt is tiled code the drafter reads easily. Replayed
-against ten real mid-session contexts from `~/.chad/sessions` (12–19k tokens, tool results in
+against ten real mid-session contexts from `~/.chad/sessions` (12-19k tokens, tool results in
 place, 384-token decodes) the same engine measures **31.7 tok/s median / 21.4 floor** greedy
 against 14.8 serial, and **27.6 / 17.7** thinking against 13.9. That ~2× is what a session
 lives at.
@@ -80,17 +83,17 @@ committed under [`benchmarks/stock/_runs/`](benchmarks/stock/); reproduce them w
 chad owns its inference loop instead of talking to a server, and the engine is fitted to the
 one checkpoint it ships:
 
-- **DFlash2 block speculation.** A bundled 1.9B drafter ([z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2),
+- DFlash2 block speculation. A bundled 1.9B drafter ([z-lab's DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2),
   ported to MLX and quantized) proposes a whole block of tokens from the main model's own
   hidden states. The main model verifies the block in one batched forward, and exact
   rejection sampling keeps every emitted token the model's own.
-- **A persistent prefix KV cache.** The transcript is kept a strict token-prefix of the live
+- A persistent prefix KV cache. The transcript is kept a strict token-prefix of the live
   cache, so a follow-up step prefills the ~16 tokens it appended instead of the 5,000 it
   already read: **~0.75 s per step instead of ~50 s**. Any server with prompt caching gets
   the easy case; the work is holding it true across compaction, truncated turns and restarts.
   The system prefix is checkpointed to disk, so the second session anywhere starts warm
   (75.6 s → 5.5 s to the first tool call).
-- **Fused Metal kernels.** Quantized-KV attention, a small-M matmul for speculative verify,
+- Fused Metal kernels. Quantized-KV attention, a small-M matmul for speculative verify,
   and a compiled single-token layer step, chosen per machine at load time, no knobs.
 
 ## What chad gives up
@@ -116,16 +119,16 @@ budget; everything else is deliberately plain.
 
 `uv run chad` launches a full-screen terminal UI (built on prompt_toolkit):
 
-- **shift-tab cycles permission modes**: `normal` (confirm each bash/write/edit) →
+- shift-tab cycles permission modes: `normal` (confirm each bash/write/edit) →
   `auto-accept edits` (edits land silently, **terminal commands still ask**) → `yolo`
   (nothing asks) → `plan mode` (read-only: investigate and propose a numbered plan) → back.
-- **type-ahead message queue.** Keep typing while the agent works; messages run in order.
-- **ctrl-c interrupts the running turn** without killing the session. **↑prefilled /
+- Type-ahead message queue. Keep typing while the agent works; messages run in order.
+- ctrl-c interrupts the running turn without killing the session. **↑prefilled /
   ↓generated** token counts show an advancing **%** on an unavoidable full re-prefill, so it
   is never silent.
-- **`@file` / `@dir` mentions** and **`!command` shell passthrough.** Pull a file into
+- `@file` / `@dir` mentions and `!command` shell passthrough. Pull a file into
   context inline, or run a shell command without invoking the model.
-- **voice mode, all local.** `/speech`, then ctrl-t to talk: Parakeet-on-MLX transcribes into
+- Voice mode, all local. `/speech`, then ctrl-t to talk: Parakeet-on-MLX transcribes into
   the input box for you to review before Enter sends it, and replies are read aloud via macOS
   `say`. A word table teaches it your identifiers. Needs the `speech` extra
   ([details](docs/configuration.md#voice-mode-speech)).
@@ -190,7 +193,7 @@ uv run chad "add a --json flag to main.py and update the tests"   # one-shot, he
 uv run chad -c               # resume this directory's last conversation
 ```
 
-**Optional extras.** Two features are opt-in because they pull deps not every install wants:
+Two features are opt-in because they pull deps not every install wants:
 `speech` (voice mode: a mic library, no torch) and `highlight` (syntax colour in diffs and
 previews). An extra rides on the install spec, not on a separate command, so how you add it
 depends on how you installed chad:
@@ -204,12 +207,12 @@ uv sync --extra speech                        # from a clone
 `/speech` in the TUI prints whichever of those matches your install, so you never have to
 work it out from here.
 
-**Upgrading** depends on how you installed: `uv tool upgrade chad-code`, `uvx --refresh
+Upgrading depends on how you installed: `uv tool upgrade chad-code`, `uvx --refresh
 chad-code`, or `git pull && uv sync` for a clone. What changed lands in
 [`CHANGELOG.md`](CHANGELOG.md). Model weights are versioned separately, so a code upgrade
 never re-downloads the model.
 
-**Development.** `uv sync` once, then `uv run pytest -q`. The fast unit gate loads **no model
+For development, `uv sync` once, then `uv run pytest -q`. The fast unit gate loads **no model
 weights**, runs in seconds, and is what CI runs. For throughput on your own machine, use
 `uv run chad-bench` (see [Throughput & performance](docs/benchmarks.md)).
 
@@ -217,11 +220,11 @@ weights**, runs in seconds, and is what CI runs. For throughput on your own mach
 
 chad speaks the same two extension formats as Claude Code:
 
-- **[Agent Skills](https://agentskills.io).** Drop a `SKILL.md` folder in
+- [Agent Skills](https://agentskills.io). Drop a `SKILL.md` folder in
   `./.claude/skills/` and it becomes a slash command: `/ship`, `/investigate the flaky test`.
   Skills cost nothing until you run one, because chad puts no skill catalog in the system
   prompt.
-- **[MCP servers](https://modelcontextprotocol.io).** Configure stdio or HTTP servers in
+- [MCP servers](https://modelcontextprotocol.io). Configure stdio or HTTP servers in
   `./.mcp.json` to expose external tools (GitHub, Postgres, Linear, Slack, …) alongside
   chad's builtins, with static-token and OAuth auth.
 
@@ -229,16 +232,16 @@ Both are covered in full in the [Configuration reference](docs/configuration.md)
 
 ## Documentation
 
-- **[Design & internals](docs/design.md)** covers why prefill is the bill, the persistent
+- [Design & internals](docs/design.md) covers why prefill is the bill, the persistent
   prefix cache, the trimmable/append-only trade, why the tool surface is five tools, and the
   ideas borrowed from other agents.
-- **[Throughput & performance](docs/benchmarks.md)** has the prefill, decode and warm-step
+- [Throughput & performance](docs/benchmarks.md) has the prefill, decode and warm-step
   numbers you can reproduce with `chad-bench`, the stock-engine comparison, and what the
   cross-session warm start is worth.
-- **[Configuration reference](docs/configuration.md)** documents Agent Skills, MCP servers,
+- [Configuration reference](docs/configuration.md) documents Agent Skills, MCP servers,
   the context window, every environment variable, and the safety opt-outs.
-- **[Troubleshooting](docs/troubleshooting.md)** is the symptom→knob map for when a session
+- [Troubleshooting](docs/troubleshooting.md) maps symptoms to knobs for when a session
   rambles, loops, or slows.
-- **[Contributing](CONTRIBUTING.md)** says what lands easily and what needs a conversation
+- [Contributing](CONTRIBUTING.md) says what lands easily and what needs a conversation
   first.
 

@@ -7,18 +7,17 @@
 
 Two ideas hold this design up.
 
-**Context is not free, and prefill is the bill.** This is the engine half, and the reason
+Context is not free, and prefill is the bill. That is the engine half, and the reason
 chad owns its inference loop instead of talking to a server.
 
-**The model already knows more than the harness can teach it.** This is the harness half,
+The model already knows more than the harness can teach it. That is the harness half,
 and the reason 2.0.0 is *smaller* than 1.x. A registry of ~56 behavioral levers and a much
 larger bespoke tool surface were measured against a bare model-plus-shell loop, repeatedly,
 and did not beat it. What shipped instead is five tools, ten result-channel behaviors, and a
 shell the model learned in pretraining ([below](#why-the-tool-surface-is-five-tools)).
 
 They meet in the same place. Every tool you add and every lever you teach is prompt tokens
-the model re-reads on every turn, and prefill is what you pay for them. A harness that earns
-its context is also a faster one.
+the model re-reads on every turn, and prefill is what you pay for them.
 
 ### Context is not free, and prefill is the bill
 
@@ -32,9 +31,9 @@ output to the transcript, so a naive backend re-reads an ever-longer prompt *eve
 That is O(n) work per step and O(n²) over a session.
 
 Concretely, on a 24 GB M4 Pro: by step 20 a real coding session is ~5,000 tokens of
-transcript, which the shipped 27B prefills in **~50 s** (~99 tok/s, because a dense model
+transcript, which the shipped 27B prefills in ~50 s (~99 tok/s, because a dense model
 reads every one of its parameters for every token of the prompt). Re-reading that every step
-is **most of a minute of dead air before the model says anything**, and it grows faster than
+is most of a minute of dead air before the model says anything, and it grows faster than
 linearly, since the prefill *rate* also falls as the prompt lengthens. Over a 40-step task,
 prefill rather than generation is where the hours vanish.
 
@@ -50,8 +49,8 @@ step N prompt:  [ system + tools | cwd · CLAUDE.md | turn 1 | … | turn N-1 | 
 
 Same session, a couple of dozen new tokens per step instead of 5,000: **under a second of
 prefill per step instead of ~50 s** (measured warm step: ~0.75 s for 16 appended tokens).
-That ~67× gap is the entire reason a 27B model on a laptop can feel like an agent instead of
-a batch job, and it *widens* with the transcript, since the cache-less side grows while the
+That ~67× gap is why a 27B model on a laptop answers in seconds, and it *widens*
+with the transcript, since the cache-less side grows while the
 warm step stays flat. The numbers are in
 [benchmarks](benchmarks.md#the-agentic-loop-win-075-s-per-step-not-50-s).
 
@@ -60,11 +59,11 @@ warm step stays flat. The numbers are in
 The cache only helps if the new prompt is a strict *extension* of the cached one. Two
 things fight that, and chad handles both:
 
-- **Compaction.** Long sessions overflow the context window, so old tool output must be
+- Compaction. Long sessions overflow the context window, so old tool output must be
   trimmed, which changes the prefix and would normally throw the whole cache away. chad
   compacts oldest-first and reclaims enough in a single pass that it won't re-trigger next
   step (see [Context window](configuration.md#context-window-agentic-coding-needs-room)).
-- **A non-trimmable cache.** The shipped model is a hybrid SSM/attention model: its recurrent
+- A non-trimmable cache. The shipped model is a hybrid SSM/attention model: its recurrent
   layers carry state that *can't be rewound to an arbitrary earlier token*. The cache can
   only grow by append, and any divergence forces a full rebuild. chad leans into that. It
   reuses by extension and keeps a disk-checkpointed copy of the stable system+tools prefix,
@@ -76,24 +75,23 @@ act like a coding agent.
 ## Why there's no model picker
 
 Every other local-agent harness leads with a model menu: 75-provider matrices, Ollama pulls,
-quant pickers. chad ships exactly one model and no flag to change it. That is a load-bearing
-wall, for three reasons:
+quant pickers. chad ships exactly one model and no flag to change it, for three reasons:
 
-1. **The engine is fitted to the model, and that fit is the product.** The DFlash2
+1. The engine is fitted to the model, and that fit is the product. The DFlash2
    drafter reads this checkpoint's residual stream at five specific layers; the fused
    quantized-KV attention kernel covers this attention shape; the small-M verify matmul
    is probed per weight shape at load; the context governor knows this model's bytes per
    token. Point the same engine at arbitrary weights and every one of those is either
    absent or wrong, which is why `--model` runs slower without breaking.
-2. **The engine co-design doesn't survive a server boundary.** The persistent prefix KV
+2. The engine co-design doesn't survive a server boundary. The persistent prefix KV
    cache diffs *token ids* against a live cache object, so it owns the tokenizer, the
    cache layout, and the model's hybrid SSM/attention non-trimmability trade
    ([above](#why-prefill-is-hard-as-well-as-expensive)). "Just let me pick a GGUF"
    means "run through a stateless server instead," and what that costs on the same
    weights is measured in [the stock-engine comparison](benchmarks.md#same-model-same-mac-stock-engine).
-3. **Zero decisions is the UX.** The target user comes from Claude Code, which also has no
-   model picker. One command, no decision, and it works. That is the experience being
-   copied, and every menu before the first task is a place to lose someone.
+3. Zero decisions is the UX. The target user comes from Claude Code, which also has no
+   model picker. One command and it works, and every menu before the first task is a
+   place to lose someone.
 
 The escape hatches exist and are honest about what they cost: `--model <repo or
 local dir>` forces specific weights through the same in-process engine (you keep the
@@ -117,18 +115,18 @@ A **pure-attention** transformer is trimmable. Each token's K/V is computed inde
 and stored in its own row, so "rewind to token *k*" is just "discard the rows past *k*."
 That cheap rewind unlocks two things that matter on a laptop:
 
-- **Prompt-lookup / speculative decoding (PLD).** Propose a draft continuation (an n-gram
+- Prompt-lookup / speculative decoding (PLD). Propose a draft continuation (an n-gram
   the model is about to re-quote from context), verify the whole run in one batched
   forward, and on a partial reject *roll the cache back* to the last accepted token. That
-  rollback **is** a trim. With no trim, every rejected draft costs a full re-prefill. On
+  rollback *is* a trim. With no trim, every rejected draft costs a full re-prefill. On
   novel-text-heavy generation that re-feed overhead makes the hybrid path measurably
   *slower* than just decoding, so PLD is the wrong trade without trimmability.
-- **Partial reuse on divergence.** When a new prompt diverges from the cache mid-stream
+- Partial reuse on divergence. When a new prompt diverges from the cache mid-stream
   (compaction trimmed an old tool output, or an edit changed something in the middle) a
   trimmable cache keeps the common prefix and re-prefills only from the divergence point.
   Append-only can't: any divergence is a full rebuild.
 
-**The shipped model is not trimmable.** It's a hybrid SSM/attention (`qwen3_5`) model, and its
+The shipped model is not trimmable. It's a hybrid SSM/attention (`qwen3_5`) model, and its
 recurrent layers carry a *fixed-size running state that is a function of the entire
 sequence so far*. There's no per-token row to drop, so there's nothing to rewind to;
 `cache_utils.can_trim_prompt_cache` reports false and `engine._trimmable` stays off. PLD is
@@ -140,21 +138,21 @@ matter how long the context grows; see the
 trimmability for a memory profile that fits comfortably in 24 GB. The job, then, is to stay
 fast on an **append-only** cache, which chad does three ways:
 
-1. **Reuse by *extension* only.** The normal agentic loop only ever *appends* (the model's
+1. Reuse by *extension* only. The normal agentic loop only ever *appends* (the model's
    reply, the tool call, the tool output) so each new prompt is a strict extension of the
    cached one and hits the cache verbatim. That's the 99% case, and it's free.
-2. **Compaction that protects the prefix.** When the window fills, chad compacts
+2. Compaction that protects the prefix. When the window fills, chad compacts
    oldest-first and reclaims enough in one pass that it won't re-trigger next step, keeping
    recent turns byte-identical so the cache extension still holds.
-3. **A disk-checkpointed stable base.** The system+tools prefix (~3k tokens, the part that
+3. A disk-checkpointed stable base. The system+tools prefix (~3k tokens, the part that
    never changes turn to turn) is persisted to disk keyed by its rendered token ids, with
    the recurrent SSM state serialized (a fixed ~51 MB floor). On a cold start *or* a
-   divergence that can't be reused in RAM, that base reloads with **zero prefill** instead
+   divergence that can't be reused in RAM, that base reloads with zero prefill instead
    of being rebuilt from scratch. Two checkpoints serve it: the full prefix, which a restart
    in the same project restores outright, and its project-independent head (tool schemas +
    behavioral prompt), which any directory restores before prefilling only its own
    cwd/listing/docs tail. (Before 2.0.3 the key included that tail, so a new directory
-   never hit — the same volatile-string-in-the-prefix bug `benchmarks/matrix` found in
+   never hit, the same volatile-string-in-the-prefix bug `benchmarks/matrix` found in
    goose.)
 
 So where a trimmable model would lean on PLD and partial-prefix repair, chad leans on
@@ -175,24 +173,23 @@ landed inside the two-bare-arm null band.
 
 So the design leans into the route the model actually takes:
 
-- **The model already knows the unix toolbox.** `rg`, `sed -n`, `wc -l` and the project's
+- The model already knows the unix toolbox. `rg`, `sed -n`, `wc -l` and the project's
   own test runner are all in pretraining. Every chad-specific dialect had to be taught
   in-context, which costs prompt tokens and which the model then mostly declined to use.
-- **The harness's knowledge lives in the result channel, not in more tools**
-  (`ambient.py`). Ten levers, all ON and each ablatable via `CHAD_DISABLE`, make
+- The harness's knowledge lives in the result channel (`ambient.py`). Ten levers, all ON and each ablatable via `CHAD_DISABLE`, make
   the bash route more honest and more informative: a first read of a source file
   carries a one-line symbol map, an empty grep explains which pipeline stage came up
   empty, a trimmed test run keeps its failure rows verbatim, a failed edit shows the
   first character where the sent text diverges from the file, and anything the
   harness trims hands back a path to the full body instead of destroying it.
-- **One editor, exact-match.** `edit` (old → new, unique match) is the editing
+- One editor, exact-match. `edit` (old → new, unique match) is the editing
   dialect every model knows. It recovers mechanically from the two dominant near-misses
   (literal `\n` escapes, indentation drift) without ever risking a wrong edit, because each
   recovery still requires a unique match.
 
 A sixth tool was built and measured, and did not survive it:
 
-- **Ranked retrieval was the one primitive `bash` appeared to lack.** `rg` answers
+- Ranked retrieval was the one primitive `bash` appeared to lack. `rg` answers
   "find this exact string" and is unbeatable at it; it cannot answer "where is FHIR
   validation handled?" without the model guessing several synonymous regexes, paying
   a round trip per miss. A BM25 index over the repo (Tantivy, one document per file)
@@ -200,13 +197,13 @@ A sixth tool was built and measured, and did not survive it:
   recall@20 26/26 and MRR 0.59, so the right file was essentially always retrieved.
 
   It still lost its slot. On a paired agent benchmark (same model, same tasks, same corpus,
-  arms differing only in whether the tool existed) success was **6/6 in both
-  arms**, time to the first answer-bearing result moved **+1.1% (flat)**, and tool-result
-  context went **+27.6%**. Discovery calls fell on the median (4.0 → 2.5) but that was
+  arms differing only in whether the tool existed) success was 6/6 in both
+  arms, time to the first answer-bearing result moved +1.1% (flat), and tool-result
+  context went +27.6%. Discovery calls fell on the median (4.0 → 2.5) but that was
   carried by a single task; on three of six the model ran a search *and* the same greps
-  it would have run anyway, and on one it had the tool and never called it. Retrieval
-  quality was never the problem: the model reaches for the shell because that is what its
-  prior does, and a tool it half-adopts is pure context cost. The tool is gone. The
+  it would have run anyway, and on one it had the tool and never called it. Ranking
+  quality was fine; the model reaches for the shell because that is what its prior does,
+  and a tool it half-adopts is pure context cost, so the tool is gone. The
   measurement is kept in `benchmarks/search/` as the record of why, with the paired rows
   under `_runs/`. It is a record rather than a live harness: `rank.py` and `measure.py`
   import the `chad.search` module that went with the tool, so they no longer run against
@@ -236,56 +233,56 @@ cli.py ──▶ agent.py (agentic loop + guardrails) ──▶ engine.py (MLX +
                  └─ ambient.py (what the result channel adds back)
 ```
 
-- **engine.py** loads the model once, keeps its KV cache alive across turns, and on every
+- engine.py loads the model once, keeps its KV cache alive across turns, and on every
   turn diffs the new prompt against the cached token ids so it only prefills the appended
   tokens. That's why multi-step tool loops stay snappy: re-rendering the whole transcript
-  each step prefills ~20–50 new tokens while 5000+ are served from cache.
-- **agent.py** renders the conversation through the model's chat template (with tool
+  each step prefills ~20-50 new tokens while 5000+ are served from cache.
+- agent.py renders the conversation through the model's chat template (with tool
   schemas), streams the turn, parses tool calls, runs them, feeds results back, and loops
   until the model stops calling tools.
-- **tools.py** holds the five-tool surface and its JSON schemas, plus the edit forgiveness
-  cascade. **ambient.py** wraps the results on the way back.
+- tools.py holds the five-tool surface and its JSON schemas, plus the edit forgiveness
+  cascade. `ambient.py` wraps the results on the way back.
 
-## What it borrows from the masters
+## What it borrows from other agents
 
-Small local models are flaky tool-callers, so the harness leans on hard-won ideas from
-existing agents:
+Small local models are flaky tool-callers, so the harness borrows from agents that
+solved the same problems:
 
 **[forge](https://github.com/antoinezambelli/forge):** a reliability layer for self-hosted tool-calling.
-- **Rescue parsing.** Accept `<tool_call>` XML, ```json fences, *and* bare JSON
+- Rescue parsing. Accept `<tool_call>` XML, ```json fences, *and* bare JSON
   objects. (Weaker local coders routinely emit fenced JSON instead of the templated XML.)
-- **Argument validation + nudge.** Missing required args get a corrective message the
+- Argument validation + nudge. Missing required args get a corrective message the
   model can retry against, instead of a crash.
-- **No-op guard.** An `edit` where `old == new` is rejected with an explanation.
-- **Edit recovery cascade.** Dogfooding showed ~1 in 6 `edit` calls missed on mechanical
+- No-op guard. An `edit` where `old == new` is rejected with an explanation.
+- Edit recovery cascade. Dogfooding showed ~1 in 6 `edit` calls missed on mechanical
   near-misses (the model emitting literal `\n`/`\t` in `old`, or indentation/trailing-ws
   drift). `tool_edit` now retries exact → escape-normalized → whitespace-flexible, each
   still requiring a *unique* target (never edits on ambiguity), and returns the closest
   line in the file on a true miss so the model self-corrects instead of looping. Guarded
   by `test_edit.py`, whose safety half asserts the converse: a wrong or ambiguous `old`
   must not change a byte.
-- **Loop guard.** Identical tool calls counted across the whole turn, not just
+- Loop guard. Identical tool calls counted across the whole turn, not just
   consecutively (so an alternating `sed -n A / sed -n B` cycle is caught too); 3rd
   repeat nudges, persistent looping aborts the turn cleanly instead of spinning forever.
 
 **[opencode](https://github.com/anomalyco/opencode) `beast` prompt:** making weaker models agentic.
-- **Persistence.** Keep going until the request is resolved; don't yield early.
-- **Verify by running,** and "when you say you'll call a tool, actually call it."
+- Persistence. Keep going until the request is resolved; don't yield early.
+- Verify by running, and "when you say you'll call a tool, actually call it."
 
 **[OpenHarness](https://github.com/HKUDS/OpenHarness):** base prompt structure.
 - Lead-with-the-answer tone, read-before-edit, don't over-engineer, and an injected
-  **environment section** (OS/shell/cwd).
-- One principle from this list 2.0.0 **inverted**: prefer dedicated tools over `bash`.
+  environment section (OS/shell/cwd).
+- One principle from this list 2.0.0 *inverted*: prefer dedicated tools over `bash`.
   chad has no dedicated tools left to prefer, and the prompt now says the opposite:
   `bash` is the primary tool ([above](#why-the-tool-surface-is-five-tools)).
 
 **[deepagents](https://github.com/langchain-ai/deepagents):** "batteries included".
-- **Planning tool** (`write_todos`). For any 2+ step task the model lays out a plan and
+- Planning tool (`write_todos`). For any 2+ step task the model lays out a plan and
   marks items `in_progress`/`completed`. The scaffold keeps a small model on-track and
   acting rather than narrating.
-- **Workspace snapshot.** The system prompt injects a listing of the project's files
+- Workspace snapshot. The system prompt injects a listing of the project's files
   (git-tracked or globbed) so the model knows it's in a real repo and explores it. This
   is what flipped the agent from "paste a generic rewrite into chat" to "grep → read →
   edit the actual file."
-- **Act-via-tools + verify-before-`done`.** A refactor must go read → edit → run tests;
+- Act-via-tools + verify-before-`done`. A refactor must go read → edit → run tests;
   the `done` tool is rejected if files were changed but nothing was run to verify them.

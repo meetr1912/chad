@@ -20,10 +20,10 @@ uv run chad-bench --agentic             # the cache-miss benchmark, below
 It drives the **real** `Engine` on the **real** model (`src/chad/bench.py`) and reports
 three things:
 
-1. **Prefill (cold).** How fast the model reads a fresh prompt. The bill a naive agentic
+1. Prefill (cold). How fast the model reads a fresh prompt. The bill a naive agentic
    loop pays *every step*.
-2. **Decode.** How fast it writes new tokens. Memory-bandwidth bound, roughly constant.
-3. **Warm step.** The agentic-loop number: how few tokens a *follow-up* turn has to prefill
+2. Decode. How fast it writes new tokens. Memory-bandwidth bound, roughly constant.
+3. Warm step. The agentic-loop number: how few tokens a *follow-up* turn has to prefill
    once the persistent prefix cache is warm. This is the whole point.
 
 ## Measured throughput (M4 Pro, 24 GB)
@@ -49,7 +49,7 @@ The default-row decode figure flatters the drafter: `chad-bench` tiles a block o
 drafter accepts nearly all of it, and a 128-token run is short. On real mid-session agent
 contexts the same engine measures ~2× serial rather than ~3×, and the
 [speculative-decoding tables](#two-throughput-levers) are the numbers a session lives at.
-The warm step varies 0.5–0.75 s run to run: 16 tokens of prefill plus the fixed cost of one
+The warm step varies 0.5-0.75 s run to run: 16 tokens of prefill plus the fixed cost of one
 forward.
 
 `--agentic` measures a different thing and is worth knowing about: it seeds a large context
@@ -97,16 +97,16 @@ same 512-token prompt `chad-bench` tiles; `llama-dflash` needs build 10658 or la
 (`STOCK_LLAMA_BIN` points at an unpacked release without touching a brew install). The measured rows are
 committed under `benchmarks/stock/_runs/`. How to read it:
 
-- **Prefill is a wash.** Both engines read a 512-token prompt at ~100 tok/s: a dense 27B
+- Prefill is a wash. Both engines read a 512-token prompt at ~100 tok/s: a dense 27B
   reads every parameter for every prompt token, and that is the chip's compute roofline,
   not anyone's tuning.
-- **Serial decode is the bandwidth wall, and the two rows sit on it differently.** The
+- Serial decode is the bandwidth wall, and the two rows sit on it differently. The
   MLX quant is ~12 GB resident against the GGUF's 13.1, and chad's serial step runs the
   fused single-token kernels described [below](#why-decode-sits-where-it-does):
   concatenated `gate|up` and `in_proj` matmuls, a compiled layer step. llama.cpp's serial
   step for this hybrid GatedDeltaNet/attention architecture was not profiled; the row says
   what a fitted engine buys on this checkpoint, not what llama.cpp can do in general.
-- **The drafter is the gap that matters, and what decides it is the verify pass.**
+- The drafter is the gap that matters, and what decides it is the verify pass.
   llama.cpp has run DFlash2 drafters since build 10658 (`--spec-type draft-dflash`), and
   the drafter is published in GGUF form (`incoai/Qwen3.8-27B-DFlash2-GGUF`, BF16 / Q8_0 /
   Q4_K_M). On this checkpoint it works as a drafter, 96.5% of drafted tokens accepted on
@@ -120,13 +120,13 @@ committed under `benchmarks/stock/_runs/`. How to read it:
   [below](#two-throughput-levers)), which is the difference between the two drafted rows.
   llama.cpp's DFlash2 PR reports ~1.8× on an M5 Pro with a Q4_K_M target, so this measures
   this GGUF on this Mac, not llama.cpp's DFlash2 in general.
-- **62 is a ceiling, not a session number.** `chad-bench` tiles a block of code, the
+- 62 is a ceiling, and a session runs slower. `chad-bench` tiles a block of code, the
   drafter accepts nearly all of it, and a 128-token run mostly measures the width
   schedule's opening regime. On real mid-session contexts the same engine measures 31.7
   tok/s median / 21.4 floor greedy and 27.6 / 17.7 at the thinking preset (the
   [speculative-decoding tables](#two-throughput-levers) below), which is ~2× serial and
   the number a session actually lives at.
-- **The per-step cost in an agent loop is what no single-shot benchmark shows.** Both
+- The per-step cost in an agent loop is what no single-shot benchmark shows. Both
   engines can reuse a prompt prefix; the difference is that chad keeps the transcript a
   strict token-prefix of the live cache *by construction*, across compaction and across
   sessions. That is the [next section](#the-agentic-loop-win-075-s-per-step-not-50-s).
@@ -175,13 +175,13 @@ spends over a minute reading a system prompt before it does anything you asked f
 prompt, cwd and workspace listing included, and a fresh directory could never hit it
 (`benchmarks/matrix` measured 32 of 32 fresh-directory cells missing, 24 s each; on 2.0.3
 three nights of the same grid have 47 of 48 restoring the head and prefilling a
-~320-token tail in 3.2–3.6 s). Now there are two checkpoints: the full prefix, which a restart in the same
+~320-token tail in 3.2-3.6 s). Now there are two checkpoints: the full prefix, which a restart in the same
 project restores outright, and its project-independent head (the tool schemas and
 behavioral prompt, most of the prefix), which any directory restores before prefilling
 only its own cwd/listing/docs tail.
 Both survive restarts and are invalidated exactly when the text they cache changes. The
-session banner's `[warm start: N prefix tokens from disk cache]` line — or
-`[…; M project tokens prefilled in S s]` for the head-only case — is chad telling you which
+session banner's `[warm start: N prefix tokens from disk cache]` line (or
+`[…; M project tokens prefilled in S s]` for the head-only case) is chad telling you which
 of these turns you are about to have.
 
 ## Why decode sits where it does
@@ -197,7 +197,7 @@ Inside the envelope, two things decide how close you get. Both were first measur
 retired 35B, whose sparse MoE made them unmissable; the *lessons* are what carried into
 2.0.0, and the code that serves them was rebuilt for the dense checkpoint.
 
-- **Dispatch cost is real, and work that removes kernels pays.** In-situ ablation of the
+- Dispatch cost is real, and work that removes kernels pays. In-situ ablation of the
   35B's decode step put bandwidth-minimal cost around 9 ms against ~14 ms real: the step
   issued roughly **400 Metal kernels per token**, each carrying ~9 µs of launch and gap
   latency. A step that is waiting on the command queue does not care how few bytes you
@@ -210,7 +210,7 @@ retired 35B, whose sparse MoE made them unmissable; the *lessons* are what carri
   Prefill deliberately keeps the stock op graph: the compiled kernels change bf16 rounding,
   and on a recurrent hybrid a prefill-side rounding change compounds across the whole
   transcript. `CHAD_NO_FASTPATH=1` is the A/B arm.
-- **Attention is a reuse problem, not a fetch problem.** Ablating the math out of the fused
+- Attention is a reuse problem. Ablating the math out of the fused
   quantized-KV kernel leaves it streaming at ~331 GB/s, already at this machine's measured
   roofline, with ~68% of its runtime spent on the GQA q-heads re-reading staged K/V out of
   threadgroup memory. That is why [`mlx_qsdpa.py`](../src/chad/mlx_qsdpa.py) has a
@@ -223,7 +223,7 @@ retired 35B, whose sparse MoE made them unmissable; the *lessons* are what carri
 
 The honest caveat, and the reason every number on this page is end-to-end rather than
 per-kernel: **isolated kernel speedups oversell badly.** The attention retile measured
-1.26–1.40× *on the kernel* and moved the whole decode step ~2%, because attention is only a
+1.26-1.40× *on the kernel* and moved the whole decode step ~2%, because attention is only a
 fifth of it. Trust steady-state `chad-bench` tok/s; don't extrapolate from a microbenchmark.
 
 You don't have to tune any of this. chad picks the fast configuration at startup. The
@@ -253,7 +253,7 @@ model flags to pick from; you just run `chad`.
 ## Two throughput levers
 
 **Thinking budget.** This is a reasoning model, and its `<think>` blocks dominate what it
-generates: measured on real agentic traces, **~62–66% of all generated tokens**. Because
+generates: measured on real agentic traces, **~62-66% of all generated tokens**. Because
 decode runs at a roughly fixed tok/s whatever it is writing, those tokens are pure
 wall-clock. `--no-think` (a per-turn toggle, or the flag) injects an empty think block and
 skips them, which is the most effective time-to-done lever on well-scoped agentic work.
@@ -272,15 +272,15 @@ an M4 Pro with the shipped quant (one load, same prompts, 384-token decodes):
 | sampling | serial | **DFlash2** |
 |---|---|---|
 | greedy | 17.5 tok/s | **60.1 (3.4×)** |
-| thinking preset (temp 1.0, top_p 0.95, top_k 20, the default) | 22.4 | **49–51** |
-| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | 23.7 | **52–54** |
+| thinking preset (temp 1.0, top_p 0.95, top_k 20, the default) | 22.4 | **49-51** |
+| non-thinking preset (temp 0.7, top_p 0.80, top_k 20) | 23.7 | **52-54** |
 
 Ten prompts (eight ~512-token prose seeds, two code continuations), 384-token decodes, medians,
 one load per run, on a 3-bit g64 quant of the same model. On prose the drafter lands ~8 tokens
 per round; code runs ~44 tok/s greedy. Those seeds are public-domain text the model has
 memorized, so they show the ceiling. **On real traffic** (`benchmarks/spec_decode.py`, ten
-mid-session contexts of 12–19k tokens replayed out of `~/.chad/sessions` with their tool
-results and schemas, 384-token decodes) acceptance inside `<think>` is 35–55% and the numbers
+mid-session contexts of 12-19k tokens replayed out of `~/.chad/sessions` with their tool
+results and schemas, 384-token decodes) acceptance inside `<think>` is 35-55% and the numbers
 are:
 
 | sampling (real contexts) | serial | schedule (default) | fixed full block |
