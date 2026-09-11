@@ -77,8 +77,8 @@ def _log_mlx_provenance() -> None:
     locally built one.
 
     Perf work on this repo has twice been measured against a patched local wheel
-    whose kernels no PyPI user receives (chad-code depends on `mlx>=0.32,<0.33`
-    from PyPI, and `uvx --from git+...` resolves fresh and ignores uv.lock). A
+    whose kernels no PyPI user receives (chad-code depends on mlx from PyPI, and
+    `uvx --from git+...` resolves fresh and ignores uv.lock). A
     local build shows up as a PEP 440 local version segment ('+<sha>'). Logging
     it means a throughput number can always be traced to the build that produced
     it, instead of silently describing a configuration we do not ship.
