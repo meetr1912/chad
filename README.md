@@ -46,7 +46,9 @@ resident at a time, each measured with its own benchmark on a 512-token prompt a
 
 | Engine | Prefill (512-tok prompt) | Decode (128 tok) | Speculative decoding |
 |---|---|---|---|
-| llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | none for this model |
+| llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | off in this benchmark |
+| llama.cpp `llama-server` (build 10917), serial | 97 tok/s | 11.3 tok/s | off |
+| llama.cpp `llama-server` (build 10917) | 95 tok/s | 11.1 tok/s² | DFlash2 drafter (Q4_K_M GGUF) |
 | **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
 | **chad**, default | 98 tok/s | **62 tok/s**¹ | DFlash2 block drafter |
 
@@ -54,16 +56,24 @@ A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 62. Th
 difference between a batch job and a pair programmer, and closing it is what the project is
 for.
 
-Ollama does not get its own row: it is llama.cpp underneath with no speculative decoding for
-this model, and on the same GGUF (0.32.15, Modelfile `FROM` only) it measures 96 tok/s
+Ollama does not get its own row: it is llama.cpp underneath, measured without speculative
+decoding, and on the same GGUF (0.32.15, Modelfile `FROM` only) it measures 96 tok/s
 prefill and the same **10.9** decode.
 
 ¹ 62 is a ceiling: `chad-bench`'s prompt is tiled code the drafter reads easily. Replayed
 against ten real mid-session contexts from `~/.chad/sessions` (12–19k tokens, tool results in
 place, 384-token decodes) the same engine measures **31.7 tok/s median / 21.4 floor** greedy
 against 14.8 serial, and **27.6 / 17.7** thinking against 13.9. That ~2× is what a session
-lives at. llama.cpp's Metal path for this hybrid architecture was not profiled, so read its
-row as what a fitted engine buys, not as a verdict on llama.cpp.
+lives at.
+
+² llama.cpp has run DFlash2 drafters since build 10658, and the drafter is published in GGUF
+form (`incoai/Qwen3.8-27B-DFlash2-GGUF`). On this checkpoint and this Mac it works as a
+drafter, 96.5% of drafted tokens accepted on the same prompt, and decodes no faster: a round
+verifies 8 tokens in one batch, and llama.cpp's Metal path reads that batch at 14.0 tok/s
+against 11.2 for a single token (`llama-bench` pp8 vs pp1), so the verify alone costs ~6.4
+serial steps and no acceptance rate can pay for it. llama.cpp's DFlash2 PR reports ~1.8× on an M5
+Pro with a Q4_K_M target, so read these rows as what a fitted engine buys on this checkpoint,
+not as a verdict on llama.cpp.
 
 Method, the longer runs and the caveats are in
 [Throughput & performance](docs/benchmarks.md#same-model-same-mac-stock-engine); the rows are

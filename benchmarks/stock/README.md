@@ -8,13 +8,19 @@ resident at a time, each measured with its own benchmark.
 
 ```bash
 brew install llama.cpp
-uv run python benchmarks/stock/stock.py llama     # llama-bench, pp512 / tg128
-uv run python benchmarks/stock/stock.py chad      # chad-bench, CHAD_NO_DFLASH=1 then default
-uv run python benchmarks/stock/stock.py table     # render _runs/*.json as markdown
+uv run python benchmarks/stock/stock.py llama         # llama-bench, pp512 / tg128
+uv run python benchmarks/stock/stock.py llama-dflash  # llama-server, serial then DFlash2 drafter
+uv run python benchmarks/stock/stock.py chad          # chad-bench, CHAD_NO_DFLASH=1 then default
+uv run python benchmarks/stock/stock.py table         # render _runs/*.json as markdown
 ```
 
-Ollama is not a separate arm — it runs llama.cpp's engine underneath, with no speculative
-decoding for this model. `_runs/ollama.json` is one hand-run measurement on the same GGUF
+`llama-dflash` needs a llama.cpp with DFlash2 (build 10658 or later). To run one without
+replacing a pinned brew install, unpack a release tarball and point `STOCK_LLAMA_BIN` at
+it; the drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF`, Q4_K_M) downloads on first use, or
+`STOCK_DRAFT=<path>` names one you have.
+
+Ollama is not a separate arm — it runs llama.cpp's engine underneath, and was measured
+without speculative decoding. `_runs/ollama.json` is one hand-run measurement on the same GGUF
 (0.32.15, `FROM`-only Modelfile, `num_ctx` 2048, temperature 0, `/api/generate` counters):
 96 / 10.9 tok/s, the llama.cpp decode number. No script arm: the import needs ~45 GB of
 scratch disk and shows nothing the llama.cpp row does not. Run the arms one at a time — each loads ~13 GB and a 24 GB box cannot hold two. The

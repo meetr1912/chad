@@ -84,12 +84,17 @@ because importing a GGUF into Ollama needs ~45 GB of scratch disk for nothing ne
 
 | Engine | Prefill (512-tok prompt) | Decode (128 tok) | Speculative decoding |
 |---|---|---|---|
-| llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | none for this model |
+| llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | off in this benchmark |
+| llama.cpp `llama-server` (build 10917), serial | 97 tok/s | 11.3 tok/s | off |
+| llama.cpp `llama-server` (build 10917) | 95 tok/s | 11.1 tok/s | DFlash2 drafter (Q4_K_M GGUF) |
 | **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
 | **chad**, default | 98 tok/s | **62 tok/s** | DFlash2 block drafter |
 
-Reproduce it with `uv run python benchmarks/stock/stock.py llama` and `… chad`, one arm at a
-time since each loads ~13 GB, then `… table` to render the rows. The measured rows are
+Reproduce it with `uv run python benchmarks/stock/stock.py llama`, `… llama-dflash` and
+`… chad`, one arm at a time since each loads ~13 GB, then `… table` to render the rows.
+The two `llama-server` rows are one build and one instrument, serial and drafted, on the
+same 512-token prompt `chad-bench` tiles; `llama-dflash` needs build 10658 or later
+(`STOCK_LLAMA_BIN` points at an unpacked release without touching a brew install). The measured rows are
 committed under `benchmarks/stock/_runs/`. How to read it:
 
 - **Prefill is a wash.** Both engines read a 512-token prompt at ~100 tok/s: a dense 27B
@@ -98,13 +103,23 @@ committed under `benchmarks/stock/_runs/`. How to read it:
 - **Serial decode is the bandwidth wall, and the two rows sit on it differently.** The
   MLX quant is ~12 GB resident against the GGUF's 13.1, and chad's serial step runs the
   fused single-token kernels described [below](#why-decode-sits-where-it-does):
-  concatenated `gate|up` and `in_proj` matmuls, a compiled layer step. llama.cpp's Metal
-  path for this hybrid GatedDeltaNet/attention architecture was not profiled; the row says
+  concatenated `gate|up` and `in_proj` matmuls, a compiled layer step. llama.cpp's serial
+  step for this hybrid GatedDeltaNet/attention architecture was not profiled; the row says
   what a fitted engine buys on this checkpoint, not what llama.cpp can do in general.
-- **The drafter is the gap that matters.** DFlash2 block speculation is what chad's
-  default row shows, and on this model it exists only as an MLX drafter fitted to this
-  checkpoint. llama.cpp can draft with a separate small model (`--model-draft`), but
-  there is no DFlash2 head in GGUF form.
+- **The drafter is the gap that matters, and what decides it is the verify pass.**
+  llama.cpp has run DFlash2 drafters since build 10658 (`--spec-type draft-dflash`), and
+  the drafter is published in GGUF form (`incoai/Qwen3.8-27B-DFlash2-GGUF`, BF16 / Q8_0 /
+  Q4_K_M). On this checkpoint it works as a drafter, 96.5% of drafted tokens accepted on
+  the tiled prompt, and decodes at 11.1 tok/s against 11.3 serial anyway. A round verifies
+  8 tokens in one batch, and llama.cpp's Metal path runs a batch of 1 / 2 / 4 / 8 / 16 at
+  11.2 / 12.8 / 13.5 / 14.0 / 45.5 tok/s (`llama-bench -p 1,2,4,8,16 -n 0`, recorded in
+  `_runs/llama-dflash.json`): the 8-token verify alone costs ~6.4 serial steps, so no
+  acceptance rate can pay for the round, and the jump at 16 is a kernel switch the round
+  sits just below. chad's whole round at the same width, drafter included, costs ~2.2
+  serial steps (`mlx_dflash.BLOCK_ROUND_COSTS`, the flat verify described
+  [below](#two-throughput-levers)), which is the difference between the two drafted rows.
+  llama.cpp's DFlash2 PR reports ~1.8× on an M5 Pro with a Q4_K_M target, so this measures
+  this GGUF on this Mac, not llama.cpp's DFlash2 in general.
 - **62 is a ceiling, not a session number.** `chad-bench` tiles a block of code, the
   drafter accepts nearly all of it, and a 128-token run mostly measures the width
   schedule's opening regime. On real mid-session contexts the same engine measures 31.7

@@ -1,0 +1,83 @@
+{
+  "engine": "llama.cpp",
+  "version": "build 10917 (8ea290247)",
+  "model": "Qwen3.8-27B-UD-Q3_K_XL.gguf",
+  "draft": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+  "prompt_tokens": 512,
+  "gen_tokens": 128,
+  "verify_width_tps": {
+    "1": 11.22,
+    "2": 12.82,
+    "4": 13.52,
+    "8": 14.02,
+    "16": 45.47,
+    "flags": "llama-bench -p 1,2,4,8,16 -n 0"
+  },
+  "serial": {
+    "prefill_tps": 96.8,
+    "decode_tps": 11.3,
+    "generated": [
+      128,
+      128,
+      128
+    ],
+    "reps": [
+      {
+        "prompt_n": 512,
+        "prompt_per_second": 96.79372670782794,
+        "predicted_n": 128,
+        "predicted_per_second": 11.32910469297011
+      },
+      {
+        "prompt_n": 512,
+        "prompt_per_second": 96.77292535480886,
+        "predicted_n": 128,
+        "predicted_per_second": 11.316465858801694
+      },
+      {
+        "prompt_n": 512,
+        "prompt_per_second": 96.81407933875984,
+        "predicted_n": 128,
+        "predicted_per_second": 11.312023737079352
+      }
+    ],
+    "flags": "llama-server, greedy, cache_prompt off"
+  },
+  "default": {
+    "prefill_tps": 94.6,
+    "decode_tps": 11.1,
+    "generated": [
+      128,
+      128,
+      128
+    ],
+    "reps": [
+      {
+        "prompt_n": 512,
+        "prompt_per_second": 95.17358397693229,
+        "predicted_n": 128,
+        "predicted_per_second": 11.11917275455967,
+        "draft_n": 114,
+        "draft_n_accepted": 110
+      },
+      {
+        "prompt_n": 512,
+        "prompt_per_second": 94.61330599403011,
+        "predicted_n": 128,
+        "predicted_per_second": 11.119624482401182,
+        "draft_n": 114,
+        "draft_n_accepted": 110
+      },
+      {
+        "prompt_n": 512,
+        "prompt_per_second": 93.93986930982635,
+        "predicted_n": 128,
+        "predicted_per_second": 11.123882651972163,
+        "draft_n": 114,
+        "draft_n_accepted": 110
+      }
+    ],
+    "acceptance": 0.965,
+    "flags": "llama-server -md Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-type draft-dflash --spec-draft-n-max 7"
+  }
+}
