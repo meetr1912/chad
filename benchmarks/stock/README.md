@@ -16,8 +16,7 @@ uv run python benchmarks/stock/stock.py table         # render _runs/*.json as m
 
 `llama-dflash` needs a llama.cpp with DFlash2 (build 10658 or later). To run one without
 replacing a pinned brew install, unpack a release tarball and point `STOCK_LLAMA_BIN` at
-it; the drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF`, Q4_K_M) downloads on first use, or
-`STOCK_DRAFT=<path>` names one you have.
+it; the drafter (`incoai/Qwen3.8-27B-DFlash2-GGUF`, Q4_K_M) downloads on first use.
 
 Ollama is not a separate arm — it runs llama.cpp's engine underneath, and was measured
 without speculative decoding. `_runs/ollama.json` is one hand-run measurement on the same GGUF

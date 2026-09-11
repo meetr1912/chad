@@ -118,14 +118,6 @@ def _llama_bin(name: str) -> str:
     return os.path.join(d, name) if d else _need(name, "brew install llama.cpp")
 
 
-def _draft_gguf() -> str:
-    local = os.environ.get("STOCK_DRAFT")
-    if local:
-        return local
-    from huggingface_hub import hf_hub_download
-    return hf_hub_download(DRAFT_REPO, DRAFT_FILE)
-
-
 def _post(path: str, body: dict, timeout: float = 600) -> dict:
     import urllib.request
     req = urllib.request.Request(f"http://127.0.0.1:{SERVER_PORT}{path}",
@@ -202,7 +194,8 @@ def arm_llama_dflash() -> None:
     ver = subprocess.run([_llama_bin("llama-server"), "--version"], capture_output=True,
                          text=True).stderr
     m = re.search(r"build (\d+), commit (\w+)", ver)
-    draft = _draft_gguf()
+    from huggingface_hub import hf_hub_download
+    draft = hf_hub_download(DRAFT_REPO, DRAFT_FILE)
     # What a verify round costs by width: a round checks draft+1 tokens in one batch, so
     # w / t_s(w) seconds. Near-flat t/s across 1..8 means the batch costs ~w serial steps
     # and even full acceptance cannot pay for the round; the drafter's speedup is bounded

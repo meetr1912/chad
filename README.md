@@ -66,14 +66,9 @@ place, 384-token decodes) the same engine measures **31.7 tok/s median / 21.4 fl
 against 14.8 serial, and **27.6 / 17.7** thinking against 13.9. That ~2× is what a session
 lives at.
 
-² llama.cpp has run DFlash2 drafters since build 10658, and the drafter is published in GGUF
-form (`incoai/Qwen3.8-27B-DFlash2-GGUF`). On this checkpoint and this Mac it works as a
-drafter, 96.5% of drafted tokens accepted on the same prompt, and decodes no faster: a round
-verifies 8 tokens in one batch, and llama.cpp's Metal path reads that batch at 14.0 tok/s
-against 11.2 for a single token (`llama-bench` pp8 vs pp1), so the verify alone costs ~6.4
-serial steps and no acceptance rate can pay for it. llama.cpp's DFlash2 PR reports ~1.8× on an M5
-Pro with a Q4_K_M target, so read these rows as what a fitted engine buys on this checkpoint,
-not as a verdict on llama.cpp.
+² llama.cpp has run DFlash2 since build 10658. Here it accepts 96.5% of drafted tokens and still
+gains nothing: verifying 8 tokens costs ~6.4 serial steps on this GGUF and Mac
+([details](docs/benchmarks.md#same-model-same-mac-stock-engine)).
 
 Method, the longer runs and the caveats are in
 [Throughput & performance](docs/benchmarks.md#same-model-same-mac-stock-engine); the rows are
