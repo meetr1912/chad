@@ -23,8 +23,24 @@ import sys
 
 # Reuse the exact model selection chad itself uses (RAM-aware default, local-dir-preferred,
 # HF fallback) so the benchmark measures the model you'd actually run.
-from .cli import _ensure_model, _pick_model
+from .cli import _ensure_model, _env_int, _pick_model
 from .engine import Engine
+
+
+def _bench_engine(model_id: str) -> Engine:
+    """The Engine both benchmarks measure, built the way `chad` itself builds it.
+
+    ONE constructor for both call sites, deliberately. `cli.main` reads CHAD_KV_BITS and
+    passes it to Engine; the two benchmarks each constructed Engine directly and so always
+    measured the AUTO kv width whatever the env said — a `CHAD_KV_BITS=0` A/B against the
+    shipped 8-bit default reported a clean null, which is the most expensive way for a
+    benchmark to be wrong. It is the failure shape `cli.SAMPLER_ENV` already documents:
+    sibling settings drift ONE AT A TIME, and the later fix looks complete while leaving
+    its neighbours dead. There is one function now, so a third benchmark cannot forget.
+
+    `cache_dir=None` so the on-disk warm prefix can't pre-load and skew the *cold* prefill
+    number; both benchmarks measure from a genuinely cold cache."""
+    return Engine(model_id=model_id, cache_dir=None, kv_bits=_env_int("CHAD_KV_BITS"))
 
 # A chunk of plausible code/transcript text. We tile it to the requested token budget so
 # the prefill measurement runs over realistic content (not a single repeated token, which
@@ -95,9 +111,8 @@ def _agentic(model_id: str, why: str, context_tokens: int, apply_fix: bool):
 
     Returns (miss_prefill_tokens, miss_prefill_s, cached_tokens)."""
     from .agent import build_system_prompt, close_unclosed_think
-    from .engine import Engine
 
-    eng = Engine(model_id=model_id, cache_dir=None)
+    eng = _bench_engine(model_id)
     eng.load()
     tok = eng.tok
 
@@ -201,9 +216,7 @@ def main(argv=None) -> int:
     model_id, why = _pick_model()
     _ensure_model(model_id)
 
-    # cache_dir=None so the on-disk warm-prefix can't pre-load and skew the *cold* prefill
-    # number; this benchmark measures from a genuinely cold cache.
-    eng = Engine(model_id=model_id, cache_dir=None)
+    eng = _bench_engine(model_id)
     sys.stderr.write(f"loading {model_id} [{why}] ...\n")
     load_s = eng.load()
 
@@ -229,6 +242,16 @@ def main(argv=None) -> int:
     print(f"chad throughput — {model_id}")
     print(f"  {why}")
     print("=" * w)
+    # What this run actually measured, not what it was asked for. An A/B is only worth
+    # the paper it prints on if the arm can be read back off the output: CHAD_KV_BITS=0
+    # takes a branch in _resolve_kv_bits that logs NOTHING, so a sweep against the 8-bit
+    # default is indistinguishable from a sweep that never applied. kv bytes/token is the
+    # measurement that cannot lie about it — it halves with the cache width.
+    kv_label = f"{eng.kv_bits}-bit group-64" if eng.kv_bits else "fp16"
+    chunk_label = (f"{args.chunk}" if args.chunk
+                   else f"adaptive (base {2048 if getattr(eng, '_is_moe', False) else 512})")
+    print(f"config                   kv cache {kv_label} "
+          f"({eng.kv_bytes_per_token:,.0f} B/tok) | prefill chunk {chunk_label}")
     print(f"model load               {load_s:6.1f} s")
     print("-" * w)
     print(f"1. prefill (cold)        {stats.prompt_tokens:6d} tok in {stats.prefill_s:6.2f} s"
