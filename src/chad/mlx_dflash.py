@@ -706,6 +706,16 @@ def _remap(weights: dict) -> dict:
 
 def _load_sidecar(sdir: str, bits: int, gs: int):
     import mlx.core as mx
+    # Quantize the skeleton at the width the sidecar was BUILT at, not at the caller's
+    # default. build_sidecar records both numbers in the safetensors header and nothing
+    # read them back, so a sidecar built at any width other than the default 4 got a
+    # 4-bit skeleton, load_weights raised on the shape mismatch, and load_drafter's
+    # catch-all turned that into a silent fall back to serial decode. A drafter is a pure
+    # speed feature that must never break load — which is exactly why a wrong width here
+    # is invisible rather than loud, and why the width has to come from the file.
+    meta = _sidecar_meta(sdir) or {}
+    bits = int(meta.get("bits") or bits)
+    gs = int(meta.get("group_size") or gs)
     with open(os.path.join(sdir, "config.json")) as f:
         cfg = DFlashConfig.from_dict(json.load(f))
     drafter = build(cfg)
@@ -750,15 +760,22 @@ def build_sidecar(src_dir: str, out_dir: str, bits: int = 4, gs: int = 64) -> st
     return out_dir
 
 
-def _is_sidecar(d: str) -> bool:
+def _sidecar_meta(d: str) -> Optional[dict]:
+    """The build metadata `build_sidecar` wrote into the safetensors header, or None
+    when this is not one of our sidecars (a plain HF checkpoint carries no `bits`)."""
     try:
         import struct
         with open(os.path.join(d, "model.safetensors"), "rb") as f:
             n = struct.unpack("<Q", f.read(8))[0]
             hdr = json.loads(f.read(n))
-        return "bits" in (hdr.get("__metadata__") or {})
+        meta = hdr.get("__metadata__") or {}
+        return meta if "bits" in meta else None
     except Exception:  # noqa: BLE001
-        return False
+        return None
+
+
+def _is_sidecar(d: str) -> bool:
+    return _sidecar_meta(d) is not None
 
 
 def bundle_dir(model_dir: str) -> Optional[str]:
@@ -843,8 +860,13 @@ def load_drafter(model: Any, model_dir: str, repo_id: Optional[str] = None,
             log.warning("DFlash drafter: target tap not installable; decoding "
                         "without it")
             return None
-        log.info("DFlash drafter loaded (%s, %d-bit g%d, block %d, selector top-%d, "
-                 "taps %s)", sdir, bits, gs, cfg.block_size, cfg.selector_top_k,
+        # Report the width the SIDECAR carries, not the one this function was called
+        # with: they differ for any sidecar not built at the default, and this line is
+        # the only place a user can see which drafter is actually decoding.
+        meta = _sidecar_meta(sdir) or {}
+        log.info("DFlash drafter loaded (%s, %s-bit g%s, block %d, selector top-%d, "
+                 "taps %s)", sdir, meta.get("bits") or bits,
+                 meta.get("group_size") or gs, cfg.block_size, cfg.selector_top_k,
                  list(cfg.target_layer_ids))
         return drafter
     except Exception as e:  # noqa: BLE001 — never break model load over DFlash
