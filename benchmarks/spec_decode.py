@@ -130,8 +130,17 @@ def agentic_corpus(tok, count: int, min_ctx: int, max_ctx: int) -> list:
     ENDS in a tool result (i.e. the model is about to write a real agentic turn), sized
     into [min_ctx, max_ctx] rendered tokens. Newest sessions first, at most one cut per
     session so the corpus is not ten slices of the same conversation."""
-    files = sorted(glob.glob(os.path.join(SESSION_DIR, "*.json")),
+    # Sessions live at <cwdhash>/<session_id>.json (session.py:13). The flat
+    # <cwdhash>.json form this glob used to match is the LEGACY single-slot layout
+    # session.py:19 still adopts, so on any machine whose sessions were all written by
+    # a current chad the corpus came back empty — and empty here is not a quiet null but
+    # a `min() arg is an empty sequence` several steps later, which reads like a bug in
+    # the benchmark's own warmup rather than like "there was nothing to replay". Both
+    # layouts are globbed; index.json is a directory listing, not a transcript.
+    files = sorted(glob.glob(os.path.join(SESSION_DIR, "*", "*.json"))
+                   + glob.glob(os.path.join(SESSION_DIR, "*.json")),
                    key=os.path.getmtime, reverse=True)
+    files = [f for f in files if os.path.basename(f) != "index.json"]
     out = []
     for path in files:
         if len(out) >= count:
