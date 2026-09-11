@@ -380,6 +380,60 @@ def test_ensure_bundle_failure_is_soft(monkeypatch, tmp_path):
     mlx_dflash.ensure_bundle(str(tmp_path / "m"), "org/model")   # no raise
 
 
+def test_sidecar_loads_at_the_width_it_was_built_at(monkeypatch, tmp_path):
+    """build_sidecar records bits/group_size in the safetensors header; the loader must
+    quantize its skeleton from that, not from load_drafter's default of 4. A mismatch
+    raises inside load_drafter's catch-all, which returns None and decodes serially —
+    so the assertion that matters is that a drafter comes back at all, and at 8 bits."""
+    import json
+    import logging
+
+    from mlx.utils import tree_flatten
+
+    model = _build_tiny()
+    args = model.language_model.args
+    n_layers = int(args.num_hidden_layers)
+    hf = {
+        "hidden_size": int(args.hidden_size), "num_hidden_layers": 2,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+        "intermediate_size": 128, "vocab_size": int(args.vocab_size),
+        "num_target_layers": n_layers, "max_position_embeddings": 512,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "dflash_config": {"block_size": 4, "target_layer_ids": [0, max(1, n_layers - 2)],
+                          "mask_token_id": int(args.vocab_size) - 1,
+                          "selector_rank": 64, "selector_top_k": 4,
+                          "conv_kernel_size": 2, "conv_group_size": 16},
+    }
+    src = tmp_path / "hf"
+    src.mkdir()
+    (src / "config.json").write_text(json.dumps(hf))
+    mx.random.seed(3)
+    bf = mlx_dflash.build(mlx_dflash.DFlashConfig.from_dict(hf))
+    mx.save_safetensors(str(src / "model.safetensors"), dict(tree_flatten(bf.parameters())))
+    out = mlx_dflash.build_sidecar(str(src), str(tmp_path / "q8"), bits=8, gs=64)
+
+    messages = []
+
+    class _Rec(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    chad_log = logging.getLogger("chad")
+    handler, old_level = _Rec(logging.INFO), chad_log.level
+    chad_log.addHandler(handler)
+    chad_log.setLevel(logging.INFO)
+    monkeypatch.setenv("CHAD_DFLASH_PATH", out)
+    try:
+        drafter = mlx_dflash.load_drafter(model, str(tmp_path / "weights"))
+    finally:
+        chad_log.removeHandler(handler)
+        chad_log.setLevel(old_level)
+
+    assert drafter is not None, messages
+    assert drafter.fc.bits == 8 and drafter.fc.group_size == 64
+    assert any("8-bit g64" in m for m in messages), messages
+
+
 def test_schedule_is_the_default_width_policy():
     """The per-round verified-width schedule is ON by default, chosen on the floor: a
     fixed full-block round costs ~2.2 serial steps whatever it commits, and on
