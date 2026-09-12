@@ -929,6 +929,11 @@ class Engine:
         # path for the whole session
         h.update(f"kv{self.kv_bits or 0}".encode())
         h.update(b"\x00")
+        # ...and so is the context window: above the native window load() applies a
+        # YaRN rope override, and the same ids cached under a different rope are a
+        # different cache
+        h.update(f"ctx{self.effective_ctx or 0}".encode())
+        h.update(b"\x00")
         if tag:  # namespace distinct checkpoint kinds (warm-prefix vs push-spill)
             h.update(tag.encode("utf-8", "ignore"))
             h.update(b"\x00")
@@ -1093,8 +1098,9 @@ class Engine:
         native-trim the attention KV back to it, then re-feed the agreed-on tokens
         so both stacks advance together — the same restore/trim/re-feed primitive
         the PLD-hybrid path proved bit-exact (test_pld_hybrid_equals_greedy), over
-        a longer range. Returns `upto` on success, None when no usable snapshot
-        (caller falls back to the full rebuild)."""
+        a longer range. Returns the resident count it landed at (`upto`, or less if the
+        re-feed stops short; `_cached_ids` records the same), None when no usable
+        snapshot (caller falls back to the full rebuild)."""
         snap = self._rewind_snap
         if not snap or snap["pos"] > upto or snap["pos"] > len(self._cached_ids):
             return None
@@ -1105,8 +1111,12 @@ class Engine:
         self._cached_ids = self._cached_ids[: snap["pos"]]
         refeed = list(target_ids[snap["pos"] : upto])
         if refeed:
-            self._prefill(refeed)
-            self._cached_ids = list(target_ids[:upto])
+            fed = self._prefill(refeed)
+            self._cached_ids = list(target_ids[: snap["pos"] + fed])
+            if fed < len(refeed):
+                log.warning("REWIND re-feed stopped short (%d/%d): %d tokens resident",
+                            fed, len(refeed), snap["pos"] + fed)
+                return snap["pos"] + fed
         log.info("REWIND to %d resident tokens (snapshot@%d, re-fed %d) — "
                  "skipped a full re-prefill", upto, snap["pos"], len(refeed))
         return upto
@@ -1132,8 +1142,9 @@ class Engine:
                 # Bounded rewind: the divergence sits inside the last
                 # turn (truncated generation re-rendered, a dropped serve stream,
                 # a retried prompt) — recovered above at the cost of re-feeding at
-                # most one turn's tokens instead of the whole transcript.
-                pass
+                # most one turn's tokens instead of the whole transcript. The ledger
+                # now ends where the rewind landed: short of `common` if its re-feed was.
+                common = len(self._cached_ids)
             else:
                 # Not trimmable (hybrid) -> can't partially rewind in RAM, so rebuild.
                 # But the dominant divergence in agentic loops is *compaction*, which
@@ -1495,159 +1506,173 @@ class Engine:
                                                 on_prefill_progress, stop_condition,
                                                 think_ceiling)
 
-        common = self._sync_to(prompt_ids)
-        suffix = prompt_ids[common:]
-        stats = GenStats(
-            prompt_tokens=len(suffix),
-            cached_tokens=common,
-        )
-        if not suffix:
-            # Nothing new to prefill (degenerate: the prompt is fully cached, e.g. an
-            # identical prompt regenerated — never in normal append-only turns). We
-            # still need one token to condition on, so we re-feed the last token. But
-            # the live KV cache already holds it, so we must drop it from the cache in
-            # lockstep, or the cache ends up one token LONGER than _cached_ids records
-            # — an off-by-one that desyncs the next turn's trim math and silently
-            # corrupts generation.
-            if self._trimmable:
-                # Mirror the PLD path: pop the last token off the live cache so the
-                # re-feed below lands the cache back at exactly prompt_ids.
-                cache_utils.trim_prompt_cache(self._cache, 1)
-                suffix = prompt_ids[-1:]
-                self._cached_ids = self._cached_ids[:-1]
-                stats.prompt_tokens = 1
-                stats.cached_tokens = common - 1
-            elif self._rewind_to(prompt_ids, len(prompt_ids) - 1) is not None:
-                # Non-trimmable hybrid with a turn-boundary snapshot:
-                # land the cache at exactly prompt_ids[:-1] via the bounded rewind,
-                # then re-feed the last token as the conditioning input — same shape
-                # as the trimmable branch above, no full rebuild.
-                common = len(prompt_ids) - 1
-                suffix = prompt_ids[-1:]
-                stats.prompt_tokens = 1
-                stats.cached_tokens = common
-            else:
-                # Non-trimmable hybrid: we cannot pop a single token off
-                # the recurrent state, so trimming is invalid and re-feeding would
-                # duplicate the last token in the cache. This degenerate case is rare,
-                # so take the safe path: rebuild from scratch and full re-prefill.
-                # Slower but correct — a desynced non-trimmable cache silently corrupts
-                # every later turn, which is far worse than one extra re-prefill here.
-                self._reset_cache()
-                common = 0
-                suffix = list(prompt_ids)
-                stats.prompt_tokens = len(suffix)
-                stats.cached_tokens = 0
-        if on_prefill:
-            on_prefill(stats.prompt_tokens, stats.cached_tokens)
-
-        kwargs = dict(
-            max_tokens=max_tokens,
-            # `seen` is passed by reference: the loop below appends each decoded
-            # id to self._seen_ids as it materializes it, so the sampler reads a
-            # live history without ever forcing a sync of its own draw.
-            sampler=(_KeyedSampler(self.temp, min_p=self.min_p, top_p=self.top_p,
-                                   top_k=self.top_k,
-                                   presence_penalty=self.presence_penalty,
-                                   seen=self._seen)
-                     if self.temp > 0
-                     else make_sampler(temp=self.temp, min_p=self.min_p, top_p=self.top_p)),
-            prompt_cache=self._cache,
-        )
-        t0 = time.time()
-        # Interruptible prefill: feed everything but the last token ourselves so
-        # should_stop is honored between chunks. stream_generate then only has to
-        # prefill the final token before decoding.
-        gen_prompt = suffix
-        resident = common
-        if len(suffix) > 1:
-            fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
-            if fed < len(suffix) - 1:  # interrupted mid-prefill
-                self._cached_ids = prompt_ids[: common + fed]
-                stats.prefill_s = time.time() - t0
-                return "", stats
-            gen_prompt = suffix[-1:]
-            resident = common + fed
-        # Turn-boundary rewind point: everything resident right now is the
-        # agreed-on prompt; whatever this turn appends past here is what a divergence
-        # inside it will need to rewind. No-op on trimmable caches.
-        self._take_rewind_snapshot(resident)
-
-        text = ""
-        gen_ids = []
-        first_token_at = None
-        oom_degraded = False
-
-        # Decode loop, factored so close-and-continue can RE-ENTER it: after a
-        # ceiling force-close, the same persistent cache is fed the </think> ids and
-        # decoding resumes into the action. Re-entry is a plain append (stream_generate
-        # prefills `seed_ids` onto self._cache, then decodes) — it touches no trim/diff/
-        # snapshot logic, so the non-trimmable-cache invariant holds. Returns why it
-        # stopped: 'ceiling' | 'stop' | 'condition' | 'eos'.
-        def _decode(seed_ids, budget):
-            nonlocal first_token_at, text
-            kw = dict(kwargs, max_tokens=max(1, budget))
-            for resp in stream_generate(self.model, self.tok, mx.array(seed_ids), **kw):
-                if first_token_at is None:
-                    first_token_at = time.time()
-                    stats.prefill_s = first_token_at - t0
-                text += resp.text
-                gen_ids.append(resp.token)
-                self._seen.append(resp.token)
-                if on_token:
-                    on_token(resp.text)
-                if stop_texts and any(s in text for s in stop_texts):
-                    return "stop"
-                if should_stop and should_stop():
-                    return "stop"
-                if think_ceiling_hit(text, len(gen_ids), think_ceiling):
-                    return "ceiling"
-                if stop_condition is not None and stop_condition(text, len(gen_ids)):
-                    stats.stop_condition_fired = True
-                    return "condition"
-            return "eos"
-
+        # From here on an exception can leave the cache somewhere the ledger cannot
+        # describe: a prefill chunk may have landed, and how far stream_generate got is
+        # internal to it. So an abnormal exit drops the cache, recording nothing as
+        # resident, rather than let the next turn prefill on top of tokens
+        # `_cached_ids` doesn't know about.
         try:
-            if _decode(gen_prompt, max_tokens) == "ceiling":
-                # Inject </think> and keep decoding the action IN THE SAME STEP. One salvage
-                # per step: THINK_CLOSE is now in `text`, so think_ceiling_hit can't refire.
-                close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
-                text += THINK_CLOSE
-                gen_ids.extend(close_ids)
-                stats.salvaged = True
-                if len(gen_ids) < max_tokens and not (should_stop and should_stop()):
-                    _decode(close_ids, max_tokens - len(gen_ids))
-        except RuntimeError as e:
-            # Metal OOM mid-decode (catchable on mlx>=0.32). stream_generate manages
-            # the cache internally, so its state after a mid-forward failure is
-            # unknowable — the only safe recovery is a clean rebuild. Keep the text
-            # decoded so far (a partial turn beats a dead process); the next turn
-            # warm-starts the system prefix from disk and re-prefills the body.
-            if "memory" not in str(e).lower():
-                raise
-            log.warning("DECODE Metal OOM after %d tokens: dropping cache, keeping "
-                        "partial text", len(gen_ids))
-            oom_degraded = True
-        stats.gen_s = time.time() - (first_token_at or t0)
-        stats.generated_tokens = len(gen_ids)
-        stats.gen_ids = list(gen_ids)
+            common = self._sync_to(prompt_ids)
+            suffix = prompt_ids[common:]
+            stats = GenStats(
+                prompt_tokens=len(suffix),
+                cached_tokens=common,
+            )
+            if not suffix:
+                # Nothing new to prefill (degenerate: the prompt is fully cached, e.g. an
+                # identical prompt regenerated — never in normal append-only turns). We
+                # still need one token to condition on, so we re-feed the last token. But
+                # the live KV cache already holds it, so we must drop it from the cache in
+                # lockstep, or the cache ends up one token LONGER than _cached_ids records
+                # — an off-by-one that desyncs the next turn's trim math and silently
+                # corrupts generation.
+                if self._trimmable:
+                    # Mirror the PLD path: pop the last token off the live cache so the
+                    # re-feed below lands the cache back at exactly prompt_ids.
+                    cache_utils.trim_prompt_cache(self._cache, 1)
+                    suffix = prompt_ids[-1:]
+                    self._cached_ids = self._cached_ids[:-1]
+                    stats.prompt_tokens = 1
+                    stats.cached_tokens = common - 1
+                elif self._rewind_to(prompt_ids, len(prompt_ids) - 1) is not None:
+                    # Non-trimmable hybrid with a turn-boundary snapshot:
+                    # land the cache at exactly prompt_ids[:-1] via the bounded rewind,
+                    # then re-feed the last token as the conditioning input — same shape
+                    # as the trimmable branch above, no full rebuild. (If the rewind's
+                    # re-feed stopped short, prefill from wherever it landed.)
+                    common = len(self._cached_ids)
+                    suffix = prompt_ids[common:]
+                    stats.prompt_tokens = len(suffix)
+                    stats.cached_tokens = common
+                else:
+                    # Non-trimmable hybrid: we cannot pop a single token off
+                    # the recurrent state, so trimming is invalid and re-feeding would
+                    # duplicate the last token in the cache. This degenerate case is rare,
+                    # so take the safe path: rebuild from scratch and full re-prefill.
+                    # Slower but correct — a desynced non-trimmable cache silently corrupts
+                    # every later turn, which is far worse than one extra re-prefill here.
+                    self._reset_cache()
+                    common = 0
+                    suffix = list(prompt_ids)
+                    stats.prompt_tokens = len(suffix)
+                    stats.cached_tokens = 0
+            if on_prefill:
+                on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
-        if oom_degraded:
-            self._reset_cache()
+            kwargs = dict(
+                max_tokens=max_tokens,
+                # `seen` is passed by reference: the loop below appends each decoded
+                # id to self._seen_ids as it materializes it, so the sampler reads a
+                # live history without ever forcing a sync of its own draw.
+                sampler=(_KeyedSampler(self.temp, min_p=self.min_p, top_p=self.top_p,
+                                       top_k=self.top_k,
+                                       presence_penalty=self.presence_penalty,
+                                       seen=self._seen)
+                         if self.temp > 0
+                         else make_sampler(temp=self.temp, min_p=self.min_p, top_p=self.top_p)),
+                prompt_cache=self._cache,
+            )
+            t0 = time.time()
+            # Interruptible prefill: feed everything but the last token ourselves so
+            # should_stop is honored between chunks. stream_generate then only has to
+            # prefill the final token before decoding.
+            gen_prompt = suffix
+            resident = common
+            if len(suffix) > 1:
+                fed = self._prefill(suffix[:-1], should_stop, on_progress=on_prefill_progress)
+                if fed < len(suffix) - 1:  # interrupted mid-prefill
+                    self._cached_ids = prompt_ids[: common + fed]
+                    stats.prefill_s = time.time() - t0
+                    return "", stats
+                gen_prompt = suffix[-1:]
+                resident = common + fed
+            # Turn-boundary rewind point: everything resident right now is the
+            # agreed-on prompt; whatever this turn appends past here is what a divergence
+            # inside it will need to rewind. No-op on trimmable caches.
+            self._take_rewind_snapshot(resident)
+
+            text = ""
+            gen_ids = []
+            first_token_at = None
+            oom_degraded = False
+
+            # Decode loop, factored so close-and-continue can RE-ENTER it: after a
+            # ceiling force-close, the same persistent cache is fed the </think> ids and
+            # decoding resumes into the action. Re-entry is a plain append (stream_generate
+            # prefills `seed_ids` onto self._cache, then decodes) — it touches no trim/diff/
+            # snapshot logic, so the non-trimmable-cache invariant holds. Returns why it
+            # stopped: 'ceiling' | 'stop' | 'condition' | 'eos'.
+            def _decode(seed_ids, budget):
+                nonlocal first_token_at, text
+                kw = dict(kwargs, max_tokens=max(1, budget))
+                for resp in stream_generate(self.model, self.tok, mx.array(seed_ids), **kw):
+                    if first_token_at is None:
+                        first_token_at = time.time()
+                        stats.prefill_s = first_token_at - t0
+                    text += resp.text
+                    gen_ids.append(resp.token)
+                    self._seen.append(resp.token)
+                    if on_token:
+                        on_token(resp.text)
+                    if stop_texts and any(s in text for s in stop_texts):
+                        return "stop"
+                    if should_stop and should_stop():
+                        return "stop"
+                    if think_ceiling_hit(text, len(gen_ids), think_ceiling):
+                        return "ceiling"
+                    if stop_condition is not None and stop_condition(text, len(gen_ids)):
+                        stats.stop_condition_fired = True
+                        return "condition"
+                return "eos"
+
+            try:
+                if _decode(gen_prompt, max_tokens) == "ceiling":
+                    # Inject </think> and keep decoding the action IN THE SAME STEP. One salvage
+                    # per step: once THINK_CLOSE is in `text`, think_ceiling_hit can't refire.
+                    # It goes into `text` and `gen_ids` only when it is fed, since both must
+                    # describe exactly what the cache holds: with no room left for it (or a
+                    # stop requested) the turn ends inside the think instead.
+                    close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
+                    if (len(gen_ids) + len(close_ids) < max_tokens
+                            and not (should_stop and should_stop())):
+                        text += THINK_CLOSE
+                        gen_ids.extend(close_ids)
+                        stats.salvaged = True
+                        _decode(close_ids, max_tokens - len(gen_ids))
+            except RuntimeError as e:
+                # Metal OOM mid-decode (catchable on mlx>=0.32). stream_generate manages
+                # the cache internally, so its state after a mid-forward failure is
+                # unknowable — the only safe recovery is a clean rebuild. Keep the text
+                # decoded so far (a partial turn beats a dead process); the next turn
+                # warm-starts the system prefix from disk and re-prefills the body.
+                if "memory" not in str(e).lower():
+                    raise
+                log.warning("DECODE Metal OOM after %d tokens: dropping cache, keeping "
+                            "partial text", len(gen_ids))
+                oom_degraded = True
+            stats.gen_s = time.time() - (first_token_at or t0)
+            stats.generated_tokens = len(gen_ids)
+            stats.gen_ids = list(gen_ids)
+
+            if oom_degraded:
+                self._reset_cache()
+                mx.clear_cache()
+                # Nothing is resident now, not even the prompt. Say so: a caller mirroring
+                # our cache (chad serve's remote client) would otherwise assume prompt+gen
+                # and estimate its next prefill against a cache that no longer exists.
+                stats.cache_reset = True
+                return text, stats
+            # The cache now holds prefix + the tokens we generated.
+            self._cached_ids = prompt_ids + gen_ids
+            # Return MLX's freed-buffer pool to the OS. The live KV cache is held in
+            # self._cache (active memory, untouched); this only releases the transient
+            # prefill/decode scratch buffers that otherwise accumulate as cached memory
+            # turn-over-turn and show up as a steadily climbing RSS.
             mx.clear_cache()
-            # Nothing is resident now, not even the prompt. Say so: a caller mirroring
-            # our cache (chad serve's remote client) would otherwise assume prompt+gen
-            # and estimate its next prefill against a cache that no longer exists.
-            stats.cache_reset = True
             return text, stats
-        # The cache now holds prefix + the tokens we generated.
-        self._cached_ids = prompt_ids + gen_ids
-        # Return MLX's freed-buffer pool to the OS. The live KV cache is held in
-        # self._cache (active memory, untouched); this only releases the transient
-        # prefill/decode scratch buffers that otherwise accumulate as cached memory
-        # turn-over-turn and show up as a steadily climbing RSS.
-        mx.clear_cache()
-        return text, stats
+        except BaseException:
+            self._reset_cache()
+            raise
 
     # -- prompt-lookup (n-gram) speculative decoding ----------------------
 
@@ -1659,6 +1684,24 @@ class Engine:
         for extra in getattr(self.tok, "eos_token_ids", None) or []:
             ids.add(int(extra))
         return ids
+
+    def _settle_after_error(self, fed_ids: Optional[list]) -> None:
+        """Leave a truthful ledger behind when a decode loop raises. `fed_ids` is the
+        loop's own ledger, or None if it raised before decoding began, while
+        `_cached_ids` was still the ledger.
+
+        The loops call back only after a round's tokens are recorded, so a raising
+        callback leaves that ledger exact. MLX can raise between a forward and the
+        recording of its tokens, or partway through a prefill, and then the cache is
+        ahead of it. So the cache is kept only if its attention layers all hold exactly
+        the ledger's length (the recurrent layers have no position to check, but advance
+        in the same forwards); otherwise it is dropped."""
+        ledger = self._cached_ids if fed_ids is None else fed_ids
+        offsets = [c.offset for c in self._cache if hasattr(c, "offset")]
+        if offsets and all(o == len(ledger) for o in offsets):
+            self._cached_ids = list(ledger)
+        else:
+            self._reset_cache()
 
     def _generate_prompt_lookup(self, prompt_ids, max_tokens, on_token, stop_texts,
                                 should_stop=None, on_prefill=None,
@@ -1673,182 +1716,189 @@ class Engine:
         is greedy (temp==0) only, whereas the think-spiral close-and-continue targets a
         temp>0 sampling pathology — that arm runs the llama backend, and the
         interactive MLX default falls to the main `generate` decode loop above."""
-        common = self._sync_to(prompt_ids)
-        suffix = prompt_ids[common:]
-        stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
-        if on_prefill:
-            on_prefill(stats.prompt_tokens, stats.cached_tokens)
+        # `fed_ids` (set once decoding starts) is this loop's ledger; if anything below
+        # raises, _settle_after_error decides whether the cache still matches it.
+        fed_ids = None
+        try:
+            common = self._sync_to(prompt_ids)
+            suffix = prompt_ids[common:]
+            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            if on_prefill:
+                on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
-        mc = self._cache
-        eos = self._eos_ids()
-        prefill_step = None  # None -> env override or adaptive sizing (see _prefill)
-        # On a hybrid cache we roll drafts back by snapshot/restore instead of trim.
-        hybrid = self._pld_hybrid and not self._trimmable
+            mc = self._cache
+            eos = self._eos_ids()
+            prefill_step = None  # None -> env override or adaptive sizing (see _prefill)
+            # On a hybrid cache we roll drafts back by snapshot/restore instead of trim.
+            hybrid = self._pld_hybrid and not self._trimmable
 
-        t0 = time.time()
+            t0 = time.time()
 
-        def _prefill_head():
-            """Prefill suffix[:-1] (all but the conditioning token) through the shared
-            chunked `_prefill`, which honors should_stop between chunks. Returns True on
-            a clean prefill, False if interrupted (caller returns an empty turn). One
-            helper for both branches below — previously this loop was inlined twice and
-            the hybrid copy silently dropped the should_stop check (un-abortable)."""
-            fed = self._prefill(suffix[:-1], should_stop, chunk=prefill_step,
-                                on_progress=on_prefill_progress)
-            if fed < len(suffix) - 1:  # interrupted mid-prefill
-                self._cached_ids = list(prompt_ids[: common + fed])
-                stats.prefill_s = time.time() - t0
-                return False
-            # Turn-boundary rewind point — see generate(). `common` and
-            # `suffix` are rebound by the degenerate branch before its call, so this
-            # is correct from both call sites.
-            self._take_rewind_snapshot(common + fed)
-            return True
+            def _prefill_head():
+                """Prefill suffix[:-1] (all but the conditioning token) through the shared
+                chunked `_prefill`, which honors should_stop between chunks. Returns True on
+                a clean prefill, False if interrupted (caller returns an empty turn). One
+                helper for both branches below — previously this loop was inlined twice and
+                the hybrid copy silently dropped the should_stop check (un-abortable)."""
+                fed = self._prefill(suffix[:-1], should_stop, chunk=prefill_step,
+                                    on_progress=on_prefill_progress)
+                if fed < len(suffix) - 1:  # interrupted mid-prefill
+                    self._cached_ids = list(prompt_ids[: common + fed])
+                    stats.prefill_s = time.time() - t0
+                    return False
+                # Turn-boundary rewind point — see generate(). `common` and
+                # `suffix` are rebound by the degenerate branch before its call, so this
+                # is correct from both call sites.
+                self._take_rewind_snapshot(common + fed)
+                return True
 
-        # Prefill everything but the last token (we need a token to condition on).
-        if not suffix:
-            if hybrid:
-                # Can't pop a single token off the recurrent state, so rebuild and
-                # re-prefill all-but-last. Rare: only fires when an identical prompt
-                # is regenerated (never in normal append-only agentic turns).
-                self._reset_cache()
-                mc = self._cache
-                common, suffix = 0, list(prompt_ids)
-                stats.prompt_tokens, stats.cached_tokens = len(suffix) - 1, 0
+            # Prefill everything but the last token (we need a token to condition on).
+            if not suffix:
+                if hybrid:
+                    # Can't pop a single token off the recurrent state, so rebuild and
+                    # re-prefill all-but-last. Rare: only fires when an identical prompt
+                    # is regenerated (never in normal append-only agentic turns).
+                    self._reset_cache()
+                    mc = self._cache
+                    common, suffix = 0, list(prompt_ids)
+                    stats.prompt_tokens, stats.cached_tokens = len(suffix) - 1, 0
+                    if not _prefill_head():
+                        return "", stats
+                    y_val = suffix[-1]
+                else:
+                    # Degenerate: prompt fully cached. Re-feed the last token.
+                    cache_utils.trim_prompt_cache(mc, 1)
+                    y_val = prompt_ids[-1]
+                    stats.prompt_tokens, stats.cached_tokens = 1, common - 1
+            else:
                 if not _prefill_head():
                     return "", stats
                 y_val = suffix[-1]
-            else:
-                # Degenerate: prompt fully cached. Re-feed the last token.
-                cache_utils.trim_prompt_cache(mc, 1)
-                y_val = prompt_ids[-1]
-                stats.prompt_tokens, stats.cached_tokens = 1, common - 1
-        else:
-            if not _prefill_head():
-                return "", stats
-            y_val = suffix[-1]
-        first_token_at = None
+            first_token_at = None
 
-        context = list(prompt_ids)   # n-gram lookup window (prompt + generated)
-        out_ids = []                 # tokens generated this turn (for text)
-        # fed_ids mirrors exactly what's resident in the KV cache (cache-type
-        # agnostic, since ArraysCache exposes no offset). The final pending token
-        # (y_val) is intentionally NOT fed, so it isn't included here.
-        fed_ids = list(prompt_ids[:-1])
-        detok = self.tok.detokenizer
-        detok.reset()
-        # Adaptive draft width: wide verify forwards are nearly free on a big
-        # bandwidth-bound model but cost real compute on a small one. Track a recent
-        # acceptance EMA and draft wide only while it's paying off, so PLD never
-        # meaningfully slows novel generation (low n-gram hit rate).
-        nd_max = self.pld_num_draft
-        acc_ema = 0.5
-        # Hybrid backoff: on a recurrent cache every rejected draft costs an extra
-        # re-feed forward, so drafting only pays inside genuinely high-accept (quote)
-        # spans. Stay at nd=0 (zero-tax standard decode) when cold, probe cheaply to
-        # detect entering a quote span, and latch wide once a draft is mostly accepted.
-        hot, step_i = 0, 0
-        PROBE_EVERY, PROBE_ND, HOT_STEPS = 10, 4, 12
+            context = list(prompt_ids)   # n-gram lookup window (prompt + generated)
+            out_ids = []                 # tokens generated this turn (for text)
+            # fed_ids mirrors exactly what's resident in the KV cache (cache-type
+            # agnostic, since ArraysCache exposes no offset). The final pending token
+            # (y_val) is intentionally NOT fed, so it isn't included here.
+            fed_ids = list(prompt_ids[:-1])
+            detok = self.tok.detokenizer
+            detok.reset()
+            # Adaptive draft width: wide verify forwards are nearly free on a big
+            # bandwidth-bound model but cost real compute on a small one. Track a recent
+            # acceptance EMA and draft wide only while it's paying off, so PLD never
+            # meaningfully slows novel generation (low n-gram hit rate).
+            nd_max = self.pld_num_draft
+            acc_ema = 0.5
+            # Hybrid backoff: on a recurrent cache every rejected draft costs an extra
+            # re-feed forward, so drafting only pays inside genuinely high-accept (quote)
+            # spans. Stay at nd=0 (zero-tax standard decode) when cold, probe cheaply to
+            # detect entering a quote span, and latch wide once a draft is mostly accepted.
+            hot, step_i = 0, 0
+            PROBE_EVERY, PROBE_ND, HOT_STEPS = 10, 4, 12
 
-        while len(out_ids) < max_tokens:
-            if should_stop and should_stop():
-                break
-            if hybrid:
-                if hot > 0:
-                    nd = nd_max               # latched in a quote span: draft wide
-                elif step_i % PROBE_EVERY == 0:
-                    nd = PROBE_ND             # cheap periodic probe for a quote span
-                else:
-                    nd = 0                    # cold: standard decode, zero re-feed tax
-            else:
-                nd = nd_max if acc_ema >= 0.25 else 2
-            step_i += 1
-            draft = prompt_lookup_draft(context, nd, ngram_max=self.pld_ngram)
-            k = len(draft)
-            # Hybrid: snapshot the recurrent state before the verify forward so a
-            # partial accept can roll back exactly (the snapshot is a free reference
-            # copy; restore lands us at the pre-forward point to re-feed from).
-            rec_snap = self._snap_recurrent() if hybrid else None
-            y = mx.array([y_val] + draft, dtype=mx.uint32)
-            logits = self.model(y[None], cache=mc)
-            toks = mx.argmax(logits[0, -(k + 1):, :], axis=-1)
-            mx.eval(toks)
-            if first_token_at is None:
-                first_token_at = time.time()
-                stats.prefill_s = first_token_at - t0
-            toks = [int(t) for t in toks.tolist()]
-            stats.forwards += 1
-            stats.draft_proposed += k
-
-            # Accept the longest prefix of the draft the model agrees with.
-            n_acc = 0
-            while n_acc < k and toks[n_acc] == draft[n_acc]:
-                n_acc += 1
-            stats.draft_accepted += n_acc
-            if k:
-                acc_ema = 0.85 * acc_ema + 0.15 * (n_acc / k)
-            if hybrid and k:
-                # Latch wide after a mostly-accepted draft; decay back toward probing.
-                hot = HOT_STEPS if n_acc >= max(1, int(0.6 * k)) else max(0, hot - 1)
-
-            # Roll the cache back over the rejected drafts. What stays resident:
-            # the previously-pending y_val plus the n_acc accepted draft tokens.
-            # (Full accept needs no rollback either way.)
-            if k - n_acc > 0:
-                if hybrid:
-                    # Restore the recurrent state to the pre-forward point, trim the
-                    # attention KV all the way back too, then re-feed just the kept
-                    # prefix so BOTH advance together to exactly y_val+draft[:n_acc].
-                    self._restore_recurrent(rec_snap)
-                    self._trim_kv(k + 1)
-                    refeed = mx.array([y_val] + draft[:n_acc], dtype=mx.uint32)
-                    self.model(refeed[None], cache=mc)
-                    mx.eval([c.state for c in mc])
-                else:
-                    cache_utils.trim_prompt_cache(mc, k - n_acc)
-            fed_ids.append(y_val)
-            fed_ids.extend(draft[:n_acc])
-
-            committed = draft[:n_acc] + [toks[n_acc]]  # accepted run + 1 bonus token
-            stop = False
-            for tid in committed:
-                if tid in eos or len(out_ids) >= max_tokens:
-                    stop = True
+            while len(out_ids) < max_tokens:
+                if should_stop and should_stop():
                     break
-                out_ids.append(tid)
-                context.append(tid)
-                detok.add_token(tid)
-                if on_token:
-                    seg = detok.last_segment
-                    if seg:
-                        on_token(seg)
-            # Soft think-cap: honor the caller's stop_condition on this path
-            # too. Checked on the committed run's text/count; byte-identical when None.
-            if not stop and stop_condition is not None \
-                    and stop_condition(detok.text, len(out_ids)):
-                stats.stop_condition_fired = True
-                stop = True
-            y_val = toks[n_acc]   # bonus token becomes next pending (unfed) token
-            if stop:
-                break
-            if stop_texts and any(s in detok.text for s in stop_texts):
-                break
+                if hybrid:
+                    if hot > 0:
+                        nd = nd_max               # latched in a quote span: draft wide
+                    elif step_i % PROBE_EVERY == 0:
+                        nd = PROBE_ND             # cheap periodic probe for a quote span
+                    else:
+                        nd = 0                    # cold: standard decode, zero re-feed tax
+                else:
+                    nd = nd_max if acc_ema >= 0.25 else 2
+                step_i += 1
+                draft = prompt_lookup_draft(context, nd, ngram_max=self.pld_ngram)
+                k = len(draft)
+                # Hybrid: snapshot the recurrent state before the verify forward so a
+                # partial accept can roll back exactly (the snapshot is a free reference
+                # copy; restore lands us at the pre-forward point to re-feed from).
+                rec_snap = self._snap_recurrent() if hybrid else None
+                y = mx.array([y_val] + draft, dtype=mx.uint32)
+                logits = self.model(y[None], cache=mc)
+                toks = mx.argmax(logits[0, -(k + 1):, :], axis=-1)
+                mx.eval(toks)
+                if first_token_at is None:
+                    first_token_at = time.time()
+                    stats.prefill_s = first_token_at - t0
+                toks = [int(t) for t in toks.tolist()]
+                stats.forwards += 1
+                stats.draft_proposed += k
 
-        detok.finalize()
-        if on_token and detok.last_segment:
-            on_token(detok.last_segment)
-        stats.gen_s = time.time() - (first_token_at or t0)
-        stats.generated_tokens = len(out_ids)
-        # What we GENERATED, which is not what we FED: `fed_ids` below deliberately
-        # excludes the final pending token, so it is the wrong list to report to a
-        # caller asking what this turn produced.
-        stats.gen_ids = list(out_ids)
+                # Accept the longest prefix of the draft the model agrees with.
+                n_acc = 0
+                while n_acc < k and toks[n_acc] == draft[n_acc]:
+                    n_acc += 1
+                stats.draft_accepted += n_acc
+                if k:
+                    acc_ema = 0.85 * acc_ema + 0.15 * (n_acc / k)
+                if hybrid and k:
+                    # Latch wide after a mostly-accepted draft; decay back toward probing.
+                    hot = HOT_STEPS if n_acc >= max(1, int(0.6 * k)) else max(0, hot - 1)
 
-        # fed_ids is exactly what's resident in the KV cache, so it's the correct
-        # prefix to diff against next turn.
-        self._cached_ids = fed_ids
-        mx.clear_cache()  # release transient scratch buffers back to the OS
-        return detok.text, stats
+                # Roll the cache back over the rejected drafts. What stays resident:
+                # the previously-pending y_val plus the n_acc accepted draft tokens.
+                # (Full accept needs no rollback either way.)
+                if k - n_acc > 0:
+                    if hybrid:
+                        # Restore the recurrent state to the pre-forward point, trim the
+                        # attention KV all the way back too, then re-feed just the kept
+                        # prefix so BOTH advance together to exactly y_val+draft[:n_acc].
+                        self._restore_recurrent(rec_snap)
+                        self._trim_kv(k + 1)
+                        refeed = mx.array([y_val] + draft[:n_acc], dtype=mx.uint32)
+                        self.model(refeed[None], cache=mc)
+                        mx.eval([c.state for c in mc])
+                    else:
+                        cache_utils.trim_prompt_cache(mc, k - n_acc)
+                fed_ids.append(y_val)
+                fed_ids.extend(draft[:n_acc])
+
+                committed = draft[:n_acc] + [toks[n_acc]]  # accepted run + 1 bonus token
+                stop = False
+                for tid in committed:
+                    if tid in eos or len(out_ids) >= max_tokens:
+                        stop = True
+                        break
+                    out_ids.append(tid)
+                    context.append(tid)
+                    detok.add_token(tid)
+                    if on_token:
+                        seg = detok.last_segment
+                        if seg:
+                            on_token(seg)
+                # Soft think-cap: honor the caller's stop_condition on this path
+                # too. Checked on the committed run's text/count; byte-identical when None.
+                if not stop and stop_condition is not None \
+                        and stop_condition(detok.text, len(out_ids)):
+                    stats.stop_condition_fired = True
+                    stop = True
+                y_val = toks[n_acc]   # bonus token becomes next pending (unfed) token
+                if stop:
+                    break
+                if stop_texts and any(s in detok.text for s in stop_texts):
+                    break
+
+            detok.finalize()
+            if on_token and detok.last_segment:
+                on_token(detok.last_segment)
+            stats.gen_s = time.time() - (first_token_at or t0)
+            stats.generated_tokens = len(out_ids)
+            # What we GENERATED, which is not what we FED: `fed_ids` below deliberately
+            # excludes the final pending token, so it is the wrong list to report to a
+            # caller asking what this turn produced.
+            stats.gen_ids = list(out_ids)
+
+            # fed_ids is exactly what's resident in the KV cache, so it's the correct
+            # prefix to diff against next turn.
+            self._cached_ids = fed_ids
+            mx.clear_cache()  # release transient scratch buffers back to the OS
+            return detok.text, stats
+        except BaseException:
+            self._settle_after_error(fed_ids)
+            raise
 
     # -- wide prompt-lookup speculative decoding (hybrid) ------------------
 
@@ -1875,344 +1925,351 @@ class Engine:
         re-feed forward, which is what made enable_pld_hybrid a loss."""
         from . import mlx_fastpath
 
-        common = self._sync_to(prompt_ids)
-        suffix = prompt_ids[common:]
-        stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
-        if on_prefill:
-            on_prefill(stats.prompt_tokens, stats.cached_tokens)
+        # `fed_ids` (set once decoding starts) is this loop's ledger; if anything below
+        # raises, _settle_after_error decides whether the cache still matches it.
+        fed_ids = None
+        try:
+            common = self._sync_to(prompt_ids)
+            suffix = prompt_ids[common:]
+            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            if on_prefill:
+                on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
-        mc = self._cache
-        eos = self._eos_ids()
-        lm = self.model.language_model
-        embed = lm.model.embed_tokens
-
-        def _logits(h):
-            if lm.args.tie_word_embeddings:
-                return embed.as_linear(h)
-            return lm.lm_head(h)
-
-        t0 = time.time()
-
-        def _prefill_head():
-            fed = self._prefill(suffix[:-1], should_stop,
-                                on_progress=on_prefill_progress)
-            if fed < len(suffix) - 1:  # interrupted mid-prefill
-                self._cached_ids = list(prompt_ids[: common + fed])
-                stats.prefill_s = time.time() - t0
-                return False
-            self._take_rewind_snapshot(common + fed)
-            return True
-
-        # Prefill everything but the last token — identical contract to the
-        # block path, including the degenerate fully-cached-prompt branch.
-        if not suffix:
-            self._reset_cache()
             mc = self._cache
-            common, suffix = 0, list(prompt_ids)
-            stats.prompt_tokens, stats.cached_tokens = len(suffix) - 1, 0
-            if not _prefill_head():
-                return "", stats
-            y_val = suffix[-1]
-        else:
-            if not _prefill_head():
-                return "", stats
-            y_val = suffix[-1]
+            eos = self._eos_ids()
+            lm = self.model.language_model
+            embed = lm.model.embed_tokens
 
-        key = mx.random.key(int.from_bytes(os.urandom(4), "little"))
-        first_token_at = None
-        out_ids = []
-        fed_ids = list(prompt_ids[:-1])
-        detok = self.tok.detokenizer
-        detok.reset()
+            def _logits(h):
+                if lm.args.tie_word_embeddings:
+                    return embed.as_linear(h)
+                return lm.lm_head(h)
 
-        # Growing numpy context buffer for the per-step n-gram lookup
-        # (always ends at the last MATERIALIZED token).
-        ctx = np.empty(len(prompt_ids) + max_tokens + 64, dtype=np.int64)
-        ctx[: len(prompt_ids)] = prompt_ids
-        ctx_n = len(prompt_ids)
+            t0 = time.time()
 
-        def _push_ctx(tid):
-            nonlocal ctx, ctx_n
-            if ctx_n == len(ctx):
-                ctx = np.concatenate([ctx, np.empty_like(ctx)])
-            ctx[ctx_n] = tid
-            ctx_n += 1
-
-        def _commit(tid):
-            """Emit one generated token. Returns True when generation must
-            stop (eos / budget); the token is then NOT emitted."""
-            if tid in eos or len(out_ids) >= max_tokens:
+            def _prefill_head():
+                fed = self._prefill(suffix[:-1], should_stop,
+                                    on_progress=on_prefill_progress)
+                if fed < len(suffix) - 1:  # interrupted mid-prefill
+                    self._cached_ids = list(prompt_ids[: common + fed])
+                    stats.prefill_s = time.time() - t0
+                    return False
+                self._take_rewind_snapshot(common + fed)
                 return True
-            out_ids.append(tid)
-            self._seen.append(tid)
-            _push_ctx(tid)
-            detok.add_token(tid)
-            if on_token:
-                seg = detok.last_segment
-                if seg:
-                    on_token(seg)
-            return False
 
-        def _mark_first():
-            nonlocal first_token_at
-            if first_token_at is None:
-                first_token_at = time.time()
-                stats.prefill_s = first_token_at - t0
-
-        def _plain_step(tok_arr):
-            """One S=1 decode forward on a (possibly lazy) (1,) token array;
-            returns the LAZY sampled next token. The forward takes the compiled
-            S=1 layer fast path when installed (S==1, mask None)."""
-            nonlocal key
-            hid1 = lm.model(tok_arr[None], cache=mc)
-            lg = _logits(hid1)[0, -1]
-            if self.temp > 0:
-                key, sub = mx.random.split(key)
-                nt = mx.random.categorical(self._spec_scaled(lg), key=sub)
+            # Prefill everything but the last token — identical contract to the
+            # block path, including the degenerate fully-cached-prompt branch.
+            if not suffix:
+                self._reset_cache()
+                mc = self._cache
+                common, suffix = 0, list(prompt_ids)
+                stats.prompt_tokens, stats.cached_tokens = len(suffix) - 1, 0
+                if not _prefill_head():
+                    return "", stats
+                y_val = suffix[-1]
             else:
-                nt = mx.argmax(lg)
-            return nt.astype(mx.uint32).reshape(1)
+                if not _prefill_head():
+                    return "", stats
+                y_val = suffix[-1]
 
-        def _wide_verify(pv, draft):
-            """Feed [pv]+draft in one batched forward; exact point-mass
-            rejection sampling; capture-replay rollback on partial rejection.
-            Returns (n_acc, next_tok)."""
-            nonlocal key
-            k = len(draft)
-            rec_snap = self._snap_recurrent()
-            coll = {"conv": [], "args": []}
-            y = mx.array([pv] + draft, dtype=mx.uint32)
-            try:
-                mlx_fastpath.GDN_COLLECTOR = coll
-                hid = lm.model(y[None], cache=mc)
-                logits = _logits(hid)[0]
-            finally:
-                mlx_fastpath.GDN_COLLECTOR = None
-            if self.temp > 0:
-                scaled = self._spec_scaled(logits)
-                # Two-phase accept: evaluate the k Bernoulli tests first
-                # (tiny), find n_acc on the host, then build ONE residual
-                # resample. The block path builds all k+1 candidate draws
-                # lazily to save a sync, but at k=31 that is 31 wasted
-                # 248k-vocab categoricals per step; a second tiny eval is
-                # cheaper here.
-                p = mx.softmax(scaled, axis=-1)
-                dr = mx.array(draft, dtype=mx.uint32)
-                p_sel = mx.take_along_axis(p[:k], dr[:, None], axis=-1)[:, 0]
-                key, sub = mx.random.split(key)
-                u = mx.random.uniform(shape=(k,), key=sub)
-                ok = u <= p_sel          # point-mass q: accept w.p. p(d)
-                mx.eval(ok)
-                okl = ok.tolist()
-                n_acc = 0
-                while n_acc < k and okl[n_acc]:
-                    n_acc += 1
-                key, sub = mx.random.split(key)
-                if n_acc < k:
-                    # residual of a point mass: p with the draft token's
-                    # mass removed (renormalized by categorical)
-                    resid = mx.where(
-                        mx.arange(p.shape[-1]) == dr[n_acc], 0.0, p[n_acc])
-                    nt = mx.where(
-                        resid.sum() > 0,
-                        mx.random.categorical(mx.log(resid + 1e-30), key=sub),
-                        mx.random.categorical(scaled[n_acc], key=sub))
+            key = mx.random.key(int.from_bytes(os.urandom(4), "little"))
+            first_token_at = None
+            out_ids = []
+            fed_ids = list(prompt_ids[:-1])
+            detok = self.tok.detokenizer
+            detok.reset()
+
+            # Growing numpy context buffer for the per-step n-gram lookup
+            # (always ends at the last MATERIALIZED token).
+            ctx = np.empty(len(prompt_ids) + max_tokens + 64, dtype=np.int64)
+            ctx[: len(prompt_ids)] = prompt_ids
+            ctx_n = len(prompt_ids)
+
+            def _push_ctx(tid):
+                nonlocal ctx, ctx_n
+                if ctx_n == len(ctx):
+                    ctx = np.concatenate([ctx, np.empty_like(ctx)])
+                ctx[ctx_n] = tid
+                ctx_n += 1
+
+            def _commit(tid):
+                """Emit one generated token. Returns True when generation must
+                stop (eos / budget); the token is then NOT emitted."""
+                if tid in eos or len(out_ids) >= max_tokens:
+                    return True
+                out_ids.append(tid)
+                self._seen.append(tid)
+                _push_ctx(tid)
+                detok.add_token(tid)
+                if on_token:
+                    seg = detok.last_segment
+                    if seg:
+                        on_token(seg)
+                return False
+
+            def _mark_first():
+                nonlocal first_token_at
+                if first_token_at is None:
+                    first_token_at = time.time()
+                    stats.prefill_s = first_token_at - t0
+
+            def _plain_step(tok_arr):
+                """One S=1 decode forward on a (possibly lazy) (1,) token array;
+                returns the LAZY sampled next token. The forward takes the compiled
+                S=1 layer fast path when installed (S==1, mask None)."""
+                nonlocal key
+                hid1 = lm.model(tok_arr[None], cache=mc)
+                lg = _logits(hid1)[0, -1]
+                if self.temp > 0:
+                    key, sub = mx.random.split(key)
+                    nt = mx.random.categorical(self._spec_scaled(lg), key=sub)
                 else:
-                    nt = mx.random.categorical(scaled[k], key=sub)
-                mx.eval(nt)
-                next_tok = int(nt)
-            else:
-                toks = mx.argmax(logits, axis=-1)
-                mx.eval(toks)
-                toks = [int(t) for t in toks.tolist()]
-                n_acc = 0
-                while n_acc < k and toks[n_acc] == draft[n_acc]:
-                    n_acc += 1
-                next_tok = toks[n_acc]
-            stats.forwards += 1
-            stats.draft_proposed += k
-            stats.draft_accepted += n_acc
+                    nt = mx.argmax(lg)
+                return nt.astype(mx.uint32).reshape(1)
 
-            # Roll the main cache back over rejected drafts (identical
-            # mechanism to _generate_spec's hybrid branch).
-            if k - n_acc > 0:
-                arr = [c for c in mc
-                       if isinstance(c, cache_utils.ArraysCache)]
-                if len(coll["conv"]) == len(arr):
-                    from mlx_lm.models.qwen3_5 import gated_delta_update
-                    n_keep = n_acc + 1
-                    for c, ci, (q_, k_, v_, a_, b_, A_log, dt_bias,
-                                st0, use_k) in zip(
-                            arr, coll["conv"], coll["args"]):
-                        nk = ci.shape[1] - (k + 1)
-                        c.cache[0] = mx.contiguous(
-                            ci[:, n_keep : n_keep + nk])
-                        _, st = gated_delta_update(
-                            q_[:, :n_keep], k_[:, :n_keep],
-                            v_[:, :n_keep], a_[:, :n_keep],
-                            b_[:, :n_keep], A_log, dt_bias, st0, None,
-                            use_kernel=use_k)
-                        c.cache[1] = st
-                    self._trim_kv(k - n_acc)
+            def _wide_verify(pv, draft):
+                """Feed [pv]+draft in one batched forward; exact point-mass
+                rejection sampling; capture-replay rollback on partial rejection.
+                Returns (n_acc, next_tok)."""
+                nonlocal key
+                k = len(draft)
+                rec_snap = self._snap_recurrent()
+                coll = {"conv": [], "args": []}
+                y = mx.array([pv] + draft, dtype=mx.uint32)
+                try:
+                    mlx_fastpath.GDN_COLLECTOR = coll
+                    hid = lm.model(y[None], cache=mc)
+                    logits = _logits(hid)[0]
+                finally:
+                    mlx_fastpath.GDN_COLLECTOR = None
+                if self.temp > 0:
+                    scaled = self._spec_scaled(logits)
+                    # Two-phase accept: evaluate the k Bernoulli tests first
+                    # (tiny), find n_acc on the host, then build ONE residual
+                    # resample. The block path builds all k+1 candidate draws
+                    # lazily to save a sync, but at k=31 that is 31 wasted
+                    # 248k-vocab categoricals per step; a second tiny eval is
+                    # cheaper here.
+                    p = mx.softmax(scaled, axis=-1)
+                    dr = mx.array(draft, dtype=mx.uint32)
+                    p_sel = mx.take_along_axis(p[:k], dr[:, None], axis=-1)[:, 0]
+                    key, sub = mx.random.split(key)
+                    u = mx.random.uniform(shape=(k,), key=sub)
+                    ok = u <= p_sel          # point-mass q: accept w.p. p(d)
+                    mx.eval(ok)
+                    okl = ok.tolist()
+                    n_acc = 0
+                    while n_acc < k and okl[n_acc]:
+                        n_acc += 1
+                    key, sub = mx.random.split(key)
+                    if n_acc < k:
+                        # residual of a point mass: p with the draft token's
+                        # mass removed (renormalized by categorical)
+                        resid = mx.where(
+                            mx.arange(p.shape[-1]) == dr[n_acc], 0.0, p[n_acc])
+                        nt = mx.where(
+                            resid.sum() > 0,
+                            mx.random.categorical(mx.log(resid + 1e-30), key=sub),
+                            mx.random.categorical(scaled[n_acc], key=sub))
+                    else:
+                        nt = mx.random.categorical(scaled[k], key=sub)
+                    mx.eval(nt)
+                    next_tok = int(nt)
                 else:
-                    # Fallback (no fastpath GDN, so no checkpoints): restore
-                    # the pre-forward snapshot and re-feed the accepted
-                    # prefix — correct but one extra forward.
-                    self._restore_recurrent(rec_snap)
-                    self._trim_kv(k + 1)
-                    refeed = mx.array([pv] + draft[:n_acc], dtype=mx.uint32)
-                    self.model(refeed[None], cache=mc)
-                    mx.eval([c.state for c in mc])
-            fed_ids.append(pv)
-            fed_ids.extend(draft[:n_acc])
-            return n_acc, next_tok
+                    toks = mx.argmax(logits, axis=-1)
+                    mx.eval(toks)
+                    toks = [int(t) for t in toks.tolist()]
+                    n_acc = 0
+                    while n_acc < k and toks[n_acc] == draft[n_acc]:
+                        n_acc += 1
+                    next_tok = toks[n_acc]
+                stats.forwards += 1
+                stats.draft_proposed += k
+                stats.draft_accepted += n_acc
 
-        # Two-state decode loop.
-        #   COMMITTED state (pend_val is not None): the pending token is a
-        #     materialized int, already emitted (or a prompt token), NOT yet
-        #     fed. This is where wide verifies launch from.
-        #   LAZY state (pend is an mx array): the pending token is the lazy
-        #     sample of an in-flight forward whose input is already fed —
-        #     the same one-behind pipelining as stream_generate, so cold
-        #     (no-span) decode pays no per-step sync bubble.
-        # The stale-context lookup runs each iteration either way; a wide
-        # verify only fires when the lookup's predicted NEXT token (d[0])
-        # matches the actual pending token — an evidence gate that both
-        # bounds the sync cost and filters false span entries.
-        pend_val = y_val         # conditioning token: committed, unfed
-        pend = None
-        stop = False
-        while not stop and len(out_ids) < max_tokens:
-            if should_stop and should_stop():
-                break
-            # The context buffer ends at the last committed token. In the
-            # COMMITTED state that token is the (unfed) pending token itself,
-            # so d[0] is the first token a verify from it should draft. In the
-            # LAZY state the pending token is still in flight, so d[0] is the
-            # lookup's PREDICTION of it — the evidence gate below only enters
-            # a span when that prediction matches the materialized sample.
-            d, ng = prompt_lookup_draft_arr(
-                ctx, ctx_n, self.pld_wide_draft + 1,
-                self.pld_wide_ngram, self.pld_wide_min_ngram)
-            candidate = (ng >= self.pld_wide_min_ngram
-                         and len(d) >= self.pld_wide_min_draft + 1)
+                # Roll the main cache back over rejected drafts (identical
+                # mechanism to _generate_spec's hybrid branch).
+                if k - n_acc > 0:
+                    arr = [c for c in mc
+                           if isinstance(c, cache_utils.ArraysCache)]
+                    if len(coll["conv"]) == len(arr):
+                        from mlx_lm.models.qwen3_5 import gated_delta_update
+                        n_keep = n_acc + 1
+                        for c, ci, (q_, k_, v_, a_, b_, A_log, dt_bias,
+                                    st0, use_k) in zip(
+                                arr, coll["conv"], coll["args"]):
+                            nk = ci.shape[1] - (k + 1)
+                            c.cache[0] = mx.contiguous(
+                                ci[:, n_keep : n_keep + nk])
+                            _, st = gated_delta_update(
+                                q_[:, :n_keep], k_[:, :n_keep],
+                                v_[:, :n_keep], a_[:, :n_keep],
+                                b_[:, :n_keep], A_log, dt_bias, st0, None,
+                                use_kernel=use_k)
+                            c.cache[1] = st
+                        self._trim_kv(k - n_acc)
+                    else:
+                        # Fallback (no fastpath GDN, so no checkpoints): restore
+                        # the pre-forward snapshot and re-feed the accepted
+                        # prefix — correct but one extra forward.
+                        self._restore_recurrent(rec_snap)
+                        self._trim_kv(k + 1)
+                        refeed = mx.array([pv] + draft[:n_acc], dtype=mx.uint32)
+                        self.model(refeed[None], cache=mc)
+                        mx.eval([c.state for c in mc])
+                fed_ids.append(pv)
+                fed_ids.extend(draft[:n_acc])
+                return n_acc, next_tok
 
-            draft = []
-            pv = None
-            if pend_val is None:
-                # LAZY state. No span candidate: submit the next forward on
-                # the lazy token FIRST, then materialize+commit one behind.
-                # (Falls through to the shared stop_condition / think-ceiling
-                # checks below — an early `continue` here silently disabled
-                # stop_condition on cold decode, which in the agent loop means
-                # every step runs to max_tokens.)
-                if not candidate:
-                    nxt = _plain_step(pend)
-                    mx.async_eval(nxt)
-                    pvc = int(pend)
+            # Two-state decode loop.
+            #   COMMITTED state (pend_val is not None): the pending token is a
+            #     materialized int, already emitted (or a prompt token), NOT yet
+            #     fed. This is where wide verifies launch from.
+            #   LAZY state (pend is an mx array): the pending token is the lazy
+            #     sample of an in-flight forward whose input is already fed —
+            #     the same one-behind pipelining as stream_generate, so cold
+            #     (no-span) decode pays no per-step sync bubble.
+            # The stale-context lookup runs each iteration either way; a wide
+            # verify only fires when the lookup's predicted NEXT token (d[0])
+            # matches the actual pending token — an evidence gate that both
+            # bounds the sync cost and filters false span entries.
+            pend_val = y_val         # conditioning token: committed, unfed
+            pend = None
+            stop = False
+            while not stop and len(out_ids) < max_tokens:
+                if should_stop and should_stop():
+                    break
+                # The context buffer ends at the last committed token. In the
+                # COMMITTED state that token is the (unfed) pending token itself,
+                # so d[0] is the first token a verify from it should draft. In the
+                # LAZY state the pending token is still in flight, so d[0] is the
+                # lookup's PREDICTION of it — the evidence gate below only enters
+                # a span when that prediction matches the materialized sample.
+                d, ng = prompt_lookup_draft_arr(
+                    ctx, ctx_n, self.pld_wide_draft + 1,
+                    self.pld_wide_ngram, self.pld_wide_min_ngram)
+                candidate = (ng >= self.pld_wide_min_ngram
+                             and len(d) >= self.pld_wide_min_draft + 1)
+
+                draft = []
+                pv = None
+                if pend_val is None:
+                    # LAZY state. No span candidate: submit the next forward on
+                    # the lazy token FIRST, then materialize+commit one behind.
+                    # (Falls through to the shared stop_condition / think-ceiling
+                    # checks below — an early `continue` here silently disabled
+                    # stop_condition on cold decode, which in the agent loop means
+                    # every step runs to max_tokens.)
+                    if not candidate:
+                        nxt = _plain_step(pend)
+                        mx.async_eval(nxt)
+                        pvc = int(pend)
+                        _mark_first()
+                        fed_ids.append(pvc)
+                        stop = _commit(pvc)
+                        if not stop and stop_texts \
+                                and any(s in detok.text for s in stop_texts):
+                            stop = True
+                        pend = nxt
+                    else:
+                        # Span candidate: materialize the pending token (the only
+                        # forward in flight is its own producer). If the lookup
+                        # predicted it, verify the continuation; else feed it and
+                        # return to the pipeline.
+                        pv = int(pend)
+                        _mark_first()
+                        stop = _commit(pv)
+                        if stop:
+                            break
+                        pend = None
+                        if pv == d[0]:
+                            draft = d[1:]
+                else:
+                    pv = pend_val
+                    pend_val = None
+                    if candidate:
+                        draft = d[: self.pld_wide_draft]
+
+                if stop:
+                    break
+                if draft:
+                    n_acc, next_tok = _wide_verify(pv, draft)
                     _mark_first()
-                    fed_ids.append(pvc)
-                    stop = _commit(pvc)
+                    for tid in draft[:n_acc]:
+                        stop = _commit(tid)
+                        if stop:
+                            break
+                    if not stop:
+                        stop = _commit(next_tok)
                     if not stop and stop_texts \
                             and any(s in detok.text for s in stop_texts):
                         stop = True
-                    pend = nxt
-                else:
-                    # Span candidate: materialize the pending token (the only
-                    # forward in flight is its own producer). If the lookup
-                    # predicted it, verify the continuation; else feed it and
-                    # return to the pipeline.
-                    pv = int(pend)
-                    _mark_first()
-                    stop = _commit(pv)
-                    if stop:
-                        break
-                    pend = None
-                    if pv == d[0]:
-                        draft = d[1:]
-            else:
-                pv = pend_val
-                pend_val = None
-                if candidate:
-                    draft = d[: self.pld_wide_draft]
+                    pend_val = next_tok   # committed, unfed: ready to verify again
+                elif pv is not None:
+                    # Committed pending token, no (confirmed) span: feed it and
+                    # return to the lazy pipeline.
+                    fed_ids.append(pv)
+                    pend = _plain_step(mx.array([pv], dtype=mx.uint32))
+                    mx.async_eval(pend)
 
-            if stop:
-                break
-            if draft:
-                n_acc, next_tok = _wide_verify(pv, draft)
-                _mark_first()
-                for tid in draft[:n_acc]:
-                    stop = _commit(tid)
-                    if stop:
-                        break
-                if not stop:
-                    stop = _commit(next_tok)
-                if not stop and stop_texts \
-                        and any(s in detok.text for s in stop_texts):
+                if not stop and stop_condition is not None \
+                        and stop_condition(detok.text, len(out_ids)):
+                    stats.stop_condition_fired = True
                     stop = True
-                pend_val = next_tok   # committed, unfed: ready to verify again
-            elif pv is not None:
-                # Committed pending token, no (confirmed) span: feed it and
-                # return to the lazy pipeline.
-                fed_ids.append(pv)
-                pend = _plain_step(mx.array([pv], dtype=mx.uint32))
-                mx.async_eval(pend)
 
-            if not stop and stop_condition is not None \
-                    and stop_condition(detok.text, len(out_ids)):
-                stats.stop_condition_fired = True
-                stop = True
-
-            # -- think-ceiling close-and-continue ---------------------------
-            # Same salvage as the block path (this loop also runs at temp>0);
-            # a plain prefix-extension forward, no trim logic.
-            if (not stop and not stats.salvaged
-                    and think_ceiling_hit(detok.text, len(out_ids),
-                                          think_ceiling)):
-                if pend_val is None:
-                    pv = int(pend)
-                    _mark_first()
-                    stop = _commit(pv)
-                    if stop:
+                # -- think-ceiling close-and-continue ---------------------------
+                # Same salvage as the block path (this loop also runs at temp>0);
+                # a plain prefix-extension forward, no trim logic.
+                if (not stop and not stats.salvaged
+                        and think_ceiling_hit(detok.text, len(out_ids),
+                                              think_ceiling)):
+                    if pend_val is None:
+                        pv = int(pend)
+                        _mark_first()
+                        stop = _commit(pv)
+                        if stop:
+                            break
+                        pend, pend_val = None, pv
+                    close_ids = list(self.tok.encode(THINK_CLOSE,
+                                                     add_special_tokens=False))
+                    y2 = mx.array([pend_val] + close_ids, dtype=mx.uint32)
+                    hid2 = lm.model(y2[None], cache=mc)
+                    logits2 = _logits(hid2)[0, -1]
+                    if self.temp > 0:
+                        key, sub = mx.random.split(key)
+                        nt = mx.random.categorical(self._spec_scaled(logits2),
+                                                   key=sub)
+                    else:
+                        nt = mx.argmax(logits2)
+                    mx.eval(nt)
+                    fed_ids.append(pend_val)
+                    fed_ids.extend(close_ids)
+                    for tid in close_ids:
+                        out_ids.append(tid)
+                        _push_ctx(tid)
+                        detok.add_token(tid)
+                        if on_token:
+                            seg = detok.last_segment
+                            if seg:
+                                on_token(seg)
+                    stats.salvaged = True
+                    nt = int(nt)
+                    if _commit(nt):
                         break
-                    pend, pend_val = None, pv
-                close_ids = list(self.tok.encode(THINK_CLOSE,
-                                                 add_special_tokens=False))
-                y2 = mx.array([pend_val] + close_ids, dtype=mx.uint32)
-                hid2 = lm.model(y2[None], cache=mc)
-                logits2 = _logits(hid2)[0, -1]
-                if self.temp > 0:
-                    key, sub = mx.random.split(key)
-                    nt = mx.random.categorical(self._spec_scaled(logits2),
-                                               key=sub)
-                else:
-                    nt = mx.argmax(logits2)
-                mx.eval(nt)
-                fed_ids.append(pend_val)
-                fed_ids.extend(close_ids)
-                for tid in close_ids:
-                    out_ids.append(tid)
-                    _push_ctx(tid)
-                    detok.add_token(tid)
-                    if on_token:
-                        seg = detok.last_segment
-                        if seg:
-                            on_token(seg)
-                stats.salvaged = True
-                nt = int(nt)
-                if _commit(nt):
-                    break
-                pend_val = nt
+                    pend_val = nt
 
-        detok.finalize()
-        if on_token and detok.last_segment:
-            on_token(detok.last_segment)
-        stats.gen_s = time.time() - (first_token_at or t0)
-        stats.generated_tokens = len(out_ids)
-        stats.gen_ids = list(out_ids)
-        self._cached_ids = fed_ids
-        mx.clear_cache()
-        return detok.text, stats
+            detok.finalize()
+            if on_token and detok.last_segment:
+                on_token(detok.last_segment)
+            stats.gen_s = time.time() - (first_token_at or t0)
+            stats.generated_tokens = len(out_ids)
+            stats.gen_ids = list(out_ids)
+            self._cached_ids = fed_ids
+            mx.clear_cache()
+            return detok.text, stats
+        except BaseException:
+            self._settle_after_error(fed_ids)
+            raise
 
     # -- speculative decoding ----------------------------------------------
 
@@ -2281,344 +2338,351 @@ class Engine:
         """
         from . import mlx_fastpath
 
-        common = self._sync_to(prompt_ids)
-        suffix = prompt_ids[common:]
-        stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
-        if on_prefill:
-            on_prefill(stats.prompt_tokens, stats.cached_tokens)
+        # `fed_ids` (set once decoding starts) is this loop's ledger; if anything below
+        # raises, _settle_after_error decides whether the cache still matches it.
+        fed_ids = None
+        try:
+            common = self._sync_to(prompt_ids)
+            suffix = prompt_ids[common:]
+            stats = GenStats(prompt_tokens=len(suffix), cached_tokens=common)
+            if on_prefill:
+                on_prefill(stats.prompt_tokens, stats.cached_tokens)
 
-        mc = self._cache
-        eos = self._eos_ids()
-        lm = self.model.language_model
-        embed = lm.model.embed_tokens
+            mc = self._cache
+            eos = self._eos_ids()
+            lm = self.model.language_model
+            embed = lm.model.embed_tokens
 
-        def _logits(h):
-            if lm.args.tie_word_embeddings:
-                return embed.as_linear(h)
-            return lm.lm_head(h)
+            def _logits(h):
+                if lm.args.tie_word_embeddings:
+                    return embed.as_linear(h)
+                return lm.lm_head(h)
 
-        hybrid = self._pld_hybrid and not self._trimmable
-        t0 = time.time()
+            hybrid = self._pld_hybrid and not self._trimmable
+            t0 = time.time()
 
-        drafter = _DFlashDrafter(self, embed, _logits)
-        drafter.start_turn()
+            drafter = _DFlashDrafter(self, embed, _logits)
+            drafter.start_turn()
 
-        def _prefill_head():
-            with drafter.tapped():
-                fed = self._prefill(suffix[:-1], should_stop,
-                                    on_progress=on_prefill_progress,
-                                    on_chunk=drafter.on_prefill_chunk)
-            if fed < len(suffix) - 1:  # interrupted mid-prefill
-                self._cached_ids = list(prompt_ids[: common + fed])
-                stats.prefill_s = time.time() - t0
-                return False
-            self._take_rewind_snapshot(common + fed)
-            return True
+            def _prefill_head():
+                with drafter.tapped():
+                    fed = self._prefill(suffix[:-1], should_stop,
+                                        on_progress=on_prefill_progress,
+                                        on_chunk=drafter.on_prefill_chunk)
+                if fed < len(suffix) - 1:  # interrupted mid-prefill
+                    self._cached_ids = list(prompt_ids[: common + fed])
+                    stats.prefill_s = time.time() - t0
+                    return False
+                self._take_rewind_snapshot(common + fed)
+                return True
 
-        # Prefill everything but the last token — identical contract to the
-        # PLD path, including the degenerate fully-cached-prompt branches.
-        if not suffix:
-            if hybrid:
-                self._reset_cache()
-                mc = self._cache
-                common, suffix = 0, list(prompt_ids)
-                stats.prompt_tokens, stats.cached_tokens = len(suffix) - 1, 0
+            # Prefill everything but the last token — identical contract to the
+            # PLD path, including the degenerate fully-cached-prompt branches.
+            if not suffix:
+                if hybrid:
+                    self._reset_cache()
+                    mc = self._cache
+                    common, suffix = 0, list(prompt_ids)
+                    stats.prompt_tokens, stats.cached_tokens = len(suffix) - 1, 0
+                    if not _prefill_head():
+                        return "", stats
+                    y_val = suffix[-1]
+                else:
+                    cache_utils.trim_prompt_cache(mc, 1)
+                    y_val = prompt_ids[-1]
+                    stats.prompt_tokens, stats.cached_tokens = 1, common - 1
+            else:
                 if not _prefill_head():
                     return "", stats
                 y_val = suffix[-1]
-            else:
-                cache_utils.trim_prompt_cache(mc, 1)
-                y_val = prompt_ids[-1]
-                stats.prompt_tokens, stats.cached_tokens = 1, common - 1
-        else:
-            if not _prefill_head():
-                return "", stats
-            y_val = suffix[-1]
 
-        policy = drafter.policy
-        rng = _Rng(mx.random.key(int.from_bytes(os.urandom(4), "little")))
-        first_token_at = None
-        out_ids = []
-        fed_ids = list(prompt_ids[:-1])
-        detok = self.tok.detokenizer
-        detok.reset()
+            policy = drafter.policy
+            rng = _Rng(mx.random.key(int.from_bytes(os.urandom(4), "little")))
+            first_token_at = None
+            out_ids = []
+            fed_ids = list(prompt_ids[:-1])
+            detok = self.tok.detokenizer
+            detok.reset()
 
-        while len(out_ids) < max_tokens:
-            if should_stop and should_stop():
-                break
-            round_t0 = time.time()
-            k = drafter.depth()
-            # Never draft past the token budget: the tail of the window is a
-            # plain (or shallower) step, not a wasted deep round.
-            k = min(k, max(0, max_tokens - len(out_ids) - 1))
-
-            # -- draft -------------------------------------------------------
-            # Proposals stay LAZY: d_arrs are k scalar arrays and one eval
-            # after the verify fetches them with the accept — one host sync.
-            # q_rows, when the proposal was SAMPLED, is one dense proposal
-            # distribution per draft (the q of rejection sampling); empty for
-            # argmax proposals, which accept as a point mass.
-            draft, q_rows, d_arrs = [], [], []
-            if k:
-                d_arrs, q_rows = drafter.propose(k, y_val, rng)
-                if self.presence_penalty and self.temp > 0:
-                    # seen_rows (below) needs the draft ids on the host BEFORE
-                    # the verify graph is built. Everyone else reads them after
-                    # the accept eval, so the pp-off path (the thinking-mode
-                    # recipe) defers this sync into that one — one host
-                    # round-trip per step instead of two.
-                    mx.eval(d_arrs)
-                    draft = [int(x) for x in d_arrs]
-
-            # -- verify: one batched main forward ---------------------------
-            # On the hybrid, arm the GDN checkpoint collector: the verify
-            # forward then steps the recurrence per position (batched matmuls
-            # untouched) and records restorable states, so a partial rejection
-            # below rolls back by reference instead of re-feeding — the
-            # re-feed tax is what made speculation a wash on recurrent caches.
-            rec_snap = self._snap_recurrent() if hybrid else None
-            coll = {"conv": [], "args": []} if (hybrid and k) else None
-            # Build the verify input from the (possibly still-lazy) draft
-            # arrays — no host ids needed to construct the graph.
-            y = (mx.concatenate([mx.array([y_val], dtype=mx.uint32)]
-                                + [d.reshape(1).astype(mx.uint32)
-                                   for d in d_arrs])
-                 if k else mx.array([y_val], dtype=mx.uint32))
-            try:
-                mlx_fastpath.GDN_COLLECTOR = coll
-                with drafter.tapped():
-                    hid = lm.model(y[None], cache=mc)
-                logits = _logits(hid)[0]
-            finally:
-                mlx_fastpath.GDN_COLLECTOR = None
-            fused = drafter.collect()
-            if self.temp > 0:
-                # Row j of the verify predicts the token AFTER draft[:j], so its
-                # presence history is the committed history plus exactly those
-                # drafts — which are already materialized ints by here, so this
-                # costs no extra sync. Getting this right is what keeps the
-                # speculative output distribution identical to plain decoding:
-                # rejection sampling preserves whatever p is, so p must be the
-                # SAME p a plain step would have built at that position. (The
-                # draft chain above is free to use the round-start history — it
-                # only defines the proposal q, which the correction cancels.)
-                seen_rows = ([self._seen + draft[:j] for j in range(k + 1)]
-                             if (self.presence_penalty and k) else None)
-                scaled = self._spec_scaled(logits, seen_rows=seen_rows)
-                p = mx.softmax(scaled, axis=-1)
-                n_acc = 0
-                if k:
-                    # Acceptance tests AND every possible next-token draw are
-                    # built lazily and fetched in ONE eval: candidate j is the
-                    # residual resample norm(max(p_j - q_j, 0)) — the
-                    # Leviathan/Chen correction that keeps the joint output
-                    # distribution exactly p — and candidate k is the bonus
-                    # token; the host then just indexes with n_acc.
-                    dr = y[1:]                 # the k draft ids, still lazy
-                    p_sel = mx.take_along_axis(p[:k], dr[:, None], axis=-1)[:, 0]
-                    u = mx.random.uniform(shape=(k,), key=rng.split())
-                    if q_rows:
-                        q = mx.stack(q_rows)
-                        q_sel = mx.take_along_axis(q, dr[:, None],
-                                                   axis=-1)[:, 0]
-                        ok = u * q_sel <= p_sel
-                    else:
-                        ok = u <= p_sel      # point-mass q: accept w.p. p(d)
-                    cand = []
-                    for j in range(k):
-                        if q_rows:
-                            resid = mx.maximum(p[j] - q_rows[j], 0.0)
-                        else:
-                            # residual of a point mass: p with the draft
-                            # token's mass removed
-                            resid = mx.where(
-                                mx.arange(p.shape[-1]) == dr[j], 0.0, p[j])
-                        sub = rng.split()
-                        cand.append(mx.where(
-                            resid.sum() > 0,
-                            mx.random.categorical(mx.log(resid + 1e-30),
-                                                  key=sub),
-                            mx.random.categorical(scaled[j], key=sub)))
-                    cand.append(mx.random.categorical(scaled[k], key=rng.split()))
-                    mx.eval(ok, cand, d_arrs)   # the round's ONE host sync
-                    if not draft:
-                        draft = [int(x) for x in d_arrs]
-                    okl = ok.tolist()
-                    while n_acc < k and okl[n_acc]:
-                        n_acc += 1
-                    next_tok = int(cand[n_acc])
-                else:
-                    nt = mx.random.categorical(scaled[0], key=rng.split())
-                    mx.eval(nt)
-                    next_tok = int(nt)
-            else:
-                toks = mx.argmax(logits, axis=-1)
-                # Top-2 values feed the policy's pending-margin gate: a
-                # near-tie next token is where the head is about to miss,
-                # whatever its streak says. Same eval — no extra host sync.
-                t2 = mx.topk(logits, 2, axis=-1) if policy is not None else None
-                mx.eval(toks, d_arrs) if t2 is None else mx.eval(toks, d_arrs, t2)
-                if k and not draft:
-                    draft = [int(x) for x in d_arrs]
-                toks = [int(t) for t in toks.tolist()]
-                n_acc = 0
-                while n_acc < k and toks[n_acc] == draft[n_acc]:
-                    n_acc += 1
-                next_tok = toks[n_acc]
-                if t2 is not None:
-                    row = t2[n_acc]
-                    policy.margin = abs(float(row[0]) - float(row[1]))
-            if first_token_at is None:
-                first_token_at = time.time()
-                stats.prefill_s = first_token_at - t0
-            stats.forwards += 1
-            stats.draft_proposed += k
-            stats.draft_accepted += n_acc
-            if policy is not None and k:
-                # An accepted draft that IS a stop token ends the walk without
-                # indicting the next position — the round ended because the
-                # generation did, not because the head missed.
-                policy.record(k, n_acc,
-                              stopped_early=(n_acc > 0
-                                             and draft[n_acc - 1] in eos))
-            if policy is not None:
-                # The measured wall of THIS round (draft + verify + the one
-                # host sync) re-prices its depth in the policy's cost table —
-                # the seed ladder only has to be right about shape, not units.
-                policy.observe_cost(k, time.time() - round_t0)
-
-            # -- roll the main cache back over rejected drafts --------------
-            if k - n_acc > 0:
-                if hybrid:
-                    arr = [c for c in mc
-                           if isinstance(c, cache_utils.ArraysCache)]
-                    if coll is not None and len(coll["conv"]) == len(arr):
-                        # Lazy replay: land every GDN layer at exactly
-                        # `n_keep` fed tokens by re-running the recurrence
-                        # over the accepted prefix from the captured
-                        # pre-round state — the recurrence is causal, so the
-                        # state after n_keep tokens is independent of the
-                        # rejected tail. One tiny lazy kernel per GDN layer,
-                        # paid only on rejection. The conv window after n
-                        # tokens of a chunk is conv_input[:, n : n+nk];
-                        # attention KV trims natively. No re-feed forward.
-                        from mlx_lm.models.qwen3_5 import gated_delta_update
-                        n_keep = n_acc + 1
-                        for c, ci, (q_, k_, v_, a_, b_, A_log, dt_bias,
-                                    st0, use_k) in zip(
-                                arr, coll["conv"], coll["args"]):
-                            nk = ci.shape[1] - (k + 1)
-                            c.cache[0] = mx.contiguous(
-                                ci[:, n_keep : n_keep + nk])
-                            _, st = gated_delta_update(
-                                q_[:, :n_keep], k_[:, :n_keep],
-                                v_[:, :n_keep], a_[:, :n_keep],
-                                b_[:, :n_keep], A_log, dt_bias, st0, None,
-                                use_kernel=use_k)
-                            c.cache[1] = st
-                        self._trim_kv(k - n_acc)
-                    else:
-                        # Fallback (no fastpath GDN, so no checkpoints):
-                        # restore the pre-forward snapshot and re-feed the
-                        # accepted prefix — correct but one extra forward.
-                        self._restore_recurrent(rec_snap)
-                        self._trim_kv(k + 1)
-                        refeed = mx.array([y_val] + draft[:n_acc],
-                                          dtype=mx.uint32)
-                        self.model(refeed[None], cache=mc)
-                        mx.eval([c.state for c in mc])
-                else:
-                    cache_utils.trim_prompt_cache(mc, k - n_acc)
-
-            # -- reconcile the drafter --------------------------------------
-            # Whatever the drafter keeps about committed positions is updated
-            # from the verify forward's own hiddens for [y_val] + the accepted
-            # drafts — bit-identical to what a re-feed would compute, per the
-            # PLD-hybrid rollback evidence. Speculative entries never survive.
-            drafter.reconcile(k, n_acc, y_val, draft, hid, fused)
-
-            fed_ids.append(y_val)
-            fed_ids.extend(draft[:n_acc])
-
-            # -- commit -----------------------------------------------------
-            committed = draft[:n_acc] + [next_tok]
-            stop = False
-            for tid in committed:
-                if tid in eos or len(out_ids) >= max_tokens:
-                    stop = True
+            while len(out_ids) < max_tokens:
+                if should_stop and should_stop():
                     break
-                out_ids.append(tid)
-                self._seen.append(tid)
-                detok.add_token(tid)
-                if on_token:
-                    seg = detok.last_segment
-                    if seg:
-                        on_token(seg)
-            if not stop and stop_condition is not None \
-                    and stop_condition(detok.text, len(out_ids)):
-                stats.stop_condition_fired = True
-                stop = True
-            y_val = next_tok
-            if stop:
-                break
-            if stop_texts and any(s in detok.text for s in stop_texts):
-                break
+                round_t0 = time.time()
+                k = drafter.depth()
+                # Never draft past the token budget: the tail of the window is a
+                # plain (or shallower) step, not a wasted deep round.
+                k = min(k, max(0, max_tokens - len(out_ids) - 1))
 
-            # -- think-ceiling close-and-continue ---------------------------
-            # This path runs at temp>0 where think spirals live, so unlike PLD
-            # it wires the salvage: feed the pending token + THINK_CLOSE ids in
-            # one forward (a plain prefix-extension — no trim/diff logic), emit
-            # them, catch the drafter up, and keep decoding the action.
-            if (not stats.salvaged
-                    and think_ceiling_hit(detok.text, len(out_ids), think_ceiling)):
-                close_ids = list(self.tok.encode(THINK_CLOSE,
-                                                 add_special_tokens=False))
-                y2 = mx.array([y_val] + close_ids, dtype=mx.uint32)
-                with drafter.tapped():
-                    hid2 = lm.model(y2[None], cache=mc)
-                fused2 = drafter.collect()
-                logits2 = _logits(hid2)[0, -1]
+                # -- draft -------------------------------------------------------
+                # Proposals stay LAZY: d_arrs are k scalar arrays and one eval
+                # after the verify fetches them with the accept — one host sync.
+                # q_rows, when the proposal was SAMPLED, is one dense proposal
+                # distribution per draft (the q of rejection sampling); empty for
+                # argmax proposals, which accept as a point mass.
+                draft, q_rows, d_arrs = [], [], []
+                if k:
+                    d_arrs, q_rows = drafter.propose(k, y_val, rng)
+                    if self.presence_penalty and self.temp > 0:
+                        # seen_rows (below) needs the draft ids on the host BEFORE
+                        # the verify graph is built. Everyone else reads them after
+                        # the accept eval, so the pp-off path (the thinking-mode
+                        # recipe) defers this sync into that one — one host
+                        # round-trip per step instead of two.
+                        mx.eval(d_arrs)
+                        draft = [int(x) for x in d_arrs]
+
+                # -- verify: one batched main forward ---------------------------
+                # On the hybrid, arm the GDN checkpoint collector: the verify
+                # forward then steps the recurrence per position (batched matmuls
+                # untouched) and records restorable states, so a partial rejection
+                # below rolls back by reference instead of re-feeding — the
+                # re-feed tax is what made speculation a wash on recurrent caches.
+                rec_snap = self._snap_recurrent() if hybrid else None
+                coll = {"conv": [], "args": []} if (hybrid and k) else None
+                # Build the verify input from the (possibly still-lazy) draft
+                # arrays — no host ids needed to construct the graph.
+                y = (mx.concatenate([mx.array([y_val], dtype=mx.uint32)]
+                                    + [d.reshape(1).astype(mx.uint32)
+                                       for d in d_arrs])
+                     if k else mx.array([y_val], dtype=mx.uint32))
+                try:
+                    mlx_fastpath.GDN_COLLECTOR = coll
+                    with drafter.tapped():
+                        hid = lm.model(y[None], cache=mc)
+                    logits = _logits(hid)[0]
+                finally:
+                    mlx_fastpath.GDN_COLLECTOR = None
+                fused = drafter.collect()
                 if self.temp > 0:
-                    nt = mx.random.categorical(self._spec_scaled(logits2),
-                                               key=rng.split())
+                    # Row j of the verify predicts the token AFTER draft[:j], so its
+                    # presence history is the committed history plus exactly those
+                    # drafts — which are already materialized ints by here, so this
+                    # costs no extra sync. Getting this right is what keeps the
+                    # speculative output distribution identical to plain decoding:
+                    # rejection sampling preserves whatever p is, so p must be the
+                    # SAME p a plain step would have built at that position. (The
+                    # draft chain above is free to use the round-start history — it
+                    # only defines the proposal q, which the correction cancels.)
+                    seen_rows = ([self._seen + draft[:j] for j in range(k + 1)]
+                                 if (self.presence_penalty and k) else None)
+                    scaled = self._spec_scaled(logits, seen_rows=seen_rows)
+                    p = mx.softmax(scaled, axis=-1)
+                    n_acc = 0
+                    if k:
+                        # Acceptance tests AND every possible next-token draw are
+                        # built lazily and fetched in ONE eval: candidate j is the
+                        # residual resample norm(max(p_j - q_j, 0)) — the
+                        # Leviathan/Chen correction that keeps the joint output
+                        # distribution exactly p — and candidate k is the bonus
+                        # token; the host then just indexes with n_acc.
+                        dr = y[1:]                 # the k draft ids, still lazy
+                        p_sel = mx.take_along_axis(p[:k], dr[:, None], axis=-1)[:, 0]
+                        u = mx.random.uniform(shape=(k,), key=rng.split())
+                        if q_rows:
+                            q = mx.stack(q_rows)
+                            q_sel = mx.take_along_axis(q, dr[:, None],
+                                                       axis=-1)[:, 0]
+                            ok = u * q_sel <= p_sel
+                        else:
+                            ok = u <= p_sel      # point-mass q: accept w.p. p(d)
+                        cand = []
+                        for j in range(k):
+                            if q_rows:
+                                resid = mx.maximum(p[j] - q_rows[j], 0.0)
+                            else:
+                                # residual of a point mass: p with the draft
+                                # token's mass removed
+                                resid = mx.where(
+                                    mx.arange(p.shape[-1]) == dr[j], 0.0, p[j])
+                            sub = rng.split()
+                            cand.append(mx.where(
+                                resid.sum() > 0,
+                                mx.random.categorical(mx.log(resid + 1e-30),
+                                                      key=sub),
+                                mx.random.categorical(scaled[j], key=sub)))
+                        cand.append(mx.random.categorical(scaled[k], key=rng.split()))
+                        mx.eval(ok, cand, d_arrs)   # the round's ONE host sync
+                        if not draft:
+                            draft = [int(x) for x in d_arrs]
+                        okl = ok.tolist()
+                        while n_acc < k and okl[n_acc]:
+                            n_acc += 1
+                        next_tok = int(cand[n_acc])
+                    else:
+                        nt = mx.random.categorical(scaled[0], key=rng.split())
+                        mx.eval(nt)
+                        next_tok = int(nt)
                 else:
-                    nt = mx.argmax(logits2)
-                mx.eval(nt)
-                drafter.after_inject(y_val, close_ids, hid2, fused2)
+                    toks = mx.argmax(logits, axis=-1)
+                    # Top-2 values feed the policy's pending-margin gate: a
+                    # near-tie next token is where the head is about to miss,
+                    # whatever its streak says. Same eval — no extra host sync.
+                    t2 = mx.topk(logits, 2, axis=-1) if policy is not None else None
+                    mx.eval(toks, d_arrs) if t2 is None else mx.eval(toks, d_arrs, t2)
+                    if k and not draft:
+                        draft = [int(x) for x in d_arrs]
+                    toks = [int(t) for t in toks.tolist()]
+                    n_acc = 0
+                    while n_acc < k and toks[n_acc] == draft[n_acc]:
+                        n_acc += 1
+                    next_tok = toks[n_acc]
+                    if t2 is not None:
+                        row = t2[n_acc]
+                        policy.margin = abs(float(row[0]) - float(row[1]))
+                if first_token_at is None:
+                    first_token_at = time.time()
+                    stats.prefill_s = first_token_at - t0
+                stats.forwards += 1
+                stats.draft_proposed += k
+                stats.draft_accepted += n_acc
+                if policy is not None and k:
+                    # An accepted draft that IS a stop token ends the walk without
+                    # indicting the next position — the round ended because the
+                    # generation did, not because the head missed.
+                    policy.record(k, n_acc,
+                                  stopped_early=(n_acc > 0
+                                                 and draft[n_acc - 1] in eos))
+                if policy is not None:
+                    # The measured wall of THIS round (draft + verify + the one
+                    # host sync) re-prices its depth in the policy's cost table —
+                    # the seed ladder only has to be right about shape, not units.
+                    policy.observe_cost(k, time.time() - round_t0)
+
+                # -- roll the main cache back over rejected drafts --------------
+                if k - n_acc > 0:
+                    if hybrid:
+                        arr = [c for c in mc
+                               if isinstance(c, cache_utils.ArraysCache)]
+                        if coll is not None and len(coll["conv"]) == len(arr):
+                            # Lazy replay: land every GDN layer at exactly
+                            # `n_keep` fed tokens by re-running the recurrence
+                            # over the accepted prefix from the captured
+                            # pre-round state — the recurrence is causal, so the
+                            # state after n_keep tokens is independent of the
+                            # rejected tail. One tiny lazy kernel per GDN layer,
+                            # paid only on rejection. The conv window after n
+                            # tokens of a chunk is conv_input[:, n : n+nk];
+                            # attention KV trims natively. No re-feed forward.
+                            from mlx_lm.models.qwen3_5 import gated_delta_update
+                            n_keep = n_acc + 1
+                            for c, ci, (q_, k_, v_, a_, b_, A_log, dt_bias,
+                                        st0, use_k) in zip(
+                                    arr, coll["conv"], coll["args"]):
+                                nk = ci.shape[1] - (k + 1)
+                                c.cache[0] = mx.contiguous(
+                                    ci[:, n_keep : n_keep + nk])
+                                _, st = gated_delta_update(
+                                    q_[:, :n_keep], k_[:, :n_keep],
+                                    v_[:, :n_keep], a_[:, :n_keep],
+                                    b_[:, :n_keep], A_log, dt_bias, st0, None,
+                                    use_kernel=use_k)
+                                c.cache[1] = st
+                            self._trim_kv(k - n_acc)
+                        else:
+                            # Fallback (no fastpath GDN, so no checkpoints):
+                            # restore the pre-forward snapshot and re-feed the
+                            # accepted prefix — correct but one extra forward.
+                            self._restore_recurrent(rec_snap)
+                            self._trim_kv(k + 1)
+                            refeed = mx.array([y_val] + draft[:n_acc],
+                                              dtype=mx.uint32)
+                            self.model(refeed[None], cache=mc)
+                            mx.eval([c.state for c in mc])
+                    else:
+                        cache_utils.trim_prompt_cache(mc, k - n_acc)
+
+                # -- reconcile the drafter --------------------------------------
+                # Whatever the drafter keeps about committed positions is updated
+                # from the verify forward's own hiddens for [y_val] + the accepted
+                # drafts — bit-identical to what a re-feed would compute, per the
+                # PLD-hybrid rollback evidence. Speculative entries never survive.
+                drafter.reconcile(k, n_acc, y_val, draft, hid, fused)
+
                 fed_ids.append(y_val)
-                fed_ids.extend(close_ids)
-                for tid in close_ids:
+                fed_ids.extend(draft[:n_acc])
+
+                # -- commit -----------------------------------------------------
+                committed = draft[:n_acc] + [next_tok]
+                stop = False
+                for tid in committed:
+                    if tid in eos or len(out_ids) >= max_tokens:
+                        stop = True
+                        break
                     out_ids.append(tid)
+                    self._seen.append(tid)
                     detok.add_token(tid)
                     if on_token:
                         seg = detok.last_segment
                         if seg:
                             on_token(seg)
-                stats.salvaged = True
-                # The freshly sampled token must be EMITTED here as well as
-                # made pending: the loop invariant is that the pending token is
-                # already in out_ids (it always enters as a committed bonus
-                # token), and the next iteration only emits what it commits.
-                nt = int(nt)
-                if nt in eos or len(out_ids) >= max_tokens:
+                if not stop and stop_condition is not None \
+                        and stop_condition(detok.text, len(out_ids)):
+                    stats.stop_condition_fired = True
+                    stop = True
+                y_val = next_tok
+                if stop:
                     break
-                out_ids.append(nt)
-                detok.add_token(nt)
-                if on_token:
-                    seg = detok.last_segment
-                    if seg:
-                        on_token(seg)
-                y_val = nt
+                if stop_texts and any(s in detok.text for s in stop_texts):
+                    break
 
-        detok.finalize()
-        if on_token and detok.last_segment:
-            on_token(detok.last_segment)
-        stats.gen_s = time.time() - (first_token_at or t0)
-        stats.generated_tokens = len(out_ids)
-        stats.gen_ids = list(out_ids)
-        self._cached_ids = fed_ids
-        mx.clear_cache()
-        return detok.text, stats
+                # -- think-ceiling close-and-continue ---------------------------
+                # This path runs at temp>0 where think spirals live, so unlike PLD
+                # it wires the salvage: feed the pending token + THINK_CLOSE ids in
+                # one forward (a plain prefix-extension — no trim/diff logic), emit
+                # them, catch the drafter up, and keep decoding the action.
+                if (not stats.salvaged
+                        and think_ceiling_hit(detok.text, len(out_ids), think_ceiling)):
+                    close_ids = list(self.tok.encode(THINK_CLOSE,
+                                                     add_special_tokens=False))
+                    y2 = mx.array([y_val] + close_ids, dtype=mx.uint32)
+                    with drafter.tapped():
+                        hid2 = lm.model(y2[None], cache=mc)
+                    fused2 = drafter.collect()
+                    logits2 = _logits(hid2)[0, -1]
+                    if self.temp > 0:
+                        nt = mx.random.categorical(self._spec_scaled(logits2),
+                                                   key=rng.split())
+                    else:
+                        nt = mx.argmax(logits2)
+                    mx.eval(nt)
+                    drafter.after_inject(y_val, close_ids, hid2, fused2)
+                    fed_ids.append(y_val)
+                    fed_ids.extend(close_ids)
+                    for tid in close_ids:
+                        out_ids.append(tid)
+                        detok.add_token(tid)
+                        if on_token:
+                            seg = detok.last_segment
+                            if seg:
+                                on_token(seg)
+                    stats.salvaged = True
+                    # The freshly sampled token must be EMITTED here as well as
+                    # made pending: the loop invariant is that the pending token is
+                    # already in out_ids (it always enters as a committed bonus
+                    # token), and the next iteration only emits what it commits.
+                    nt = int(nt)
+                    if nt in eos or len(out_ids) >= max_tokens:
+                        break
+                    out_ids.append(nt)
+                    detok.add_token(nt)
+                    if on_token:
+                        seg = detok.last_segment
+                        if seg:
+                            on_token(seg)
+                    y_val = nt
+
+            detok.finalize()
+            if on_token and detok.last_segment:
+                on_token(detok.last_segment)
+            stats.gen_s = time.time() - (first_token_at or t0)
+            stats.generated_tokens = len(out_ids)
+            stats.gen_ids = list(out_ids)
+            self._cached_ids = fed_ids
+            mx.clear_cache()
+            return detok.text, stats
+        except BaseException:
+            self._settle_after_error(fed_ids)
+            raise
 
 
 class _Rng:

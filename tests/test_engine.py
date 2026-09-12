@@ -1020,6 +1020,163 @@ def test_bounded_rewind_orchestration():
     check("snapshot at divergence: common intact", common == 12, common)
 
 
+def test_rewind_to_honors_short_prefill():
+    """Tier 1 (no weights): the bounded rewind records only what its re-feed actually fed.
+
+      cache: [P0..P9, G0..G4], snapshot@10
+      target: [P0..P9, G0, G1, X, Y]  (agrees with the cache through 12 -> re-feed 2)
+      _prefill feeds 1 of the 2
+
+    `_rewind_to` must land the ledger at target[:11] and return 11, and `_sync_to` must
+    hand 11 back as the resident prefix. Recording target[:12] would make the caller's
+    next prefill start one token past the end of the cache."""
+    from chad.engine import Engine
+
+    class _NoTrim:
+        def is_trimmable(self):
+            return False
+
+    def make():
+        eng = object.__new__(Engine)
+        eng._pld_hybrid = True
+        eng._trimmable = False
+        eng._cache = [_NoTrim()]
+        eng._cached_ids = list(range(100, 110)) + list(range(200, 205))  # P0..P9+G0..G4
+        eng._rewind_snap = {"pos": 10, "recurrent": "SNAP"}
+        eng._restore_recurrent = lambda s: None
+        eng._trim_kv = lambda n: None
+        eng._prefill = lambda ids, *a, **k: 1              # stops after one token
+        return eng
+
+    target = list(range(100, 110)) + [200, 201, 999, 998]
+    eng = make()
+    landed = eng._rewind_to(target, 12)
+    check("short re-feed: returns the resident count", landed == 11, landed)
+    check("short re-feed: ledger holds only what was fed",
+          eng._cached_ids == target[:11], eng._cached_ids)
+
+    eng = make()
+    common = eng._sync_to(target)
+    check("short re-feed: _sync_to reports the shorter prefix", common == 11, common)
+    check("short re-feed: ledger agrees with _sync_to",
+          eng._cached_ids == target[:common], eng._cached_ids)
+
+
+def test_ckpt_path_keys_on_rope_override():
+    """Tier 1 (no weights): above the native window, load() applies a YaRN rope override,
+    so the same prefix ids cached under it are a different cache. The checkpoint key must
+    tell the two apart, or a long-context session's warm prefix restores into a
+    native-window session."""
+    from chad.engine import Engine
+
+    eng = object.__new__(Engine)  # bypass __init__ (no weights to load)
+    eng.model_id = "m"
+    eng.kv_bits = None
+    eng.cache_dir = "/tmp/chad-test-nonexistent"
+    eng.effective_ctx = 32768
+    native = eng._ckpt_path([1, 2, 3])
+    check("same window, same key", eng._ckpt_path([1, 2, 3]) == native)
+    eng.effective_ctx = 131072
+    extended = eng._ckpt_path([1, 2, 3])
+    check("YaRN-extended window keys differently", extended != native, extended)
+
+
+def _plain_generate_engine(resets):
+    """A weightless Engine that reaches generate()'s plain decode path: prompt lookup off,
+    greedy, no drafter (the class default), and a `_sync_to` that treats the ledger as a
+    prefix of the prompt. `_reset_cache` appends to `resets` and clears the ledger, as the
+    real one does."""
+    from chad.engine import Engine
+
+    eng = object.__new__(Engine)  # bypass __init__ (no weights)
+    eng.prompt_lookup = False
+    eng.temp = 0.0
+    eng._cached_ids = []
+    eng._sync_to = lambda ids: len(eng._cached_ids)
+    eng._prefill = lambda ids, *a, **k: len(ids)
+    eng._reset_cache = lambda: (resets.append(1), setattr(eng, "_cached_ids", []))
+    return eng
+
+
+def test_generate_exception_resets_ledger():
+    """Tier 1 (no weights): when generate() raises partway through a turn, how much of it
+    reached the cache is unknowable (a prefill chunk may have landed; stream_generate's
+    progress is internal to it). It must drop the cache and record nothing resident:
+    keeping the pre-turn ledger would let the next turn prefill on top of tokens the
+    ledger never recorded."""
+    resets = []
+    eng = _plain_generate_engine(resets)
+    eng._cached_ids = [1, 2]                  # the prompt's first two tokens are resident
+
+    def _boom(ids, *a, **k):
+        raise RuntimeError("boom")
+
+    eng._prefill = _boom
+    try:
+        eng.generate([1, 2, 3, 4, 5], max_tokens=8)
+        check("generate() re-raises the failure", False, "no exception raised")
+    except RuntimeError as e:
+        check("generate() re-raises the failure", "boom" in str(e), str(e))
+    check("the cache was dropped", resets == [1], resets)
+    check("nothing is recorded as resident", eng._cached_ids == [], eng._cached_ids)
+
+
+def test_salvage_records_only_the_close_it_feeds():
+    """Tier 1 (no weights): think-ceiling close-and-continue injects </think> by feeding its
+    ids through the cache. When the budget can't fit them, the turn ends without them:
+    `text`, `gen_ids` and the ledger all describe the tokens the cache holds, and a close
+    that was recorded but never fed would put phantom tokens in all three."""
+    from chad import engine as eng_mod
+
+    class _Resp:
+        def __init__(self, text, token):
+            self.text, self.token = text, token
+
+    class _Tok:
+        def encode(self, s, add_special_tokens=False):
+            return [9001, 9002]                # </think> as two ids
+
+    seeds = []
+
+    def _fake_stream(model, tok, arr, **kw):
+        seeds.append([int(t) for t in arr.tolist()])
+        for i in range(kw["max_tokens"]):
+            yield _Resp("x", 1000 + i)         # never closes the think on its own
+
+    prompt = [1, 2, 3, 4]
+    orig = eng_mod.stream_generate
+    try:
+        eng_mod.stream_generate = _fake_stream
+
+        # Ceiling at 4 with a budget of 5: the two close ids don't fit after 4 tokens.
+        eng = _plain_generate_engine([])
+        eng.tok = _Tok()
+        text, stats = eng.generate(prompt, max_tokens=5, think_ceiling=4)
+        check("no room: close not in text", "</think>" not in text, repr(text))
+        check("no room: not marked salvaged", stats.salvaged is False)
+        check("no room: close ids not recorded", 9001 not in stats.gen_ids, stats.gen_ids)
+        check("no room: close never fed", len(seeds) == 1, seeds)
+        check("no room: ledger is prompt + what was generated",
+              eng._cached_ids == prompt + stats.gen_ids, eng._cached_ids)
+
+        # Room to spare: the close is fed, recorded, and decoding continues after it.
+        seeds.clear()
+        eng = _plain_generate_engine([])
+        eng.tok = _Tok()
+        text, stats = eng.generate(prompt, max_tokens=10, think_ceiling=4)
+        check("room: close in text", "</think>" in text, repr(text))
+        check("room: marked salvaged", stats.salvaged is True)
+        check("room: close fed as the re-entry seed", seeds[-1] == [9001, 9002], seeds)
+        check("room: close ids recorded after the think",
+              stats.gen_ids[4:6] == [9001, 9002], stats.gen_ids)
+        check("room: generated count matches the ids",
+              stats.generated_tokens == len(stats.gen_ids), stats.generated_tokens)
+        check("room: ledger is prompt + everything generated",
+              eng._cached_ids == prompt + stats.gen_ids, eng._cached_ids)
+    finally:
+        eng_mod.stream_generate = orig
+
+
 def test_take_rewind_snapshot_gating():
     """Tier 1: the snapshot is only taken on the validated cache composition —
     hybrid (_pld_hybrid) with tokens resident. Anything else is a silent no-op
@@ -1312,6 +1469,10 @@ if __name__ == "__main__":
              test_prefill_oom_retry_rolls_back,
              test_snapshot_survives_empty_kvcache,
              test_bounded_rewind_orchestration,
+             test_rewind_to_honors_short_prefill,
+             test_ckpt_path_keys_on_rope_override,
+             test_generate_exception_resets_ledger,
+             test_salvage_records_only_the_close_it_feeds,
              test_take_rewind_snapshot_gating,
              test_keyed_sampler_worker_thread_entropy,
              test_keyed_sampler_min_p_trims_sub_floor_tail,
