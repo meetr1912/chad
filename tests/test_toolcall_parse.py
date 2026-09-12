@@ -221,6 +221,22 @@ def test_salvage_closed_block_unclosed_json():
        [("glob", {"pattern": "*.py"})])
 
 
+def test_salvage_keeps_string_arguments_verbatim():
+    """A salvaged call runs exactly what the model wrote. The repair used to rewrite
+    Python constants inside string values, so the harness executed `x is null` for
+    `x is None` and wrote `x = true` into a file, with nothing in the tool result to
+    show the command had changed."""
+    v1 = ('<tool_call>{"name": "bash", "arguments": {"command": "python -c \'assert x is None\' && ls\n'
+          '</parameter>\n</function>\n</tool_call>')
+    eq("v1 salvaged command verbatim", parse_tool_calls(v1),
+       [("bash", {"command": "python -c 'assert x is None' && ls"})])
+
+    v2 = ('<tool_call>{"name": "write", "arguments": {"path": "a.py", '
+          '"content": "x = True\\nif x: print(None)\\n"</tool_call>')
+    eq("v2 salvaged content verbatim", parse_tool_calls(v2),
+       [("write", {"path": "a.py", "content": "x = True\nif x: print(None)\n"})])
+
+
 def test_text_param_first_line_indent_preserved():
     """A multi-line old/new/content value keeps its first line's leading whitespace.
     The wholesale .strip() ate the opening tab of every indented edit block (the value
@@ -259,6 +275,7 @@ if __name__ == "__main__":
     test_salvage_garbled_tool_name()
     test_hybrid_name_parameter_dialect()
     test_salvage_closed_block_unclosed_json()
+    test_salvage_keeps_string_arguments_verbatim()
     test_text_param_first_line_indent_preserved()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

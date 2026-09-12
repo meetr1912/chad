@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 from . import config
 from .tools import active_schemas
@@ -86,6 +86,10 @@ def legacy_validate(name, args):
 # Recovers the malformed-but-obvious JSON weak models emit. Each transform is
 # applied additively and we re-attempt json.loads after the cheap ones, so a
 # call that only needs one fix isn't risked by a later, more aggressive one.
+# Textual repairs go through `_outside_strings`, never a bare re.sub over the
+# call text: a string value is the model's payload (a shell command, file
+# content) and must reach the tool byte-for-byte. A garble that only parses by
+# editing the inside of a string fails into the malformed-call nudge instead.
 # ---------------------------------------------------------------------------
 
 _FENCE = re.compile(r"^\s*```(?:json|tool_call)?\s*|\s*```\s*$", re.IGNORECASE)
@@ -93,6 +97,44 @@ _TRAILING_COMMA = re.compile(r",\s*([}\]])")
 _BARE_KEY = re.compile(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*):")
 _PY_CONST = re.compile(r"\b(True|False|None)\b")
 _PY_MAP = {"True": "true", "False": "false", "None": "null"}
+
+
+def _outside_strings(s: str, fn: Callable[[str], str]) -> str:
+    """Apply `fn` to each run of text between JSON string literals and re-join.
+    Literals pass through untouched, quotes included; an unterminated string
+    (truncated output) runs to end-of-text and is left for `_balance` to close."""
+    out: List[str] = []
+    start = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+                out.append(s[start : i + 1])
+                start = i + 1
+            continue
+        if ch == '"':
+            out.append(fn(s[start:i]))
+            start = i
+            in_str = True
+    tail = s[start:]
+    out.append(tail if in_str else fn(tail))
+    return "".join(out)
+
+
+def _repair_structure(s: str) -> str:
+    """Trailing-comma, Python-constant and bare-key repairs, applied only to the
+    text between string literals."""
+    def fix(chunk: str) -> str:
+        chunk = _TRAILING_COMMA.sub(r"\1", chunk)
+        chunk = _PY_CONST.sub(lambda m: _PY_MAP[m.group(1)], chunk)
+        return _BARE_KEY.sub(r'\1"\2"\3:', chunk)
+    return _outside_strings(s, fix)
 
 
 def _balance(s: str) -> str:
@@ -122,7 +164,8 @@ def _balance(s: str) -> str:
 
 def repair_json(raw: Any) -> Optional[dict]:
     """Best-effort parse of a possibly-malformed JSON object. Returns the dict,
-    or None if even the repaired text won't parse."""
+    or None if even the repaired text won't parse. String values come back
+    exactly as written; only the JSON structure around them is repaired."""
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str):
@@ -136,13 +179,7 @@ def repair_json(raw: Any) -> Optional[dict]:
         pass
     # Progressive repairs, cheapest first; re-try after each.
     s = _FENCE.sub("", s).strip()
-    for transform in (
-        lambda x: x,
-        lambda x: _TRAILING_COMMA.sub(r"\1", x),
-        lambda x: _PY_CONST.sub(lambda m: _PY_MAP[m.group(1)], x),
-        lambda x: _BARE_KEY.sub(r'\1"\2"\3:', x),
-        _balance,
-    ):
+    for transform in (lambda x: x, _repair_structure, _balance):
         s = transform(s)
         try:
             v = json.loads(s)
