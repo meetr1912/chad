@@ -48,7 +48,7 @@ Build a sidecar for a new target from its bf16 DFlash checkpoint with
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from .diag import log
 
@@ -236,7 +236,9 @@ def build(config: DFlashConfig):
             coeff = base + delta[..., None]
             out = coeff[:, :, 0] * xg
             for t in range(1, self.taps):
-                shifted = mx.pad(xg[:, :-t], ((0, 0), (t, 0), (0, 0), (0, 0)))
+                # A list, not a tuple of tuples: the mlx stub only types list[tuple[int, int]]
+                # (mlx accepts both at runtime).
+                shifted = mx.pad(xg[:, :-t], [(0, 0), (t, 0), (0, 0), (0, 0)])
                 out = out + coeff[:, :, t] * shifted
             return out.reshape(B, L, H)
 
@@ -720,7 +722,9 @@ def _load_sidecar(sdir: str, bits: int, gs: int):
         cfg = DFlashConfig.from_dict(json.load(f))
     drafter = build(cfg)
     _quantize(drafter, bits, gs)
-    drafter.load_weights(list(mx.load(os.path.join(sdir, "model.safetensors")).items()))
+    # cast: mx.load returns a dict for a .safetensors path; the stub types a 3-way union
+    loaded = cast(dict, mx.load(os.path.join(sdir, "model.safetensors")))
+    drafter.load_weights(list(loaded.items()))
     drafter.eval()
     mx.eval(drafter.parameters())
     return drafter
@@ -741,7 +745,7 @@ def build_sidecar(src_dir: str, out_dir: str, bits: int = 4, gs: int = 64) -> st
     drafter = build(cfg)
     weights: dict = {}
     for st in sorted(glob.glob(os.path.join(src_dir, "*.safetensors"))):
-        weights.update(mx.load(st))
+        weights.update(cast(dict, mx.load(st)))  # a dict for .safetensors, see _load_sidecar
     weights = _remap(weights)
     drafter.load_weights(list(weights.items()))
     del weights

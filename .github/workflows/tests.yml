@@ -21,9 +21,8 @@ permissions:
 
 jobs:
   lint:
-    # ruff + mypy need no Apple Silicon (mypy runs with ignore_missing_imports, so the
-    # mlx/tree_sitter stubs never matter for type-checking) — run on the cheap Linux
-    # runner like the `lock` job, not the ~10×-pricier macos-14.
+    # ruff is platform-independent, so it runs on the cheap Linux runner like the `lock`
+    # job, not the ~10×-pricier macos-14. mypy does NOT run here: see `typecheck`.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -33,8 +32,22 @@ jobs:
       - run: uv sync
       - name: ruff (lint + import order)
         run: uv run ruff check src tests benchmarks
+
+  typecheck:
+    # mypy runs on macOS because the mlx stubs DO matter: on Linux mlx is not installed,
+    # ignore_missing_imports types every mlx symbol as Any, and the check passes vacuously
+    # over exactly the engine and kernel modules it should guard — while the same command
+    # failed on a Mac. Type-check the environment users actually run. One interpreter is
+    # enough: the config pins python 3.11.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --python 3.11
       - name: mypy (src only; config pins python 3.11)
-        run: uv run mypy src/chad
+        run: uv run --python 3.11 mypy src/chad
 
   test:
     runs-on: macos-14

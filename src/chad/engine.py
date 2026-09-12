@@ -85,7 +85,8 @@ def _log_mlx_provenance() -> None:
     """
     try:
         import mlx.core as mx
-        ver = str(mx.__version__)
+        # getattr: the mlx stubs omit __version__; the attribute exists at runtime
+        ver = str(getattr(mx, "__version__", "?"))
     except Exception:  # noqa: BLE001 — diagnostics must never break loading
         return
     if "+" in ver:

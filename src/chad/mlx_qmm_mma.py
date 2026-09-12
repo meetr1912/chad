@@ -73,7 +73,7 @@ import json
 import os
 import platform
 import time
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from . import config
 from .diag import log
@@ -343,7 +343,9 @@ def _cache_key() -> str:
         chip = mx.device_info().get("device_name", "metal")
     except Exception:  # noqa: BLE001
         chip = platform.machine()
-    return f"{chip}-mlx{mx.__version__}-k{_KERNEL_VERSION}".replace(" ", "_").replace("/", "_")
+    # getattr: the mlx stubs omit __version__; the attribute exists at runtime
+    ver = getattr(mx, "__version__", "?")
+    return f"{chip}-mlx{ver}-k{_KERNEL_VERSION}".replace(" ", "_").replace("/", "_")
 
 
 def measure(groups: dict, verbose: bool = False) -> dict:
@@ -365,7 +367,10 @@ def measure(groups: dict, verbose: bool = False) -> dict:
             diff = mx.max(mx.abs(ref - got))
             scale = mx.max(mx.abs(ref))
             mx.eval(diff, scale)
-            if diff.item() > _REL_TOL * max(scale.item(), 1.0):
+            # cast: the mlx stub types .item() as int|float|complex; these scalars are real
+            d = cast(float, diff.item())
+            s = cast(float, scale.item())
+            if d > _REL_TOL * max(s, 1.0):
                 ok = False
                 break
         if not ok:
