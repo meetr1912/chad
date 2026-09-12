@@ -388,17 +388,29 @@ that gap: it speaks the *same* `/completion` protocol, backed by the local MLX e
 its real prefix cache, so the container drives **this** machine's model unchanged.
 
 ```bash
-uv run chad serve --host 0.0.0.0 --port 8081     # on the Mac holding the weights
-# then, from the container (or another host):
-chad "…" --backend llama --base-url http://host.docker.internal:8081
+# on the Mac holding the weights:
+export CHAD_SERVE_API_KEY=$(openssl rand -hex 32)
+uv run chad serve --host 0.0.0.0 --port 8081
+# then, from the container (or another host), with the same key in its environment:
+chad "…" --backend llama --base-url http://host.docker.internal:8081 \
+  --api-key-env CHAD_SERVE_API_KEY
 ```
 
 - `--host` / `CHAD_SERVE_HOST`: bind address. Defaults to `127.0.0.1`; a container
-  reaching in over `host.docker.internal`, or any other machine, needs `0.0.0.0`.
+  reaching in over `host.docker.internal`, or any other machine, needs `0.0.0.0`. Any
+  bind other than loopback is **refused at startup** without `CHAD_SERVE_API_KEY`, before
+  the weights load.
 - `--port` / `CHAD_SERVE_PORT`: TCP port (default `8081`).
-- `CHAD_SERVE_API_KEY`: require `Authorization: Bearer <key>`. There is no auth by
-  default, which is why the default bind is loopback; set this whenever you widen it, and
-  give the client `--api-key-env`.
+- `CHAD_SERVE_API_KEY`: require `Authorization: Bearer <key>`, and give the client
+  `--api-key-env`. There is no auth by default, which is why the default bind is loopback.
+  The server speaks plain HTTP, so the key crosses the network in cleartext: use a
+  high-entropy value (like the `openssl rand` above), keep the server on a network you
+  trust, or put a TLS-terminating proxy in front of it.
+- `CHAD_SERVE_ALLOW_ANON=1`: serve a non-loopback bind with no key anyway. Only the exact
+  value `1` counts. Anyone who can reach the port can then drive the model, reset and
+  reshape its prefix cache, and warm prefixes from the server's disk, so reserve it for an
+  isolated network you control. Earlier versions allowed this by default with only a
+  warning; a launch script that relied on that now needs a key or this variable.
 
 The engine knobs are the same ones a local `chad` reads, and they mean the same thing
 here: the server is the local product, so `CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`,

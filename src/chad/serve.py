@@ -96,6 +96,7 @@ ids in the client's cache mirror, which makes its next pre-generation prefill es
 conservative — the server's own diff, and the stats it reports, stay exact.
 """
 
+import hmac
 import json
 import os
 import queue
@@ -147,8 +148,33 @@ SOCKET_TIMEOUT_S = 300.0
 # `queue.Full` is not an OSError, so it has to be named explicitly.
 WRITE_FAILED = (BrokenPipeError, ConnectionResetError, OSError, queue.Full)
 
+# What a client hears when an engine call fails. The exception text stays in the server
+# log: it carries whatever the engine had in hand (checkpoint paths under the operator's
+# home, allocator detail), and the client degrades the same way whatever it says.
+ENGINE_ERROR = "engine error; see server log"
+
 
 # --- pure helpers (no engine, no socket — unit-tested offline) --------------
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def bind_policy(host: str, api_key: str, allow_anon: bool) -> Optional[str]:
+    """None when the bind is acceptable; otherwise the refusal message. A non-loopback
+    bind with no key hands the GPU and the prefix cache to anyone on the network, so it
+    needs either a key or an explicit, spelled-out opt-in."""
+    if host in LOOPBACK_HOSTS or api_key or allow_anon:
+        return None
+    return (f"refusing to bind {host} without CHAD_SERVE_API_KEY. Set a key, or set "
+            "CHAD_SERVE_ALLOW_ANON=1 to serve unauthenticated on purpose.")
+
+
+def display_model(model_id: str) -> str:
+    """The model name a response may carry: its last path component. `model_id` is a
+    Hugging Face repo id or a local weights directory, and the latter is a path on the
+    operator's disk that no client needs — clients only display the name."""
+    return os.path.basename(model_id.rstrip("/"))
+
 
 def props_payload(n_ctx: int, model_id: str = "",
                   capabilities: Optional[list] = None) -> dict:
@@ -157,7 +183,7 @@ def props_payload(n_ctx: int, model_id: str = "",
     block is the extension handshake (absent on stock llama.cpp)."""
     return {
         "default_generation_settings": {"n_ctx": int(n_ctx)},
-        "model_path": model_id,
+        "model_path": display_model(model_id),
         "chad": {
             "server": "chad-serve",
             "backend": "mlx",
@@ -382,8 +408,40 @@ def emit_done(write: Callable[[str], None], gone: threading.Event) -> None:
         return
     try:
         write("data: [DONE]\n\n")
-    except (BrokenPipeError, ConnectionResetError, OSError):
+    except WRITE_FAILED:
         gone.set()
+
+
+def drain(lines: queue.Queue, fut: Any, emit: Callable[[str], None], done: object,
+          keepalive: Callable[[], None], poll_s: float = 0.5) -> None:
+    """The HTTP thread's half of the queue seam: hand every chunk generation produced to
+    `emit`, in order, up to the `done` sentinel. While the queue is quiet and generation
+    is still running, `keepalive` gets its chance to hold the client's idle timeout off.
+
+    A quiet queue plus a finished future is NOT proof that nothing is left. The producer
+    can enqueue its last chunks and finish in the gap between a `get` timing out and the
+    `fut.done()` check — and the last chunk is the one carrying the generated ids and the
+    timings. So a finished future first drains whatever is already queued. An empty queue
+    ends that drain too, because the producer never waits to put the sentinel on a full
+    queue and may have finished without one."""
+    while True:
+        try:
+            chunk = lines.get(timeout=poll_s)
+        except queue.Empty:
+            if not fut.done():
+                keepalive()
+                continue
+            while True:
+                try:
+                    chunk = lines.get_nowait()
+                except queue.Empty:
+                    return
+                if chunk is done:
+                    return
+                emit(chunk)
+        if chunk is done:
+            return
+        emit(chunk)
 
 
 # --- server state -----------------------------------------------------------
@@ -481,10 +539,12 @@ class ServerState:
         pressure. Observability, because this is invisible from the client side and
         silently disarms if either half is missing: the engine needs somewhere to write
         (`cache_dir`) AND a measured per-token cost to decide with. Both are plain
-        attribute reads — no MLX, so no executor hop."""
+        attribute reads — no MLX, so no executor hop. The directory itself is not
+        reported: it is a path under the operator's home, and `run` logs it at startup
+        for the one person who needs it."""
         cache_dir = getattr(self.eng, "cache_dir", None)
         per_token = float(getattr(self.eng, "kv_bytes_per_token", 0.0) or 0.0)
-        return {"cache_dir": cache_dir, "kv_bytes_per_token": per_token,
+        return {"kv_bytes_per_token": per_token,
                 "budget_bytes": int(getattr(self.eng, "kv_cache_max_bytes", 0) or 0),
                 "armed": bool(cache_dir and per_token)}
 
@@ -516,8 +576,11 @@ def _make_handler(state: ServerState) -> type:
         def _authorized(self) -> bool:
             if not state.api_key:
                 return True
-            hdr = self.headers.get("Authorization", "")
-            return hdr.strip() == f"Bearer {state.api_key}"
+            # Constant-time: `==` returns at the first differing byte, which tells anyone
+            # who can time the 401 how much of a guessed key was right.
+            hdr = self.headers.get("Authorization", "").strip()
+            expected = f"Bearer {state.api_key}"
+            return hmac.compare_digest(hdr.encode(), expected.encode())
 
         def _read_json(self) -> dict:
             n = int(self.headers.get("Content-Length") or 0)
@@ -537,6 +600,13 @@ def _make_handler(state: ServerState) -> type:
 
         def _error(self, code: int, msg: str) -> None:
             self._send_json(code, {"error": {"code": code, "message": msg}})
+
+        def _engine_error(self, op: str, e: BaseException) -> str:
+            """Log an engine failure here and return the fixed string the client gets
+            (see ENGINE_ERROR). Logged whatever `quiet` says: with the detail kept off
+            the wire, the log is the only place it exists."""
+            sys.stderr.write(f"[serve] {op} failed: {type(e).__name__}: {e}\n")
+            return ENGINE_ERROR
 
         def _emit_raw(self, text: str, dead: threading.Event) -> None:
             """Write one already-encoded SSE payload to the socket, marking the peer dead
@@ -573,7 +643,7 @@ def _make_handler(state: ServerState) -> type:
                                              "n_ctx": state.n_ctx(),
                                              "safe_ctx": safe,
                                              "ctx_pressure": safe < state.n_ctx(),
-                                             "model": state.model_id,
+                                             "model": display_model(state.model_id),
                                              "spill": state.spill_status()})
             return self._error(404, f"no such endpoint: {path}")
 
@@ -651,37 +721,36 @@ def _make_handler(state: ServerState) -> type:
                         # The drain's future-done check retires it instead.
                         pass
 
+            last_sent = time.monotonic()
+
+            def send(chunk: str) -> None:
+                nonlocal last_sent
+                if dead.is_set():
+                    # Socket is gone; keep draining anyway so the engine never blocks
+                    # on a full queue while it winds down.
+                    return
+                last_sent = time.monotonic()
+                self._emit_raw(chunk, dead)
+
+            def keepalive() -> None:
+                # Silence. A cold prefill of a long prompt produces no tokens for
+                # minutes, and a client measures the wait on BYTES, not on our
+                # progress: every HTTP client has an idle-read timeout, chad's own
+                # included (CompletionEngine passes `timeout` to urlopen, which
+                # applies it per read). Staying quiet through a long prefill gets
+                # the turn killed just before the first token, and because a socket
+                # timeout looks transient the agent re-issues the step — paying for
+                # the same prefill again, and again. So keep the socket warm.
+                nonlocal last_sent
+                if (not dead.is_set()
+                        and time.monotonic() - last_sent >= KEEPALIVE_S):
+                    last_sent = time.monotonic()
+                    self._emit_raw(": keepalive\n\n", dead)
+
             state.busy = True
             fut = state.submit(generate)
-            last_sent = time.monotonic()
             try:
-                while True:
-                    try:
-                        chunk = lines.get(timeout=0.5)
-                    except queue.Empty:
-                        if fut.done():
-                            break
-                        # Silence. A cold prefill of a long prompt produces no tokens for
-                        # minutes, and a client measures the wait on BYTES, not on our
-                        # progress: every HTTP client has an idle-read timeout, chad's own
-                        # included (CompletionEngine passes `timeout` to urlopen, which
-                        # applies it per read). Staying quiet through a long prefill gets
-                        # the turn killed just before the first token, and because a socket
-                        # timeout looks transient the agent re-issues the step — paying for
-                        # the same prefill again, and again. So keep the socket warm.
-                        if (not dead.is_set()
-                                and time.monotonic() - last_sent >= KEEPALIVE_S):
-                            last_sent = time.monotonic()
-                            self._emit_raw(": keepalive\n\n", dead)
-                        continue
-                    if chunk is done:
-                        break
-                    if dead.is_set():
-                        # Socket is gone; keep draining anyway so the engine never blocks
-                        # on a full queue while it winds down.
-                        continue
-                    last_sent = time.monotonic()
-                    self._emit_raw(chunk, dead)
+                drain(lines, fut, send, done, keepalive)
                 info = fut.result()
             finally:
                 state.busy = False
@@ -696,7 +765,8 @@ def _make_handler(state: ServerState) -> type:
                 state.call(state.eng.push_cache if which == "push"
                            else state.eng.pop_cache)
             except Exception as e:  # noqa: BLE001 — latency feature, not correctness
-                return self._send_json(200, {"ok": False, "error": str(e)})
+                return self._send_json(200, {"ok": False,
+                                             "error": self._engine_error(which, e)})
             return self._send_json(200, {"ok": True, "op": which})
 
         def _warm(self, body: dict) -> None:
@@ -723,7 +793,7 @@ def _make_handler(state: ServerState) -> type:
                                          head_ids=list(head) if head else None)
             except Exception as e:  # noqa: BLE001 — same: degrade, don't fail a run
                 return self._send_json(200, {"status": "error", "fed": 0,
-                                             "error": str(e)})
+                                             "error": self._engine_error("warm", e)})
             finally:
                 state.busy = False
             return self._send_json(200, {"status": status, "fed": int(fed)})
@@ -759,13 +829,19 @@ def run(args: Any) -> int:
 
     host = args.host or config.env_str("CHAD_SERVE_HOST", DEFAULT_HOST)
     port = int(args.port or config.env_int("CHAD_SERVE_PORT", DEFAULT_PORT))
-    # Unauthenticated by default, which is why the default bind is loopback. A LAN
-    # bind (what a container on another host needs) should set a token.
+    # Unauthenticated by default, which is why the default bind is loopback. A wider bind
+    # (what a container on another host needs) is refused without a key unless the
+    # operator opts out by name — checked before the weights load, so a refusal costs
+    # nothing. The opt-out is strictly "1": presence alone would read `=0` as consent.
     api_key = config.env_str("CHAD_SERVE_API_KEY", "") or ""
-    if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
+    refusal = bind_policy(host, api_key, config.eq("CHAD_SERVE_ALLOW_ANON", "1"))
+    if refusal:
+        sys.stderr.write(f"[serve] {refusal}\n")
+        return 2
+    if host not in LOOPBACK_HOSTS and not api_key:
         sys.stderr.write(
-            f"[serve] warning: binding {host} with no CHAD_SERVE_API_KEY — anyone who "
-            "can reach this port can spend your GPU.\n")
+            f"[serve] warning: serving {host} unauthenticated on purpose — anyone who can "
+            "reach this port can drive the model and reshape its prefix cache.\n")
 
     from .engine import Engine, sweep_orphan_spills
     model_id, why = cli._pick_model(getattr(args, "model", None))
@@ -809,6 +885,7 @@ def run(args: Any) -> int:
 
     sys.stderr.write(
         f"ready in {load_s:.1f}s | context {state.n_ctx()} tokens\n"
+        f"KV checkpoints in {cache_dir}\n"
         f"serving {model_id} on http://{host}:{port} "
         f"(llama.cpp /completion protocol{', auth on' if api_key else ''})\n"
         f"point a client at it with:  chad \"…\" --backend llama --base-url "

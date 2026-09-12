@@ -425,6 +425,7 @@ class CompletionEngine:
                                          min_p=self.min_p, top_p=self.top_p)
             salvage_here = False
             gen_ids: list = []
+            req_text = ""               # this request's text alone (the salvage may need it)
             n_chunks = 0
             timings: Optional[dict] = None
             stream = self._stream_completion(body)
@@ -458,6 +459,7 @@ class CompletionEngine:
                             first_at = time.time()
                             stats.prefill_s = first_at - t0
                         text += seg
+                        req_text += seg
                         # Feed both watchers before any early exit, so neither can miss a
                         # marker that lands in the same segment as a break.
                         stop_hit = stop_watch.feed(seg)
@@ -516,6 +518,14 @@ class CompletionEngine:
             # Force-close the runaway <think> and loop once more: tokenize THINK_CLOSE
             # and extend the prompt for the continuation request so `cache_prompt`
             # reuses the common prefix (no detokenize — this backend is token-native).
+            if not gen_ids and req_text:
+                # The server streamed text but no per-chunk ids. Stock llama.cpp sends
+                # `tokens` on every chunk; `chad serve` sends them only in the final chunk,
+                # which a salvaged stream never reaches, so without this the continuation
+                # would jump from the prompt straight to the close marker. Best-effort:
+                # re-tokenizing can split differently from the model's own ids at merge
+                # boundaries, and it runs only when the server gave us none.
+                all_gen_ids.extend(self.tok.encode(req_text, add_special_tokens=False))
             close_ids = list(self.tok.encode(THINK_CLOSE, add_special_tokens=False))
             text += THINK_CLOSE
             # The injected close is part of the text the watchers are tracking; feed it

@@ -8,10 +8,12 @@ way to prove the two halves actually agree on the wire.
 """
 
 import json
+import queue
 import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import Future
 
 import pytest
 
@@ -124,6 +126,9 @@ def test_props_advertises_ctx_and_capabilities():
     assert p["default_generation_settings"]["n_ctx"] == 32768
     caps = p["chad"]["capabilities"]
     assert serve.CAP_CACHE_QUARANTINE in caps and serve.CAP_WARM_PREFIX in caps
+    # a local weights directory is a path on the operator's disk; only its name goes out
+    assert serve.props_payload(1, "/Users/operator/models/ornith-35b/")["model_path"] \
+        == "ornith-35b"
 
 
 def test_sse_line_shape_matches_the_client_parser():
@@ -179,6 +184,18 @@ def test_timings_map_genstats_onto_the_llama_cpp_fields():
     assert t["cache_n"] == 900
 
 
+def test_bind_policy_refuses_keyless_lan():
+    """A non-loopback bind with no key used to print a warning and serve anyway, handing
+    the model and its prefix cache to the whole network. It now needs a key or an opt-out
+    spelled out by name."""
+    refusal = serve.bind_policy("0.0.0.0", "", False)
+    assert refusal and "CHAD_SERVE_API_KEY" in refusal and "CHAD_SERVE_ALLOW_ANON" in refusal
+    assert serve.bind_policy("0.0.0.0", "k", False) is None
+    assert serve.bind_policy("0.0.0.0", "", True) is None
+    for loopback in serve.LOOPBACK_HOSTS:
+        assert serve.bind_policy(loopback, "", False) is None
+
+
 # --- streaming ------------------------------------------------------------
 
 def test_stream_emits_one_chunk_per_token_then_ids_and_timings():
@@ -232,6 +249,86 @@ def test_a_dead_client_stops_generation_and_sends_no_final_chunk():
     assert info["cancelled"] is True
     # generation stopped early rather than running out the full 5 tokens
     assert n["w"] == 2
+
+
+def test_emit_done_survives_queue_full():
+    """The handler's `write` is a bounded-queue put, so a client that stops reading at the
+    very end of a stream makes the `[DONE]` put fail with `queue.Full` — which is not an
+    OSError. It must land as the same cancel signal as any other failed write, not as an
+    exception that kills the request thread."""
+    gone = threading.Event()
+
+    def full(chunk):
+        raise queue.Full
+
+    serve.emit_done(full, gone)
+    assert gone.is_set()
+
+    def full_on_done(chunk):
+        if "[DONE]" in chunk:
+            raise queue.Full
+
+    info = serve.stream_completion(FakeEngine(),
+                                   serve.parse_completion_request({"prompt": [1]}),
+                                   full_on_done)
+    assert info["cancelled"] is False       # the turn itself completed and was delivered
+
+
+class _LateQueue(queue.Queue):
+    """A queue whose producer lands its tail in the gap right after the drain's first
+    `get` times out — the race, made deterministic."""
+
+    def __init__(self, tail):
+        super().__init__()
+        self._tail = tail
+
+    def get(self, block=True, timeout=None):
+        if self._tail is not None:
+            tail, self._tail = self._tail, None
+            for item in tail:
+                self.put_nowait(item)
+            raise queue.Empty
+        return super().get(block, timeout)
+
+
+def test_drain_delivers_every_chunk_before_done():
+    """The final chunk carries the generated ids and the timings. When generation finishes
+    between a `get` timing out and the future check, that chunk is already queued, and a
+    drain that trusted `fut.done()` alone dropped it: the client saw the stream end with
+    no ids and fell back to estimates."""
+    done = object()
+    fut: Future = Future()
+    fut.set_result({})
+    emitted, keepalives = [], []
+    serve.drain(_LateQueue(["a", "b", "final", done, "after-done"]), fut, emitted.append,
+                done, lambda: keepalives.append(1), poll_s=0.01)
+    assert emitted == ["a", "b", "final"]
+    assert not keepalives, "sent a keepalive on a stream whose generation had finished"
+    # the ordinary path: everything queued ahead of the sentinel, delivered in order
+    plain: queue.Queue = queue.Queue()
+    for item in ("x", "y", done):
+        plain.put(item)
+    emitted.clear()
+    serve.drain(plain, fut, emitted.append, done, lambda: None, poll_s=0.01)
+    assert emitted == ["x", "y"]
+
+
+def test_drain_keeps_alive_only_while_generation_runs():
+    """A quiet queue with generation still running is a long prefill and gets the keepalive
+    hook on every idle poll. A finished generation with nothing queued ends the drain even
+    without a sentinel, since the producer never waits to enqueue one on a full queue."""
+    class Running:
+        def __init__(self, polls):
+            self.polls = polls
+
+        def done(self):
+            self.polls -= 1
+            return self.polls < 0
+
+    keepalives = []
+    serve.drain(queue.Queue(), Running(3), lambda chunk: None, object(),
+                lambda: keepalives.append(1), poll_s=0.01)
+    assert len(keepalives) == 3
 
 
 # --- end to end over a real socket, driven by the real client -------------
@@ -413,6 +510,48 @@ def test_api_key_gates_a_lan_bound_server(guarded_server):
     c = CompletionEngine(model_id="m", base_url=url, api_key="s3cret")
     text, _ = c.generate([1, 2], max_tokens=8)
     assert text == "hello world"
+
+
+def test_run_refuses_a_keyless_lan_bind_before_loading_anything(monkeypatch, capsys):
+    """The wiring, not just the policy: the refusal has to fire before the weights load,
+    and the opt-out is the literal "1" — `CHAD_SERVE_ALLOW_ANON=0` is not consent."""
+    from types import SimpleNamespace
+
+    from chad import cli
+
+    def no_load(*a, **kw):
+        raise AssertionError("reached model selection on a bind that should be refused")
+
+    monkeypatch.setattr(cli, "_preflight", lambda *a, **kw: None)
+    monkeypatch.setattr(cli, "_pick_model", no_load)
+    monkeypatch.delenv("CHAD_SERVE_API_KEY", raising=False)
+    monkeypatch.setenv("CHAD_SERVE_ALLOW_ANON", "0")
+    args = SimpleNamespace(backend="mlx", host="0.0.0.0", port=8081, model=None)
+    assert serve.run(args) == 2
+    assert "refusing to bind 0.0.0.0" in capsys.readouterr().err
+
+
+def test_engine_errors_reach_the_log_not_the_client(live_server, capsys):
+    """Exception text carries whatever the engine had in hand: a checkpoint path under the
+    operator's home, allocator detail. The client degrades the same way whatever it is
+    told, so it gets a fixed string and the detail stays in the server's log."""
+    url, eng, _ = live_server
+    leak = "/Users/operator/.cache/chad/kv/abc.safetensors"
+
+    def boom(*a, **kw):
+        raise OSError(f"[Errno 28] No space left on device: '{leak}'")
+
+    eng.push_cache = boom
+    eng.warm_prefix = boom
+    for path, body in (("/cache/push", {}), ("/warm", {"prefix": [1, 2, 3]})):
+        req = urllib.request.Request(url + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            reply = r.read().decode()
+        assert leak not in reply, f"{path} put a host path on the wire"
+        assert json.loads(reply)["error"] == serve.ENGINE_ERROR
+    assert leak in capsys.readouterr().err
 
 
 def test_health_answers_while_the_engine_thread_is_busy(live_server):
@@ -808,8 +947,20 @@ def test_health_reports_whether_the_disk_spill_path_is_armed(live_server):
     with urllib.request.urlopen(url + "/health", timeout=5) as r:
         spill = json.loads(r.read())["spill"]
     assert spill["armed"] is True
-    assert spill["cache_dir"] == "/tmp/kv" and spill["kv_bytes_per_token"] == 1234.0
+    # the directory is a host path: armed-ness is reported, the path itself is not
+    assert "cache_dir" not in spill and spill["kv_bytes_per_token"] == 1234.0
     # lose either half and it must report disarmed rather than quietly doing nothing
     eng.kv_bytes_per_token = 0.0
     with urllib.request.urlopen(url + "/health", timeout=5) as r:
         assert json.loads(r.read())["spill"]["armed"] is False
+
+
+def test_health_names_the_model_without_its_path(live_server):
+    """A local weights directory is a path under the operator's home. `/health` is readable
+    by anyone who can reach the port, and a monitor only needs the name."""
+    url, _, state = live_server
+    state.model_id = "/Users/operator/models/ornith-test/"
+    with urllib.request.urlopen(url + "/health", timeout=5) as r:
+        body = json.loads(r.read())
+    assert body["model"] == "ornith-test"
+    assert "/Users/operator" not in json.dumps(body)
