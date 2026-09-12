@@ -8,8 +8,7 @@ One model (Qwen3.8-27B, 3-bit, with its DFlash2 drafter), one entrypoint, run wi
     uv run chad -c                             # resume this directory's conversation
     uv run chad --model <repo|dir>             # run different weights
 
-Plus three subcommands, each with its own `--help`: `chad serve`, `chad prove`,
-`chad levers`.
+Plus two subcommands, each with its own `--help`: `chad prove`, `chad levers`.
 
 Rare long-session knobs live in env vars — see docs/configuration.md.
 """
@@ -80,9 +79,9 @@ def _env_float(name):
 
 # The three sampler knobs travel TOGETHER, as one call, deliberately.
 #
-# They used to be three sibling blocks inlined in `main()`, which meant every serve path
-# that builds its own engine had to remember to copy all three — and `chad serve` didn't
-# copy any, so a server started with CHAD_MIN_P ran without it and nothing said so. The
+# They used to be three sibling blocks inlined in `main()`, which meant every path that
+# builds its own engine had to remember to copy all three — and one didn't copy any, so
+# it ran without CHAD_MIN_P and nothing said so. The
 # failure shape is that sibling settings drift ONE AT A TIME: a later fix honors the field
 # it touched, looks complete, and leaves its neighbours silently dead. There is one
 # function now, so a caller cannot honor `temp` and forget `min_p`.
@@ -537,8 +536,7 @@ def _fail_backend(err, base_url):
         sys.stderr.write(
             f"  fix:   nothing is listening at {base_url or 'the base URL'}. Start the\n"
             "         server, check the host/port, and confirm it is reachable from here\n"
-            "         (a container needs the server bound to 0.0.0.0, not 127.0.0.1).\n"
-            "         To serve this Mac's own model: `chad serve --host 0.0.0.0`.\n")
+            "         (a container needs the server bound to 0.0.0.0, not 127.0.0.1).\n")
     elif "HTTP 401" in msg or "HTTP 403" in msg:
         sys.stderr.write(
             "  fix:   the server rejected the credentials. Pass --api-key-env NAME "
@@ -590,9 +588,9 @@ def _pick_session(items):
 # Real subcommands, dispatched on argv[1] rather than through argparse subparsers.
 # The default invocation's positional is a free-form task string, and a subparser layout
 # would either shadow it or force `chad -- "some task"`; matching argv[1] exactly keeps
-# `chad "serve the API from cache"` a task and `chad serve` a subcommand, which is the
-# same rule the old literal-positional dispatch used.
-_SUBCOMMANDS = ("serve", "prove", "levers")
+# `chad "prove the parser handles empty input"` a task and `chad prove` a subcommand,
+# which is the same rule the old literal-positional dispatch used.
+_SUBCOMMANDS = ("prove", "levers")
 
 # Set by `_main` once the remote backend's URL is resolved, so the top-level BackendError
 # handler can name the host that stopped answering. Only the remote backend can raise
@@ -600,22 +598,11 @@ _SUBCOMMANDS = ("serve", "prove", "levers")
 _resolved_base_url = None
 
 
-def _add_model_arg(ap):
-    """`--model`, shared by the agent and `chad serve` — both load a local model and both
-    need the same escape hatch from the shipped default."""
-    ap.add_argument("--model", default=None,
-                    help="which model to load: 'auto' (the shipped default) or any "
-                         "Hugging Face repo id / local model dir. Other weights run "
-                         "through the same engine; the tuning is fitted to the shipped "
-                         "model, so expect to lose speed, not correctness. "
-                         "Also CHAD_MODEL.")
-
-
 def _agent_parser():
     ap = argparse.ArgumentParser(
         prog="chad",
         description="Local coding agent for a 24 GB Apple Silicon Mac (MLX, one model, no API key).",
-        epilog="subcommands (each takes --help): chad serve · chad prove · chad levers. "
+        epilog="subcommands (each takes --help): chad prove · chad levers. "
                "Long-session and unattended-run knobs live in CHAD_* env vars — "
                "see docs/configuration.md.",
     )
@@ -661,7 +648,12 @@ def _agent_parser():
     ap.add_argument("--api-key-env", dest="api_key_env", default=None,
                     help="name of the env var holding the API key for a remote backend; the "
                          "key is read from that var, never passed on the command line.")
-    _add_model_arg(ap)
+    ap.add_argument("--model", default=None,
+                    help="which model to load: 'auto' (the shipped default) or any "
+                         "Hugging Face repo id / local model dir. Other weights run "
+                         "through the same engine; the tuning is fitted to the shipped "
+                         "model, so expect to lose speed, not correctness. "
+                         "Also CHAD_MODEL.")
     ap.add_argument("--repl", action="store_true",
                     help="plain line REPL instead of the full-screen TUI")
     # Back-compat: -p/--prompt was the old one-shot spelling, now the positional task;
@@ -671,39 +663,17 @@ def _agent_parser():
     return ap
 
 
-def _serve_parser():
-    """`chad serve` — expose this machine's MLX engine over the same llama.cpp
-    /completion protocol the remote backend speaks, so a chad that can't run MLX
-    (a Linux container) drives the local model instead of a remote GGUF."""
-    ap = argparse.ArgumentParser(
-        prog="chad serve",
-        description="Serve this machine's local MLX engine over the llama.cpp "
-                    "/completion protocol. Point a client at it with "
-                    "`chad \"…\" --backend llama --base-url http://<host>:<port>`.",
-    )
-    ap.add_argument("--host", default=None,
-                    help="bind address (default 127.0.0.1; use 0.0.0.0 to accept clients "
-                         "from containers or the LAN — set CHAD_SERVE_API_KEY if you do). "
-                         "Also CHAD_SERVE_HOST.")
-    ap.add_argument("--port", type=int, default=None,
-                    help="TCP port (default 8081). Also CHAD_SERVE_PORT.")
-    _add_model_arg(ap)
-    # Hidden, and rejected by serve.run: without it `chad serve --backend llama` would
-    # die on "unrecognized arguments" instead of explaining why serving a remote client
-    # backend is incoherent.
-    ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
-                    help=argparse.SUPPRESS)
-    return ap
-
-
 def _prove_parser():
     ap = argparse.ArgumentParser(
         prog="chad prove",
         description="Run the bundled end-to-end smoke test against the shipped model: "
                     "downloads it if needed, drives a real task, and reports what worked.",
     )
+    # Hidden, and rejected by prove.run: without it `chad prove --backend llama` would
+    # die on "unrecognized arguments" instead of explaining why proving a remote server
+    # is incoherent.
     ap.add_argument("--backend", choices=("mlx", "llama"), default="mlx",
-                    help=argparse.SUPPRESS)  # see _serve_parser
+                    help=argparse.SUPPRESS)
     return ap
 
 
@@ -742,9 +712,6 @@ def _main(argv=None):
     if sub == "levers":
         _levers_parser().parse_args(argv[1:])
         sys.exit(_run_levers())
-    if sub == "serve":
-        from . import serve
-        sys.exit(serve.run(_serve_parser().parse_args(argv[1:])))
     if sub == "prove":
         from . import prove
         sys.exit(prove.run(_prove_parser().parse_args(argv[1:])))
@@ -790,11 +757,6 @@ def _main(argv=None):
     cache_dir = os.path.expanduser("~/.cache/chad/kv")
     kv_cache_max_gb = _env_int("CHAD_KV_CACHE_MAX_GB")
     kv_cache_max_bytes = (kv_cache_max_gb if kv_cache_max_gb is not None else 8) * 1024**3
-    # Clean up push-spills orphaned by a prior killed/crashed session (see engine.py) —
-    # runs for every backend: the dir is shared, and a remote-backend run should still
-    # reclaim what a dead MLX session leaked.
-    from .engine import sweep_orphan_spills
-    sweep_orphan_spills(cache_dir, max_age_s=6 * 3600)
 
     if args.backend == "llama":
         # Drive the chad harness against a remote llama.cpp server instead

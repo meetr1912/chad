@@ -43,7 +43,6 @@ def _bare_engine(model=None, kv_bits=None):
     eng.kv_bits = kv_bits
     eng._cached_ids = []
     eng._rewind_snap = None
-    eng._cache_stack = []
     return eng
 
 

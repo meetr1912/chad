@@ -187,7 +187,7 @@ def test_interrupted_prefill_records_only_fed_tokens():
     eng.cache_dir = "/tmp/chad-test-nonexistent"   # truthy so warm_prefix doesn't 'skip'
     eng._cached_ids = []                            # cold: nothing resident yet
     eng._reset_cache = lambda: None                 # keep our fake _cache in place
-    eng._ckpt_path = lambda ids, tag=None: "/tmp/chad-test-nonexistent/no.ckpt"  # -> miss
+    eng._ckpt_path = lambda ids: "/tmp/chad-test-nonexistent/no.ckpt"  # -> miss
 
     prefix = list(range(600))              # > 1 chunk at the 512-token default
     checks = {"n": 0}
@@ -689,62 +689,6 @@ def test_truncation_recovery_matches_fresh():
           f"cached_tokens={warm_stats.cached_tokens} (expected > 0 — divergence not exercised)")
 
 
-# === Tier 2c: cache quarantine push/pop bit-exactness ==============
-# The subagent/Task tool runs a sub-agent on a QUARANTINED cache: engine.push_cache
-# stashes the main session's warm cache aside, the sub-agent runs on a fresh one, and
-# pop_cache restores the main cache. The invariant that makes this safe on the
-# non-trimmable hybrid is that after pop the main cache generates BYTE-IDENTICALLY to a
-# never-pushed control — i.e. push/pop is a lossless snapshot/restore. This exercises it
-# on the small trimmable model (push/pop is model-agnostic); a bug that corrupts the
-# restored cache breaks the strict equality below — do NOT loosen.
-
-def test_push_pop_bit_exact():
-    if not _model_tests_enabled():
-        return skip("push_pop_bit_exact", "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
-    # push/pop is model-agnostic (RAM-tuple stash + optional disk spill); the trimmable
-    # default is the CI path. A run on a real bf16 hybrid is also wanted,
-    # so CHAD_TEST_HYBRID_MODEL — when set — points THIS test at those weights.
-    model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL", TIER2_MODEL)
-    eng = _build_engine(model_id=model_id)
-    if eng is None:
-        return skip("push_pop_bit_exact", f"could not load {model_id}")
-
-    def _tmpl(user):
-        return list(eng.tok.apply_chat_template(
-            [{"role": "system", "content": "You are a precise coding assistant."},
-             {"role": "user", "content": user}], add_generation_prompt=True))
-
-    P = _tmpl("Write a one-line Python function that squares n.")
-    Q = _tmpl("Explain in one sentence what a hash map is.")  # unrelated sub-agent churn
-
-    # Control: reach state S (prime the cache with P + a short generation), snapshot the
-    # resident ids, then continue from S with an extended prompt — NO push in between.
-    eng._reset_cache()
-    eng.generate(list(P), max_tokens=8)
-    ids_s = list(eng._cached_ids)
-    P2 = ids_s + list(P[:4])                       # extend the cache with a few valid tokens
-    control, _ = eng.generate(list(P2), max_tokens=24)
-
-    # Quarantine: reach the SAME state S, push it aside, run an unrelated generation on a
-    # fresh cache (the sub-agent), pop, then continue from the restored S with the same P2.
-    eng._reset_cache()
-    eng.generate(list(P), max_tokens=8)
-    check("re-reached state S deterministically", eng._cached_ids == ids_s,
-          f"{len(eng._cached_ids)} vs {len(ids_s)}")
-    eng.push_cache()
-    check("push handed out a fresh empty cache", eng._cached_ids == [], eng._cached_ids)
-    eng.generate(list(Q), max_tokens=8)            # sub-agent work in the quarantined cache
-    eng.pop_cache()
-    check("pop restored _cached_ids to state S exactly", eng._cached_ids == ids_s,
-          f"{len(eng._cached_ids)} vs {len(ids_s)}")
-    quar, _ = eng.generate(list(P2), max_tokens=24)
-
-    # CORRUPTION GUARD: the post-pop continuation must equal the never-pushed control,
-    # byte-for-byte. If this fails, push/pop corrupted the cache — STOP and report.
-    check("post-pop generation == never-pushed control", quar == control,
-          f"\n--- QUARANTINE ---\n{quar!r}\n--- CONTROL ---\n{control!r}")
-
-
 # --- On-disk KV cache bounding (no model, pure filesystem) ---------
 
 def _touch(path, size, age_s=0.0):
@@ -755,23 +699,6 @@ def _touch(path, size, age_s=0.0):
     t = time.time() - age_s
     os.utime(path, (t, t))
     return path
-
-
-def test_sweep_orphan_spills_removes_only_old_push_files():
-    import tempfile
-
-    from chad.engine import sweep_orphan_spills
-    with tempfile.TemporaryDirectory() as d:
-        old_push = _touch(os.path.join(d, "push-aaa.safetensors"), 100, age_s=10 * 3600)
-        new_push = _touch(os.path.join(d, "push-bbb.safetensors"), 100, age_s=0)
-        old_warm = _touch(os.path.join(d, "warm-ccc.safetensors"), 100, age_s=10 * 3600)
-        freed = sweep_orphan_spills(d, max_age_s=6 * 3600)
-        check("old push-spill removed", not os.path.exists(old_push))
-        check("fresh push-spill kept", os.path.exists(new_push))
-        check("old warm file untouched by sweep", os.path.exists(old_warm))
-        check("sweep reports bytes freed", freed == 100, f"freed={freed}")
-    check("sweep of a missing dir is a no-op",
-          sweep_orphan_spills("/nonexistent/nope", max_age_s=1) == 0)
 
 
 def test_enforce_cache_budget_evicts_lru_first():
@@ -813,7 +740,7 @@ def test_enforce_cache_budget_disabled_when_zero():
         check("zero budget removes nothing", os.path.exists(p))
 
 
-def test_ckpt_path_filenames_are_kind_tagged():
+def test_ckpt_path_filenames_are_warm_tagged():
     import tempfile
 
     from chad.engine import Engine
@@ -822,10 +749,7 @@ def test_ckpt_path_filenames_are_kind_tagged():
         eng.model_id = "test-model"
         eng.cache_dir = d
         warm = os.path.basename(eng._ckpt_path([1, 2, 3]))
-        push = os.path.basename(eng._ckpt_path([1, 2, 3], tag="push"))
         check("warm checkpoint basename tagged", warm.startswith("warm-"), warm)
-        check("push checkpoint basename tagged", push.startswith("push-"), push)
-        check("kinds hash differently", warm.split("-", 1)[1] != push.split("-", 1)[1])
 
 
 def test_adaptive_chunk_bounds():
@@ -1459,11 +1383,10 @@ if __name__ == "__main__":
              test_guards, test_draft_length, test_prefill_progress_callback,
              test_interrupted_prefill_records_only_fed_tokens,
              test_stop_condition_soft_close,
-             test_sweep_orphan_spills_removes_only_old_push_files,
              test_enforce_cache_budget_evicts_lru_first,
              test_enforce_cache_budget_protects_paths,
              test_enforce_cache_budget_disabled_when_zero,
-             test_ckpt_path_filenames_are_kind_tagged,
+             test_ckpt_path_filenames_are_warm_tagged,
              test_adaptive_chunk_bounds,
              test_load_fails_fast_without_mlx,
              test_prefill_oom_retry_rolls_back,
@@ -1483,8 +1406,7 @@ if __name__ == "__main__":
              test_pld_hybrid_equals_greedy,
              test_hybrid_rewind_matches_fresh,
              test_degenerate_reprefill_matches_fresh,
-             test_truncation_recovery_matches_fresh,
-             test_push_pop_bit_exact)
+             test_truncation_recovery_matches_fresh)
     for fn in tier1 + tier2:
         try:
             fn()

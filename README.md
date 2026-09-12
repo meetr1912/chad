@@ -145,9 +145,8 @@ budget; everything else is deliberately plain.
 | `--model` | `auto` (the shipped default), or any HF repo id / local model dir |
 | `--repl` | plain line REPL instead of the TUI |
 
-Three subcommands, each with its own `--help`: `chad prove` (the offline smoke test),
-`chad serve` ([serve this Mac's model to a container or the LAN](docs/configuration.md#serving-the-local-model-to-a-container-chad-serve)),
-and `chad levers` (print the result-channel lever registry as JSON, for A/B ablation).
+Two subcommands, each with its own `--help`: `chad prove` (the offline smoke test) and
+`chad levers` (print the result-channel lever registry as JSON, for A/B ablation).
 
 A headless task (positional, or piped with no TTY) auto-approves mutating tools and runs
 greedy (temp 0). Every conversation is persisted under `~/.chad/sessions/`, and every resume

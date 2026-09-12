@@ -226,12 +226,6 @@ class _Engine:
         self.warm_calls.append((list(prefix_ids), list(head_ids or [])))
         return "skip", 0
 
-    def push_cache(self):
-        pass
-
-    def pop_cache(self):
-        pass
-
 
 def _agent_in(path, monkeypatch, files):
     from chad.agent import Agent

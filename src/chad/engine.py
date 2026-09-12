@@ -31,8 +31,8 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 # MLX is Apple-only (no CPU/CUDA build), and the whole `Engine` class below rides on it.
-# But two module-level helpers here — `sweep_orphan_spills` and `peek_context_window` —
-# are MLX-free and ARE needed on the remote `--backend llama` path, which loads no
+# But one module-level helper here — `peek_context_window` — is MLX-free and IS
+# needed on the remote `--backend llama` path, which loads no
 # MLX at all. Guard the imports so `import chad.engine` succeeds on a non-Apple host (e.g.
 # inside a Linux container that runs chad against a remote server). `Engine`
 # itself is only ever CONSTRUCTED on the default MLX path, where these are present; if a
@@ -66,10 +66,8 @@ from . import config
 from .base_engine import THINK_CLOSE, GenStats, think_ceiling_hit
 from .diag import log
 
-# checkpoint filename kinds (prefix on the basename) — lets cleanup target the
-# ephemeral push-spills without touching durable warm-prefix files.
+# checkpoint filename prefix (on the basename)
 _CKPT_WARM = "warm"
-_CKPT_PUSH = "push"
 
 
 def _log_mlx_provenance() -> None:
@@ -263,30 +261,6 @@ def prompt_lookup_draft_arr(arr, n, num_draft, ngram_max, ngram_min):
             if draft.size:
                 return [int(t) for t in draft], ng
     return [], 0
-
-
-def sweep_orphan_spills(cache_dir: str, max_age_s: float) -> int:
-    """Delete push-spill checkpoints older than max_age_s. A push-spill lives only
-    for the duration of an active sub-agent (seconds–minutes) and is removed by
-    pop_cache on the clean path; anything older was orphaned by a killed/crashed
-    process and is dead weight. Returns bytes freed. Never raises."""
-    freed = 0
-    try:
-        deadline = time.time() - max_age_s
-        for name in os.listdir(cache_dir):
-            if not name.startswith(_CKPT_PUSH + "-") or not name.endswith(".safetensors"):
-                continue
-            path = os.path.join(cache_dir, name)
-            try:
-                st = os.stat(path)
-                if st.st_mtime < deadline:
-                    os.remove(path)
-                    freed += st.st_size
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return freed
 
 
 def enforce_cache_budget(cache_dir: str, max_bytes: int, protect: set) -> int:
@@ -565,10 +539,6 @@ class Engine:
     _n_attn_heads: int = field(init=False, default=16)
     _n_kv_heads: int = field(init=False, default=0)
     _head_dim: int = field(init=False, default=0)
-    # One-deep cache quarantine stack: push_cache stashes the live
-    # (cache, cached_ids, flags) here so a subagent can run in a fresh isolated cache;
-    # pop_cache restores it bit-identically. Depth 1 only — subagents never nest.
-    _cache_stack: list = field(init=False, default_factory=list)
     # Bounded rewind for the non-trimmable hybrid: ONE recurrent-state
     # snapshot per turn, taken at prefill-end (reference copy — the DeltaNet layers
     # reassign their state arrays each step, so old arrays stay immutably valid).
@@ -886,8 +856,7 @@ class Engine:
         hybrid we can still roll back specially. Called whenever self._cache is
         replaced (reset, warm-start load, compaction reload)."""
         # A replaced cache invalidates the turn-boundary rewind snapshot — its
-        # position is meaningless against new contents. (pop_cache restores the
-        # pushed snapshot explicitly, after its direct flag assignments.)
+        # position is meaningless against new contents.
         self._rewind_snap = None
         self._trimmable = cache_utils.can_trim_prompt_cache(self._cache)
         # ...BUT a qwen3_5-style hybrid is recoverable a different way: its
@@ -920,7 +889,7 @@ class Engine:
     # the recurrent SSM state serializes fine (a fixed ~51MB floor; cheap for one
     # warm-start file), and on a same-model load the state is bit-for-bit reusable.
 
-    def _ckpt_path(self, ids: list, tag: str = "") -> str:
+    def _ckpt_path(self, ids: list) -> str:
         h = hashlib.sha1()
         h.update(self.model_id.encode("utf-8", "ignore"))
         h.update(b"\x00")
@@ -934,14 +903,10 @@ class Engine:
         # different cache
         h.update(f"ctx{self.effective_ctx or 0}".encode())
         h.update(b"\x00")
-        if tag:  # namespace distinct checkpoint kinds (warm-prefix vs push-spill)
-            h.update(tag.encode("utf-8", "ignore"))
-            h.update(b"\x00")
         h.update(np.asarray(ids, dtype=np.uint32).tobytes())
         # cache_dir is Optional on the dataclass but is always set when checkpointing
         # is enabled, which is the only path that reaches _ckpt_path.
-        kind = _CKPT_PUSH if tag == _CKPT_PUSH else _CKPT_WARM
-        return os.path.join(self.cache_dir, f"{kind}-{h.hexdigest()}.safetensors")  # type: ignore[arg-type]
+        return os.path.join(self.cache_dir, f"{_CKPT_WARM}-{h.hexdigest()}.safetensors")  # type: ignore[arg-type]
 
     def warm_prefix(self, prefix_ids: list, should_stop=None, head_ids=None):
         """Make a cold session start warm. Two checkpoints can serve it, longest first:
@@ -1184,111 +1149,6 @@ class Engine:
             return len(hd)
         self._reset_cache()
         return 0
-
-    # -- one-deep cache quarantine -----------------------------
-    # A subagent explores in a SEPARATE small context so the main transcript's warm
-    # cache isn't destroyed by the churn (grep/read spelunking). push_cache stashes the
-    # live cache aside and hands the subagent a fresh empty one; pop_cache restores the
-    # main cache bit-identically. The stash lives in RAM by default (measured cheap: a
-    # 30k-token hybrid main cache ≈ 615 MB), but spills to a disk checkpoint when holding
-    # it resident alongside the subagent's own growing cache would crowd the Metal budget.
-
-    def _should_spill(self, ids: list) -> bool:
-        """Whether to spill the pushed main cache to disk (vs holding it in RAM) while a
-        subagent runs. The fast path keeps it in RAM; we only spill when the main cache
-        is large enough that keeping it resident would leave too little headroom under
-        Apple's recommended working set for the subagent to prefill its own context.
-        Needs cache_dir (nowhere to spill), a measured per-token cost, and the live
-        Metal memory APIs — returns False (hold in RAM) if any is unavailable."""
-        if not self.cache_dir or not self.kv_bytes_per_token or not ids:
-            return False
-        main_bytes = len(ids) * self.kv_bytes_per_token
-        try:
-            budget = int(mx.device_info()["max_recommended_working_set_size"])
-            active = mx.get_active_memory()
-        except Exception:  # noqa: BLE001 — memory probe unavailable -> keep it in RAM
-            return False
-        # `active` already includes the resident model + the live main cache we're about
-        # to push. The free band under the (safety-scaled) working set is what the
-        # subagent gets to grow its own cache into. If that band is already tighter than
-        # the main cache we'd be holding aside, reclaim the main cache to disk.
-        free = budget * 0.90 - active
-        return free < main_bytes
-
-    def push_cache(self):
-        """Depth-1 cache quarantine: stash the live (cache, cached_ids, flags) and start
-        a fresh empty cache so a subagent can run isolated. pop_cache restores it. Raises
-        if a cache is already pushed — subagents can't nest, and depth-1 keeps the
-        lifecycle trivially auditable. Spills the stashed cache to disk when RAM is tight
-        (see _should_spill), reclaiming it on pop."""
-        if self._cache_stack:
-            raise RuntimeError("push_cache: cache stack is depth-1 only (no nesting)")
-        frame = {
-            "cached_ids": self._cached_ids,
-            "trimmable": self._trimmable,
-            "pld_hybrid": self._pld_hybrid,
-            "warm_prefix_ids": self._warm_prefix_ids,
-            "cache": self._cache,
-            "spill_path": None,
-            # The rewind snapshot is reference-copied recurrent state belonging to
-            # THIS cache; it survives the push in RAM either way (tiny next to the
-            # cache itself) and is restored on pop so the parent's rewind window
-            # isn't lost to a subagent round-trip.
-            "rewind_snap": self._rewind_snap,
-        }
-        if self._should_spill(self._cached_ids):
-            path = self._ckpt_path(self._cached_ids, tag=_CKPT_PUSH)
-            try:
-                os.makedirs(self.cache_dir, exist_ok=True)
-                cache_utils.save_prompt_cache(path, self._cache)
-                frame["spill_path"] = path
-                frame["cache"] = None  # drop the RAM reference; reclaimed on pop
-                self._enforce_kv_budget(path)
-            except Exception:  # noqa: BLE001 — disk full/read-only -> just hold in RAM
-                pass
-        self._cache_stack.append(frame)
-        self._reset_cache()
-        mx.clear_cache()  # release the freed buffers (esp. after a spill drop)
-
-    def pop_cache(self):
-        """Restore the cache stashed by push_cache, exactly. After this the main
-        session's cache + _cached_ids are bit-identical to before the push, so its
-        next turn re-syncs against a fully warm prefix (no re-prefill). Raises if
-        nothing was pushed."""
-        if not self._cache_stack:
-            raise RuntimeError("pop_cache: no pushed cache to restore")
-        frame = self._cache_stack.pop()
-        spill = frame.get("spill_path")
-        if spill:
-            try:
-                self._cache = cache_utils.load_prompt_cache(spill)
-            except Exception:
-                # The spilled checkpoint is missing/corrupt (spills only happen under
-                # Metal memory pressure, so this is narrow). Degrade to a clean re-prefill
-                # rather than propagate: pop_cache must never abort the parent — the
-                # invariant is that a stuck sub-agent can't corrupt it. _reset_cache clears
-                # _cached_ids, so the next turn re-syncs from empty and warms the prefix.
-                log.warning("pop_cache: spilled checkpoint %s unreadable; "
-                            "re-prefilling the parent from scratch", spill)
-                self._reset_cache()
-                try:
-                    os.remove(spill)
-                except OSError:
-                    pass
-                mx.clear_cache()
-                return
-            try:
-                os.remove(spill)
-            except OSError:
-                pass
-        else:
-            self._cache = frame["cache"]
-        self._cached_ids = frame["cached_ids"]
-        self._trimmable = frame["trimmable"]
-        self._pld_hybrid = frame["pld_hybrid"]
-        self._warm_prefix_ids = frame["warm_prefix_ids"]
-        self._rewind_snap = frame["rewind_snap"]
-        mx.clear_cache()
 
     def _enforce_kv_budget(self, just_written: str) -> None:
         """LRU-evict the on-disk KV cache dir down to `kv_cache_max_bytes`, protecting
@@ -1657,10 +1517,6 @@ class Engine:
             if oom_degraded:
                 self._reset_cache()
                 mx.clear_cache()
-                # Nothing is resident now, not even the prompt. Say so: a caller mirroring
-                # our cache (chad serve's remote client) would otherwise assume prompt+gen
-                # and estimate its next prefill against a cache that no longer exists.
-                stats.cache_reset = True
                 return text, stats
             # The cache now holds prefix + the tokens we generated.
             self._cached_ids = prompt_ids + gen_ids

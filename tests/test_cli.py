@@ -479,9 +479,9 @@ if __name__ == "__main__":
 # --- sampler env: one call, so the knobs cannot drift apart ---------------
 
 def test_apply_sampler_env_sets_all_three(monkeypatch):
-    """They used to be three inlined sibling blocks in main(), which is why `chad serve`
-    — building its own engine — silently ran without ANY of them. One function now, so a
-    caller cannot honor temp and forget min_p."""
+    """They used to be three inlined sibling blocks in main(), so a second path that built
+    its own engine silently ran without ANY of them. One function now, so a caller cannot
+    honor temp and forget min_p."""
     class E:
         temp = 0.0
         min_p = 0.0
@@ -507,16 +507,6 @@ def test_apply_sampler_env_ignores_junk_and_leaves_unset_knobs_alone(monkeypatch
     assert (e.temp, e.min_p, e.top_p) == (0.3, 0.02, 0.9)
 
 
-def test_serve_applies_the_same_sampler_env_as_the_local_cli():
-    """The point of `chad serve` is that a container measures the model people actually
-    run. A server that ignored CHAD_MIN_P would sample differently from a local chad
-    started with it — the exact drift this server exists to eliminate."""
-    import inspect
-
-    from chad import serve
-    assert "apply_sampler_env" in inspect.getsource(serve.run)
-
-
 # --- subcommand dispatch ------------------------------------------------------
 # `serve` / `prove` / `levers` are matched against argv[0] rather than routed through
 # argparse subparsers: the default invocation's positional is a free-form task string,
@@ -532,19 +522,6 @@ def test_subcommand_dispatch_matches_only_the_bare_word():
         check(f"'{word} ...' stays a task", sentence not in cli._SUBCOMMANDS)
         check(f"'{word} ...' parses as the task positional",
               parse([sentence]).task == sentence)
-
-
-def test_serve_parser_owns_host_and_port():
-    """--host/--port used to sit on the top-level parser, so `chad --port 9999 "fix it"`
-    parsed fine and then ignored the port. They belong to the one command that reads
-    them; the agent parser must now reject them outright."""
-    serve_args = cli._serve_parser().parse_args(["--host", "0.0.0.0", "--port", "9999"])
-    check("serve parses host", serve_args.host == "0.0.0.0", serve_args.host)
-    check("serve parses port", serve_args.port == 9999, serve_args.port)
-    with pytest.raises(SystemExit):
-        cli._agent_parser().parse_args(["--port", "9999"])
-    with pytest.raises(SystemExit):
-        cli._agent_parser().parse_args(["--host", "0.0.0.0"])
 
 
 def test_unattended_governor_knobs_are_env_only():

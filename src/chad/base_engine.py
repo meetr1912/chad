@@ -135,13 +135,7 @@ class GenStats:
                                     # slicing `_cached_ids`, whose shape differs per decode
                                     # path (the prompt-lookup path stores what it FED the
                                     # cache, which omits the final pending token, and an
-                                    # OOM empties it). `chad serve` puts these on the wire
-                                    # so a remote client can mirror the server's cache.
-    cache_reset: bool = False       # the prefix cache was DROPPED during this turn (Metal
-                                    # OOM recovery), so nothing is resident afterwards —
-                                    # not even the prompt. A caller mirroring cache state
-                                    # must clear its mirror rather than assume prompt+gen,
-                                    # which is the one thing `gen_ids` alone cannot say.
+                                    # OOM empties it).
 
     @property
     def tok_per_s(self) -> float:
@@ -166,10 +160,10 @@ class BaseEngine(Protocol):
       - `completion_engine.CompletionEngine` — a llama.cpp raw `/completion` client.
 
     Data members (`tok`, `model_id`, `effective_ctx`, `cache_dir`, `_cached_ids`) are read
-    by the agent loop; the methods are the calls it makes each turn. The warm-prefix /
-    cache-quarantine members are honored by the MLX engine and no-op'd by a remote
-    backend (see `CompletionEngine`), which is exactly why they're part of the documented
-    seam rather than hidden inside `Engine`.
+    by the agent loop; the methods are the calls it makes each turn. `warm_prefix` is
+    honored by the MLX engine and no-op'd by a remote backend (see `CompletionEngine`),
+    which is exactly why it's part of the documented seam rather than hidden inside
+    `Engine`.
     """
 
     # --- data members the agent loop reads -------------------------------
@@ -214,13 +208,4 @@ class BaseEngine(Protocol):
         of `prefix_ids` (a proper prefix of it), checkpointed once for every project so
         a fresh directory restores it and prefills only the tail. Returns
         (status, n_tokens) with status 'hit' | 'partial' | 'miss' | 'skip'."""
-        ...
-
-    def push_cache(self) -> None:
-        """Quarantine the live cache so a sub-agent can run isolated (MLX); no-op on a
-        stateless backend, which has no cache to protect."""
-        ...
-
-    def pop_cache(self) -> None:
-        """Restore the cache stashed by `push_cache` (MLX); no-op on a stateless backend."""
         ...

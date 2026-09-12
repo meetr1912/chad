@@ -96,8 +96,8 @@ quant pickers. chad ships exactly one model and no flag to change it, for three 
 The escape hatches exist and are honest about what they cost: `--model <repo or
 local dir>` forces specific weights through the same in-process engine (you keep the
 cache, you lose the tuning fit), and `--backend llama` runs the harness against a remote
-llama.cpp server as a measured ablation arm (you lose the on-disk warm-prefix checkpoint and
-cache-quarantine, since the KV lives in the server; documented in-code).
+llama.cpp server as a measured ablation arm (you lose the on-disk warm-prefix checkpoint,
+since the KV lives in the server; documented in-code).
 
 chad ships Qwen3.8-27B on every machine, with no RAM tier and no size shorthands
 (`--model` takes a repo id or a directory and nothing else). The tier that 1.x carried
@@ -215,7 +215,7 @@ The code is a standard `src/` package; tests live in `tests/`:
 
 ```
 src/chad/        importable package (uv installs it as the `chad` console script)
-  cli.py         argument parsing + entrypoint (chad.cli:main), plus `serve`/`prove`/`levers`
+  cli.py         argument parsing + entrypoint (chad.cli:main), plus `prove`/`levers`
   agent.py       agentic loop + guardrails
   engine.py      MLX inference + persistent prefix cache
   tools.py       the five-tool surface + JSON schemas

@@ -365,7 +365,7 @@ prefix KV cache on-device). `--backend llama` instead drives the *same* harness 
 remote **llama.cpp** server's raw `/completion` endpoint (token-id prompts). This is the
 arm used when chad runs inside a Linux benchmark container against a GGUF served on a GPU
 box, where MLX can't run. It's lossy relative to the in-process engine (the KV cache lives
-in the server, so warm-prefix checkpoints and cache-quarantine are no-ops) but keeps real
+in the server, so warm-prefix checkpoints are no-ops) but keeps real
 cache telemetry and passes `<think>` back verbatim, not a general "use a cloud model" path.
 
 ```bash
@@ -378,94 +378,6 @@ uv run chad --backend llama --base-url http://<host>:8081   # or CHAD_LLAMA_BASE
   model's vocab; required for a GGUF server (GGUF repos ship no tokenizer).
 - `--api-key-env NAME`: the *name* of the env var holding the API key (read from that
   var, never passed on the command line). Omit for a local endpoint that needs no key.
-
-### Serving the local model to a container (`chad serve`)
-
-`--backend llama` exists because a Linux container can't run MLX. The usual answer is to
-point it at a llama.cpp server holding a GGUF, but then the thing being measured is a
-different quantization of the model than the one people actually run. `chad serve` closes
-that gap: it speaks the *same* `/completion` protocol, backed by the local MLX engine and
-its real prefix cache, so the container drives **this** machine's model unchanged.
-
-```bash
-# on the Mac holding the weights:
-export CHAD_SERVE_API_KEY=$(openssl rand -hex 32)
-uv run chad serve --host 0.0.0.0 --port 8081
-# then, from the container (or another host), with the same key in its environment:
-chad "…" --backend llama --base-url http://host.docker.internal:8081 \
-  --api-key-env CHAD_SERVE_API_KEY
-```
-
-- `--host` / `CHAD_SERVE_HOST`: bind address. Defaults to `127.0.0.1`; a container
-  reaching in over `host.docker.internal`, or any other machine, needs `0.0.0.0`. Any
-  bind other than loopback is **refused at startup** without `CHAD_SERVE_API_KEY`, before
-  the weights load.
-- `--port` / `CHAD_SERVE_PORT`: TCP port (default `8081`).
-- `CHAD_SERVE_API_KEY`: require `Authorization: Bearer <key>`, and give the client
-  `--api-key-env`. There is no auth by default, which is why the default bind is loopback.
-  The server speaks plain HTTP, so the key crosses the network in cleartext: use a
-  high-entropy value (like the `openssl rand` above), keep the server on a network you
-  trust, or put a TLS-terminating proxy in front of it.
-- `CHAD_SERVE_ALLOW_ANON=1`: serve a non-loopback bind with no key anyway. Only the exact
-  value `1` counts. Anyone who can reach the port can then drive the model, reset and
-  reshape its prefix cache, and warm prefixes from the server's disk, so reserve it for an
-  isolated network you control. Earlier versions allowed this by default with only a
-  warning; a launch script that relied on that now needs a key or this variable.
-
-The engine knobs are the same ones a local `chad` reads, and they mean the same thing
-here: the server is the local product, so `CHAD_MAX_CONTEXT`, `CHAD_KV_BITS`,
-`CHAD_KV_CACHE_MAX_GB` and the full sampler family (`CHAD_TEMP`, `CHAD_MIN_P`,
-`CHAD_TOP_P`, `CHAD_TOP_K`, `CHAD_PRESENCE_PENALTY`) all apply to the model it serves.
-They travel as one call, so the server and a local run cannot drift apart one setting at a
-time. A knob a request doesn't mention keeps the server's value; a request that sends one
-explicitly wins for that request only, so a client can A/B a sampler setting against a server
-without restarting it.
-
-`GET /props` reports the context window the server actually enforces, and clients should
-budget against it. That number is pinned at load and never moves, because clients read it
-once and size everything else against it. A prompt that doesn't fit is refused with `400`
-before anything is prefilled, and a `n_predict` larger than the room left beside the
-prompt is clamped to fit; overrunning the window is a Metal allocation the engine may not
-survive, and one client's bad budget shouldn't take down everyone else's session.
-
-The wall requests are admitted against is **live**, and can be tighter than the advertised
-window. The Metal budget is blind to other processes, so a container stack or a browser
-started after the server took physical pages the KV cache needs one-for-one; a prompt that
-fit at load may not fit now. `GET /health` reports both: `n_ctx` (advertised) and
-`safe_ctx` (what fits right now), plus `ctx_pressure` when they diverge, so you can see a
-tightened wall coming instead of meeting it as a `400`. `CHAD_CTX_SAFETY` tunes the
-headroom the estimate holds back (default 0.975).
-
-The endpoints, since a client is a contract:
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /completion` | generation, token-id prompts in, SSE out; the final line carries the generated ids and real `timings` so the client's stats are exact. Dropping the connection cancels generation, as llama.cpp does |
-| `GET /props` | the context window the server enforces, plus which extensions it speaks |
-| `GET /health` | liveness, whether a generation is in flight, and `n_ctx` / `safe_ctx` / `ctx_pressure` |
-| `POST /cache/push`, `POST /cache/pop` | chad-only, cache quarantine |
-| `POST /warm` | chad-only, on-disk KV warm start |
-
-The last two are what a stock llama.cpp server can't do, and they exist because both ends
-are chad's. `/props` advertises them and the client feature-detects, so nothing changes when
-you point the same client at a real llama-server:
-
-- cache quarantine: a client brackets a sub-agent's excursion with a real engine
-  push/pop, so the excursion's prompt does not evict the main transcript's prefix and force
-  a re-prefill on the way back.
-- warm prefix: the on-disk KV warm-start of the stable system+tools prefix, which a
-  remote client can't do for itself because the checkpoint lives on the server's disk.
-
-Both are latency, never correctness: a client that doesn't speak them, or a call that fails,
-degrades to plain remote behavior.
-
-The engine holds **one** KV cache, so generation is serialized: one agent at a time.
-Concurrent clients queue rather than thrash the prefix (`/props` and `/health` stay
-lock-free so a monitor can poll during a long turn). Two caveats worth stating before you
-trust a number that comes out of this: scores are *not* comparable to a GGUF run (different
-quantization is the whole point of the exercise), and on a laptop the agent's own container
-workload competes with decode; on a wall-clock-timed benchmark, a task can fail on time
-rather than on capability. Pilot a handful of tasks before trusting a full sweep.
 
 ### Sampling & reasoning effort
 
@@ -500,8 +412,8 @@ CHAD_REASONING_EFFORT=low uv run chad  # template-level reasoning budget, where 
   [think-cap](#turn-budgets--think-cap) below, which force-closes a `<think>` run the model
   has already started.
 
-All five sampler settings are applied as one call, so every path that builds an engine,
-interactive, one-shot, and `chad serve`) honors the same set.
+All five sampler settings are applied as one call, so every path that builds an engine
+(interactive and one-shot) honors the same set.
 
 ### Turn budgets & think-cap
 

@@ -60,8 +60,7 @@ Everything else falls through to stock. Opt out: CHAD_NO_QSDPA=1.
 Scope note: the engine builds the cache quantized from the start, so these
 kernels serve normal decode, speculative verification and prefill alike. The one path
 that still requires an fp16 cache is opt-in wide prompt-lookup decoding
-(CHAD_USE_PLD). This also serves `chad serve` setups exposing the in-process
-engine with --kv-bits.
+(CHAD_USE_PLD).
 """
 
 from typing import Any

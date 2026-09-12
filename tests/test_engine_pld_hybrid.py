@@ -108,7 +108,6 @@ def _engine(model):
     eng._model_path = ""
     eng._cached_ids = []
     eng._rewind_snap = None
-    eng._cache_stack = []
     eng._warm_prefix_ids = None
     eng.kv_bytes_per_token = 0.0
     eng._is_moe = False

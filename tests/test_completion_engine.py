@@ -449,31 +449,3 @@ def test_generate_salvage_does_not_refire_on_the_injected_close():
     assert stats.salvaged is True
     assert len(bodies) == 2, "salvaged more than once — the injected close was missed"
     assert THINK_CLOSE in text
-
-
-def test_salvage_reconstructs_ids_when_server_sends_none():
-    """`chad serve` sends the generated ids only in its final chunk, and a salvaged
-    request's stream is closed before that chunk arrives. The continuation used to be
-    built from streamed ids alone, so against chad's own server it was prompt + close
-    marker: the runaway think the model was meant to continue from had vanished."""
-    first = list(_sse(
-        {"content": "reasoning ", "stop": False},
-        {"content": "and more ", "stop": False},
-        {"content": "and more ", "stop": False},
-    ))
-    cont = list(_sse(
-        {"content": "answer", "stop": False},
-        {"content": "", "tokens": [99], "stop": True,
-         "timings": {"prompt_n": 1, "prompt_ms": 1.0, "predicted_n": 1,
-                     "predicted_ms": 1.0}},
-    ))
-    ad, bodies = _salvage_adapter(first, cont)
-    text, stats = ad.generate([1, 2, 3], max_tokens=200, think_ceiling=3)
-    assert stats.salvaged is True and len(bodies) == 2
-    close_ids = ad.tok.encode(THINK_CLOSE)
-    think_ids = ad.tok.encode("reasoning and more and more ")
-    cont_prompt = bodies[1]["prompt"]
-    assert len(cont_prompt) > 3 + len(close_ids), "continuation dropped the think"
-    assert cont_prompt == [1, 2, 3] + think_ids + close_ids
-    # and the mirror holds what the server's cache now does, re-tokenized think included
-    assert ad._cached_ids == [1, 2, 3] + think_ids + close_ids + [99]

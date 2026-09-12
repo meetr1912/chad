@@ -53,8 +53,8 @@ class ScriptedEngine:
 
     `generate` ignores the prompt and returns the NEXT string from `script`, honoring
     `CompletionEngine.generate`'s exact return contract `(text, GenStats)` so `Agent` can't
-    tell it apart from a real backend. Stateless, so the warm-prefix / cache-quarantine
-    members no-op (like `CompletionEngine`). If the script runs dry the loop failed to
+    tell it apart from a real backend. Stateless, so `warm_prefix` no-ops (like
+    `CompletionEngine`). If the script runs dry the loop failed to
     terminate — we raise rather than hang, turning a non-terminating loop into a clear
     test failure."""
 
@@ -83,18 +83,12 @@ class ScriptedEngine:
                          generated_tokens=max(1, len(text) // 4), approximate=True)
         return text, stats
 
-    # --- stateless seam: no cache to warm, quarantine, or drop ---------------
+    # --- stateless seam: no cache to warm or drop ---------------
     def reset(self):
         self._cached_ids = []
 
     def warm_prefix(self, prefix_ids, should_stop=None, head_ids=None):
         return "skip", 0
-
-    def push_cache(self):
-        pass
-
-    def pop_cache(self):
-        pass
 
 
 def _tool_call(name, **args):
