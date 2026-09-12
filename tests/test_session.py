@@ -152,6 +152,40 @@ def test_index_0600_and_corrupt_tolerated(tmp_path):
     check("rebuilt from files", items[0]["session_id"] == "20260101-000000-abcd")
 
 
+def test_persisted_copy_masks_known_prefix_secrets(tmp_path):
+    # A credential echoed into a tool result or a tool-call argument must not reach disk:
+    # the file outlives the session and is replayed on resume. A git sha must survive,
+    # prose is never touched, and the in-memory transcript keeps the real values.
+    session.SESS_DIR = os.path.join(tmp_path, "sessions")
+    a = tempfile.mkdtemp(prefix="proj_redact_")
+    tok = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"  # 40 chars
+    sha = "a3f9c1e2b4d6071829abcdef0123456789abcdef"
+    call = "<tool_call>\n" + json.dumps({"name": "bash", "arguments": {
+        "command": "curl -H 'Authorization: Bearer " + tok + "' https://example.com"}}) \
+        + "\n</tool_call>"
+    msgs = [{"role": "user", "content": "the token is Bearer " + tok},
+            {"role": "assistant", "content": call},
+            {"role": "tool", "name": "bash", "content": "Authorization: Bearer " + tok + "\n"},
+            {"role": "tool", "name": "bash", "content": "commit " + sha + "\n"},
+            {"role": "assistant", "content": "done; it was Bearer " + tok}]
+    before = json.loads(json.dumps(msgs))
+    session.save_session(a, msgs, {}, session_id="20260101-000000-5ec2")
+
+    masked = [msgs[0],
+              {**msgs[1], "content": call.replace(tok, "<redacted:40>")},
+              {**msgs[2], "content": "Authorization: Bearer <redacted:40>\n"},
+              msgs[3],
+              msgs[4]]
+    got = session.load_session(a)["messages"]
+    check("tool result + tool-call args masked; sha and prose untouched", got == masked, got)
+    check("in-memory transcript untouched", msgs == before)
+
+    # resuming forks: the masked transcript saved again is byte-stable (the mask is idempotent)
+    session.save_session(a, got, {}, session_id="20260101-000100-5ec2")
+    check("re-save of a masked transcript is stable",
+          session.load_session(a)["messages"] == masked)
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as home:
         test_session(home)
@@ -160,5 +194,6 @@ if __name__ == "__main__":
         test_prune_keeps_newest(home)
         test_adopt_legacy(home)
         test_index_0600_and_corrupt_tolerated(home)
+        test_persisted_copy_masks_known_prefix_secrets(home)
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

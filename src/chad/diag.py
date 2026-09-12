@@ -49,8 +49,7 @@ else:
         pass
 
 
-# Coarse, conservative secret masking for what gets WRITTEN TO THE LOG only.
-# Two branches:
+# Coarse, conservative secret masking. Two branches:
 #   1. A known key prefix (Bearer/sk-/ghp_/xox/aws_secret/api_key) followed by a
 #      value in a WIDE class that includes base64 punctuation (+ / =). The old
 #      single-class regex stopped at the first `/`, so an AWS secret like
@@ -58,22 +57,30 @@ else:
 #   2. A bare 32+ high-entropy blob in a NARROW class (no `/` or `+`) so ordinary
 #      file paths and URLs are left untouched — over-redaction silently guts the
 #      log's diagnostic value, which is worse than the status quo.
-_SECRET_RE = re.compile(
-    r"(?i)"
+# The log previews use both. Persisted session transcripts use only branch 1: they are
+# replayed to the model on resume, and a git sha turned into <redacted:40> changes what
+# it does next. Branch 1 is its own regex, not the combined one with branch-2 matches
+# handed back, because a bare-blob match can start earlier and swallow a prefixed key
+# (`deploy_token_ghp_…`). Keep the two halves separable.
+_PREFIXED = (
     r"(bearer\s+|sk-|ghp_|xox[baprs]-|aws_secret_access_key\s*=\s*|api[_-]?key\s*[=:]\s*)"
-    r"([A-Za-z0-9_\-+/]{16,}={0,2})"
-    r"|([A-Za-z0-9_\-]{32,})")
+    r"([A-Za-z0-9_\-+/]{16,}={0,2})")
+_SECRET_RE = re.compile(r"(?i)" + _PREFIXED + r"|([A-Za-z0-9_\-]{32,})")
+_PREFIXED_SECRET_RE = re.compile(r"(?i)" + _PREFIXED)
 
 
-def redact(s: str) -> str:
+def redact(s: str, *, bare_blobs: bool = True) -> str:
     """Mask secrets in a log preview. Known-prefix secrets keep their prefix and mask
     the (wide) value; bare high-entropy blobs are masked whole. Length-preserving so
-    `<redacted:NN>` still carries a rough signal of what was there."""
+    `<redacted:NN>` still carries a rough signal of what was there.
+
+    `bare_blobs=False` masks only known-prefix secrets: the mode for text the model will
+    read again, where masking every long identifier would change its behaviour."""
     def _mask(m):
         if m.group(1) is not None:  # known-prefix secret (wide value class)
             return m.group(1) + "<redacted:" + str(len(m.group(2))) + ">"
         return "<redacted:" + str(len(m.group(3))) + ">"  # bare high-entropy blob
-    return _SECRET_RE.sub(_mask, s)
+    return (_SECRET_RE if bare_blobs else _PREFIXED_SECRET_RE).sub(_mask, s)
 
 
 def warn_footer(warnings) -> list:

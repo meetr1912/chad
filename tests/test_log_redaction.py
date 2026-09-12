@@ -61,6 +61,24 @@ def test_redacts_secrets():
     check("32-char bare blob masked (at floor)", _redact(b32) == "<redacted:32>")
 
 
+def test_prefix_only_mode():
+    # bare_blobs=False is the persisted-transcript mode: text replayed to the model on
+    # resume keeps its git shas and long identifiers and loses only prefixed credentials.
+    hex40 = "a3f9c1e2b4d6071829abcdef0123456789abcdef"
+    check("bare 40-char hex UNCHANGED", _redact(hex40, bare_blobs=False) == hex40)
+
+    tok = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF"  # 42 chars
+    check("Bearer token still masked",
+          _redact("Authorization: Bearer " + tok, bare_blobs=False)
+          == "Authorization: Bearer <redacted:42>")
+
+    # A prefixed key glued into a longer blob-shaped run: the bare-blob rule must not
+    # consume the run first and hand the key back unmasked.
+    glued = "deploy_token_ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab"
+    check("prefixed key inside a blob-shaped run masked",
+          _redact(glued, bare_blobs=False) == "deploy_token_ghp_<redacted:38>")
+
+
 def test_leaves_normal_text_unchanged():
     # --- should be UNCHANGED (no over-redaction) --------------------------------
     for normal in [

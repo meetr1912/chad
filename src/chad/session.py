@@ -18,12 +18,17 @@ overwrites only *its own* session file, so resuming a session (which mints a fre
 seeds the old messages) never rewrites the original — every resume is implicitly a fork.
 A legacy single-slot `~/.chad/sessions/<cwdhash>.json` file is adopted as one session the
 first time the directory is listed. Retention keeps the newest N per cwd, pruned on save.
+
+What lands on disk has known-prefix secrets (bearer tokens, `sk-`/`ghp_` keys, …) masked
+in tool results and tool-call arguments; the in-memory transcript keeps the real values.
 """
 import hashlib
 import json
 import os
 import secrets
 import time
+
+from .diag import redact
 
 SESS_DIR = os.path.expanduser("~/.chad/sessions")
 RETAIN = 20            # keep the newest N sessions per cwd; prune older on save
@@ -220,6 +225,24 @@ def _prune(cwd: str, keep: int = RETAIN) -> None:
     _write_index(cwd, sessions)
 
 
+def _redacted(messages: list) -> list:
+    """A copy with known-prefix secrets masked in tool results and tool-call arguments.
+    The in-memory transcript is untouched (the running turn needs the real values); only
+    the on-disk copy, which outlives the session and is replayed on resume, is masked.
+    Bare high-entropy blobs are left alone so a resumed transcript keeps its git shas.
+    Only the messages that change are copied; user and assistant prose is never touched."""
+    out = []
+    for m in messages:
+        c = m.get("content")
+        role = m.get("role")
+        if isinstance(c, str) and (role == "tool" or (role == "assistant" and "<tool_call>" in c)):
+            masked = redact(c, bare_blobs=False)
+            if masked != c:
+                m = {**m, "content": masked}
+        out.append(m)
+    return out
+
+
 def save_session(cwd: str, messages: list, meta: dict = None,
                  session_id: str = None) -> str:
     """Atomically persist the conversation for `cwd` to its own session file. Mints a
@@ -232,7 +255,7 @@ def save_session(cwd: str, messages: list, meta: dict = None,
         path = _session_path(cwd, session_id)
         ok = _atomic_write_json(path, {"cwd": os.path.abspath(cwd), "session_id": session_id,
                                        "updated": updated, "meta": meta or {},
-                                       "messages": messages})
+                                       "messages": _redacted(messages)})
         if not ok:
             return ""
         _update_index(cwd, session_id, messages, updated)

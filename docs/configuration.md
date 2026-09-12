@@ -731,7 +731,9 @@ CHAD_CHECKPOINT_DIR=/tmp/ckpt       uv run chad  # relocate the shadow-git edit 
 - `CHAD_CHECKPOINT_DIR`: where the shadow-git repositories backing `/undo` and
   `/restore` live (default `~/.chad/checkpoints`, keyed per workspace). It exists so a test
   or eval suite never writes real home state. Note this is *not* `~/.chad/history`, which is
-  the TUI's prompt-history file.
+  the TUI's prompt-history file. The store is private (mode `0700`), never snapshots
+  `.env*`, `*.pem`, `*.key` or SSH private keys, and a workspace's snapshots are swept
+  after 30 days without an edit.
 
 ### Tree-sitter tags (ambient structure)
 

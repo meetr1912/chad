@@ -30,6 +30,7 @@ machine is broken" from "the model struggled with my task" in about a minute.
 | chad vanishes mid-turn, with no error and **no traceback at all** | an MLX Metal abort under memory pressure; the crash happens below Python, so nothing can print | close memory-heavy apps and re-run; on a borderline box lower `CHAD_CTX_SAFETY`, or point `--model` at a smaller quant. The crash report (worth attaching to a bug) lands in `~/Library/Logs/DiagnosticReports/` |
 | Disk full of old model weights | the Hugging Face cache keeps every revision | `hf cache ls` / `hf cache rm` (older CLIs: `huggingface-cli scan-cache` / `delete-cache`) |
 | Disk filling up in `~/.cache/chad/kv` | one warm-prefix KV checkpoint per project, ~51 MB floor each | it self-evicts at 8 GB; lower it with `CHAD_KV_CACHE_MAX_GB`, at the cost of a cold first turn in the least-recently-used projects |
+| Disk filling up in `~/.chad/checkpoints` | a shadow-git snapshot of each workspace, taken before every edit so `/undo` can put files back | a workspace's snapshots are swept after 30 days without an edit; it is safe to `rm -rf` sooner (you lose `/undo` history) |
 
 ## Something you configured isn't happening
 
