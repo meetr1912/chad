@@ -299,6 +299,26 @@ def test_write():
         os.chdir(cwd)
 
 
+# --- _under_plans: plan mode's only writable area -------------------------------
+
+def test_under_plans_resolves_symlinks(tmp_path, monkeypatch):
+    """A `plans` entry that is a symlink, or a link inside a real `plans`, must not carry
+    a plan-mode write out of ./plans/: the check compares real paths."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    os.symlink(tmp_path / "elsewhere", "plans")
+    check("symlinked plans dir is rejected", tools._under_plans("plans/x.md") is False)
+    check("symlinked plans dir itself is rejected", tools._under_plans("plans") is False)
+
+    os.remove("plans")
+    os.mkdir("plans")
+    check("real plans dir is accepted", tools._under_plans("plans/x.md") is True)
+    check("`..` escape is rejected", tools._under_plans("plans/../x.md") is False)
+    os.symlink(tmp_path / "elsewhere" / "x.md", "plans/link.md")
+    check("link inside plans pointing out is rejected",
+          tools._under_plans("plans/link.md") is False)
+
+
 # --- write_todos: the wire format ---------------------------------------------
 # The tool's format is a markdown checklist — the same text it prints back — because
 # that is what a model writes unprompted. Every other shape it has been observed to

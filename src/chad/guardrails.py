@@ -85,6 +85,21 @@ def is_destructive_bash(command: str) -> bool:
     return _rm_hits_protected(command)
 
 
+def plan_mode_verdict(mode: str, name: str, args: dict) -> str:
+    """'plan_write' — a write/edit under ./plans/ in plan mode (allowed, no confirm);
+    'blocked' — any other mutating tool in plan mode; 'normal' — everything else.
+    The single decision point for plan mode's read-only promise; run_turn consumes it
+    and tests/test_gate.py pins it."""
+    from .tools import _under_plans, is_mutating
+    if mode != "plan":
+        return "normal"
+    if name in ("write", "edit") and _under_plans(str(args.get("path", "") or "")):
+        return "plan_write"
+    if is_mutating(name):
+        return "blocked"
+    return "normal"
+
+
 # A shell command that proves NOTHING about runtime behavior — a syntax/compile check,
 # a byte-compile, or a --version/--help probe. These must NOT clear unverified_edit: the
 # demonstrated failure is a model that "verifies" a real Django bug-fix with

@@ -47,7 +47,6 @@ from .toolcall_parse import parse_tool_calls, strip_think
 from .tools import (
     IGNORE_DIRS,
     TERMINAL,
-    _under_plans,
     active_schemas,
     alias_to_bash,
     dispatch_for,
@@ -1611,11 +1610,12 @@ class Agent:
                     planned_this_turn = True
                 # Plan mode is read-only EXCEPT for writing the plan file itself:
                 # write/edit are allowed only under ./plans/. Every other mutating
-                # tool (bash) and any write outside ./plans/ is blocked.
-                plan_write = (self.mode == "plan" and name in ("write", "edit")
-                              and _under_plans(args.get("path", "")))
+                # tool (bash) and any write outside ./plans/ is blocked
+                # (see guardrails.plan_mode_verdict).
+                verdict = guardrails.plan_mode_verdict(self.mode, name, args)
+                plan_write = verdict == "plan_write"
                 _tool_s = 0.0  # stays 0 when the tool is blocked/denied (fn never ran)
-                if self.mode == "plan" and is_mutating(name) and not plan_write:
+                if verdict == "blocked":
                     result = ("[plan mode: only writing the plan file under ./plans/ is "
                               "allowed. Do not edit project files or run commands. "
                               "Investigate with read-only bash, then write your "

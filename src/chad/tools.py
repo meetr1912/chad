@@ -36,14 +36,18 @@ def _rel(path: str) -> str:
 
 
 # The only writable area in plan mode: plan files land here, nothing else may be
-# touched. See the plan-mode gate in agent.run_turn.
+# touched. See guardrails.plan_mode_verdict.
 PLANS_DIR = "plans"
 
 
 def _under_plans(path: str) -> bool:
-    """True if `path` resolves inside ./plans/ (the only writable area in plan mode)."""
-    root = os.path.abspath(PLANS_DIR)
-    p = os.path.abspath(path)
+    """True if `path` resolves inside ./plans/ (the only writable area in plan mode).
+
+    The target's symlinks are resolved but `plans` itself is not: the root is the real
+    cwd joined with `plans`, so a `plans` entry that is a symlink (a cloned repo can ship
+    one), or a link inside it, cannot carry the write somewhere else."""
+    root = os.path.join(os.path.realpath(os.getcwd()), PLANS_DIR)
+    p = os.path.realpath(path)
     return p == root or p.startswith(root + os.sep)
 
 
