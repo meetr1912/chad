@@ -10,13 +10,31 @@ Docs fixes, tests, bug fixes that come with a failing-test repro, portability an
 tooling improvements. The gate is fast and needs **no model weights**:
 
 ```bash
-uv run pytest -q            # unit gate: loads no model, runs in seconds
-uv run ruff check src tests # lint
-uv run mypy src/chad        # type check
+make gate
 ```
 
-All three run in CI (`.github/workflows/tests.yml`). A green `pytest` alone still fails the
-build if `ruff` or `mypy` is unhappy, so run all three before opening a PR.
+That runs three targets in order, and CI (`.github/workflows/tests.yml`) runs the same ones:
+
+- `make lint` runs `ruff check` over `src`, `tests` and `benchmarks`.
+- `make typecheck` runs `mypy` over `src/chad`.
+- `make test` runs `pytest -q`, which loads no model and finishes in seconds.
+
+A green `make test` alone still fails the build if `ruff` or `mypy` is unhappy, so run the
+whole gate before opening a PR.
+
+### Running the model-backed tests
+
+A few tests in `tests/test_engine.py` load a real model and compare its output byte for
+byte. They skip unless you set `CHAD_MODEL_TESTS=1`, and the first run downloads a 0.5B
+proxy model from Hugging Face:
+
+```bash
+CHAD_MODEL_TESTS=1 uv run pytest -q tests/test_engine.py
+```
+
+The hybrid-cache tests also need `CHAD_TEST_HYBRID_MODEL` set to a local qwen3_5 model
+directory, and skip without it. Their strict byte-equality checks need unquantized (bf16)
+weights.
 
 ## What needs a conversation first
 

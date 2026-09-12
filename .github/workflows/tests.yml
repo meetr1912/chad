@@ -1,10 +1,12 @@
 name: tests
 
 # Apple Silicon only: MLX builds/runs on arm64 macOS, so every job that imports
-# chad runs on macos-14 (GitHub's arm64 runner). The fast unit gate loads NO model
-# and finishes in seconds; the model-backed eval tiers (Ornith) self-skip without
-# weights and are not run here — run `uv run python run_tests.py --evals` locally
-# with the model on disk for those.
+# chad runs on macos-14 (GitHub's arm64 runner). Lint, typecheck and test each run the
+# Makefile target of the same name, so CI checks exactly what the docs tell contributors
+# to run. The fast unit gate loads NO model and finishes in seconds; the tier-2
+# proxy-model tests are opt-in and not run here — run
+# `CHAD_MODEL_TESTS=1 uv run pytest -q tests/test_engine.py` on a Mac with the model
+# cached. The private eval tiers are the maintainer's and are not in this repo.
 on:
   push:
     branches: [main]
@@ -31,7 +33,7 @@ jobs:
           enable-cache: true
       - run: uv sync
       - name: ruff (lint + import order)
-        run: uv run ruff check src tests benchmarks
+        run: make lint
 
   typecheck:
     # mypy runs on macOS because the mlx stubs DO matter: on Linux mlx is not installed,
@@ -47,7 +49,10 @@ jobs:
           enable-cache: true
       - run: uv sync --python 3.11
       - name: mypy (src only; config pins python 3.11)
-        run: uv run --python 3.11 mypy src/chad
+        # UV_PYTHON carries the interpreter through `make` to its `uv run`.
+        env:
+          UV_PYTHON: "3.11"
+        run: make typecheck
 
   test:
     runs-on: macos-14
@@ -63,14 +68,15 @@ jobs:
       - name: Sync dependencies (python ${{ matrix.python }})
         run: uv sync --python ${{ matrix.python }}
       - name: Fast test gate (no model)
-        # CHAD_FAST_TESTS=1 keeps this gate model-free (its documented contract): the
-        # tier-2 cache tests in test_engine.py self-skip instead of downloading a 4-bit
-        # proxy model. Those byte-exact warm-vs-fresh equality checks flip on quantized
-        # argmax near-ties across runner hardware (a numerical tie, not a cache bug — see
-        # the sibling quantization-tie skip), and are meant to run locally on real weights.
+        # The suite is model-free by default (its documented contract): the tier-2 cache
+        # tests in test_engine.py skip unless CHAD_MODEL_TESTS=1 opts in, so nothing here
+        # downloads the 4-bit proxy model. Those byte-exact warm-vs-fresh equality checks
+        # flip on quantized argmax near-ties across runner hardware (a numerical tie, not a
+        # cache bug — see the sibling quantization-tie skip), and are meant to run locally
+        # on real weights. UV_PYTHON carries the matrix interpreter through `make`.
         env:
-          CHAD_FAST_TESTS: "1"
-        run: uv run --python ${{ matrix.python }} pytest -q
+          UV_PYTHON: ${{ matrix.python }}
+        run: make test
       - name: CLI smoke (entrypoint imports + parses, no model)
         run: uv run --python ${{ matrix.python }} chad --help
 

@@ -57,6 +57,13 @@ def skip(name, why):
         pytest.skip(why)
 
 
+def _model_tests_enabled() -> bool:
+    """The model-backed tier-2 tests (a 0.5B proxy download + byte-exact greedy
+    comparisons) run only on explicit opt-in. Unset, the suite is the fast gate CI
+    runs: no weights, no network."""
+    return bool(os.environ.get("CHAD_MODEL_TESTS"))
+
+
 def _is_quantized(model_dir):
     """True if the model dir's config.json declares quantization (mlx/awq/gptq).
 
@@ -367,11 +374,11 @@ def _build_engine(model_id=TIER2_MODEL, enable_pld_hybrid=False):
 
 
 def test_pld_equals_greedy():
-    # CI's fast gate (.github/workflows/tests.yml) sets CHAD_FAST_TESTS=1 to stay
-    # model-free; this tier loads a real model (seconds–minutes when cached) so skip it
-    # there. Run it locally by invoking pytest WITHOUT that var (weights on disk).
-    if os.environ.get("CHAD_FAST_TESTS"):
-        return skip("pld_equals_greedy", "CHAD_FAST_TESTS set (fast gate; skips model load)")
+    # This tier loads a real model (seconds–minutes when cached, a download on a clean
+    # clone), so the default gate that CI runs skips it. Run it locally with
+    # CHAD_MODEL_TESTS=1 (weights on disk).
+    if not _model_tests_enabled():
+        return skip("pld_equals_greedy", "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
     eng = _build_engine()
     if eng is None:
         return skip("pld_equals_greedy", f"could not load {TIER2_MODEL}")
@@ -441,9 +448,9 @@ def test_pld_equals_greedy():
 
 def test_pld_hybrid_equals_greedy():
     # Fast gate skips model loads (matches test_pld_equals_greedy).
-    if os.environ.get("CHAD_FAST_TESTS"):
+    if not _model_tests_enabled():
         return skip("pld_hybrid_equals_greedy",
-                    "CHAD_FAST_TESTS set (fast gate; skips model load)")
+                    "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
     model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL")
     if not model_id:
         return skip("pld_hybrid_equals_greedy",
@@ -522,8 +529,8 @@ def test_hybrid_rewind_matches_fresh():
     quantized weights argmax exact-ties make bit-equality undefined (see
     _is_quantized), so it degrades to structural checks + a warm/fresh prefix
     sanity comparison."""
-    if os.environ.get("CHAD_FAST_TESTS"):
-        return skip("hybrid_rewind", "CHAD_FAST_TESTS set (fast gate)")
+    if not _model_tests_enabled():
+        return skip("hybrid_rewind", "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
     model_id = os.environ.get("CHAD_TEST_HYBRID_MODEL")
     if not model_id:
         return skip("hybrid_rewind", "CHAD_TEST_HYBRID_MODEL unset")
@@ -593,8 +600,9 @@ def test_degenerate_reprefill_matches_fresh():
     `not suffix` branch (prompt fully cached). With the off-by-one fixed, the live KV
     cache is kept in lockstep with _cached_ids, so the second (degenerate-path)
     generation must be byte-identical to a fresh-cache greedy run."""
-    if os.environ.get("CHAD_FAST_TESTS"):
-        return skip("degenerate_reprefill", "CHAD_FAST_TESTS set (fast gate)")
+    if not _model_tests_enabled():
+        return skip("degenerate_reprefill",
+                    "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
     eng = _build_engine()
     if eng is None:
         return skip("degenerate_reprefill", f"could not load {TIER2_MODEL}")
@@ -641,8 +649,8 @@ def test_truncation_recovery_matches_fresh():
     the cache reuse must never change output. (The old Agent._render_for_cache splice was
     proven to always equal a plain render, so it was deleted; the real invariant lives at
     the engine level and is what this test now pins.)"""
-    if os.environ.get("CHAD_FAST_TESTS"):
-        return skip("truncation_recovery", "CHAD_FAST_TESTS set (fast gate)")
+    if not _model_tests_enabled():
+        return skip("truncation_recovery", "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
     eng = _build_engine()
     if eng is None:
         return skip("truncation_recovery", f"could not load {TIER2_MODEL}")
@@ -691,8 +699,8 @@ def test_truncation_recovery_matches_fresh():
 # restored cache breaks the strict equality below — do NOT loosen.
 
 def test_push_pop_bit_exact():
-    if os.environ.get("CHAD_FAST_TESTS"):
-        return skip("push_pop_bit_exact", "CHAD_FAST_TESTS set (fast gate)")
+    if not _model_tests_enabled():
+        return skip("push_pop_bit_exact", "CHAD_MODEL_TESTS not set (fast gate; skips model load)")
     # push/pop is model-agnostic (RAM-tuple stash + optional disk spill); the trimmable
     # default is the CI path. A run on a real bf16 hybrid is also wanted,
     # so CHAD_TEST_HYBRID_MODEL — when set — points THIS test at those weights.

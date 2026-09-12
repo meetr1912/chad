@@ -1,16 +1,15 @@
 # Releasing chad
 
 Maintainer checklist. The pipeline is tag-driven: pushing a version tag runs
-`.github/workflows/publish.yml`, which builds and — after the manual `pypi-env`
+`.github/workflows/publish.yml`, which builds and — after the manual `pypi`
 environment approval — publishes `chad-code` to PyPI.
 
 ## Checklist
 
-1. **Gates green, locally and in CI** (none of these load model weights):
+1. **Gate green, locally and in CI** (it loads no model weights). It runs lint,
+   typecheck and tests, the same targets CI runs:
    ```bash
-   uv run pytest -q
-   uv run ruff check src tests
-   uv run mypy src/chad
+   make gate
    ```
 2. **Behavior changes eval'd.** Anything model-visible since the last release
    (prompts, tool schemas, guardrails, engine, compaction) has been through the
@@ -51,7 +50,9 @@ environment approval — publishes `chad-code` to PyPI.
    ```bash
    git tag v<X.Y.Z> && git push origin v<X.Y.Z>
    ```
-   Approve the `pypi-env` gate when the publish workflow pauses on it.
+   Approve the `pypi` gate when the publish workflow pauses on it (the name must
+   also match the trusted-publisher configuration on PyPI; see the comment at the
+   top of `publish.yml`).
 7. **Cold-install check** (or wait for the weekly canary,
    `.github/workflows/canary.yml`):
    ```bash
