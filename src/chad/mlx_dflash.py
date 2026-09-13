@@ -50,6 +50,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Optional, cast
 
+from . import config
 from .diag import log
 
 # The drafter sidecar's subdirectory inside a model weights dir.
@@ -785,7 +786,7 @@ def _is_sidecar(d: str) -> bool:
 def bundle_dir(model_dir: str) -> Optional[str]:
     """The drafter sidecar bundled with the weights at `model_dir`, or None.
     CHAD_DFLASH_PATH wins when set (an explicit dir is an order)."""
-    explicit = os.environ.get("CHAD_DFLASH_PATH")
+    explicit = config.env_str("CHAD_DFLASH_PATH")
     if explicit:
         return os.path.expanduser(explicit)
     d = os.path.join(model_dir, _BUNDLE)

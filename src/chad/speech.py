@@ -20,6 +20,8 @@ import subprocess
 import threading
 from collections import deque
 
+from . import config
+
 # Parakeet TDT v3 (0.6B, multilingual): the engine Hex ships as its default,
 # and for the same reasons — a class faster than Whisper per clip, better
 # dictation accuracy, and a TDT decoder without Whisper's repetition-loop
@@ -50,7 +52,7 @@ MAX_TAKE_S = 600
 
 
 def stt_model() -> str:
-    return os.environ.get("CHAD_STT_MODEL", DEFAULT_STT_MODEL)
+    return config.env_str("CHAD_STT_MODEL", DEFAULT_STT_MODEL)
 
 
 def stt_quant_bits():
@@ -62,7 +64,7 @@ def stt_quant_bits():
     faster decode (the decoder is memory-bound). CHAD_STT_QUANT=4 halves
     memory again (514 MB, equally clean on the battery) but synthetic clean
     audio can't rule out degradation on noisy mics — opt-in, not default."""
-    raw = os.environ.get("CHAD_STT_QUANT", "8").strip().lower()
+    raw = config.env_str("CHAD_STT_QUANT", "8").strip().lower()
     if raw in ("", "0", "16", "none", "off", "bf16"):
         return None
     if raw in ("4", "8"):
@@ -143,7 +145,7 @@ def tts_status():
     """
     if not os.path.exists(SAY_BIN):
         return False, f"{SAY_BIN} not found — dictation works, replies won't be spoken"
-    voice = os.environ.get("CHAD_VOICE")
+    voice = config.env_str("CHAD_VOICE")
     if not voice:
         return True, ""
     try:
@@ -231,7 +233,7 @@ def collapse_repeats(text: str, max_run: int = 3) -> str:
 
 
 def remap_path() -> str:
-    return os.environ.get("CHAD_SPEECH_WORDS",
+    return config.env_str("CHAD_SPEECH_WORDS",
                           os.path.expanduser("~/.chad/speech_words.json"))
 
 
@@ -293,10 +295,10 @@ def say_argv(text: str) -> list:
     """argv for macOS `say`. Text passed as a single argument (no shell), voice
     and rate env-tunable. `--` guards a transcript that starts with a dash."""
     argv = ["/usr/bin/say"]
-    voice = os.environ.get("CHAD_VOICE")
+    voice = config.env_str("CHAD_VOICE")
     if voice:
         argv += ["-v", voice]
-    rate = os.environ.get("CHAD_SPEECH_RATE")
+    rate = config.env_str("CHAD_SPEECH_RATE")
     if rate:
         argv += ["-r", rate]
     return argv + ["--", text]

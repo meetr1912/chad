@@ -24,6 +24,7 @@ pattern as `tools._TODOS` — and is cleared by `reset_session()` when a new Age
 
 import os
 
+from . import config
 from .diag import log, warn_footer
 from .ignore import IGNORE_DIRS
 
@@ -199,13 +200,14 @@ def discover(cwd: str = None, home: str = None):
     `order` is the de-duplicated menu order (stable: discovery order); `warnings`
     collects per-skill diagnostics plus shadow/collision notes for surfacing in /skills.
     """
-    # CHAD_NO_SKILLS=1 disables discovery entirely, so `/name` resolves to nothing and
-    # the menu is bare. The prompt-confound this originally existed for — ~50 user
-    # skills injected into every system prompt, differing from a clean environment and
-    # shifting a small model's greedy trajectory — is now structurally impossible, since
-    # discovery reaches only the completion menu. It stays as the switch for a host that
-    # wants its personal skills unreachable from chad at all.
-    if os.environ.get("CHAD_NO_SKILLS", "").strip().lower() in ("1", "true", "yes", "on"):
+    # CHAD_NO_SKILLS — set to any non-empty value, the convention every other CHAD_NO_*
+    # follows — disables discovery entirely, so `/name` resolves to nothing and the menu
+    # is bare. The prompt-confound this originally existed for — ~50 user skills injected
+    # into every system prompt, differing from a clean environment and shifting a small
+    # model's greedy trajectory — is now structurally impossible, since discovery reaches
+    # only the completion menu. It stays as the switch for a host that wants its personal
+    # skills unreachable from chad at all.
+    if config.flag("CHAD_NO_SKILLS"):
         return {}, [], []
     cwd = cwd or os.getcwd()
     home = home or os.path.expanduser("~")
@@ -283,10 +285,6 @@ def reset_session():
 def skill_names():
     """Names of all available skills."""
     return list(get_registry().order)
-
-
-def has_skills() -> bool:
-    return bool(get_registry().order)
 
 
 # ---------------------------------------------------------------------------

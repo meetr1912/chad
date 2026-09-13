@@ -11,8 +11,3 @@ IGNORE_DIRS = (".git", "node_modules", "__pycache__", ".venv", "venv",
 
 # repomap (whole-repo indexing) additionally skips these; a symbol edit doesn't.
 REPOMAP_EXTRA = (".cache", "models", "site-packages")
-
-
-def slash_wrapped(names) -> tuple:
-    """`/name/` substring forms for path-contains tests (the symbols/repomap style)."""
-    return tuple(f"/{d}/" for d in names)

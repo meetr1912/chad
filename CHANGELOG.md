@@ -30,6 +30,11 @@ Notable, user-visible changes.
   position, so after the first compaction every surviving step reported an earlier
   message's time.
 
+**`CHAD_NO_SKILLS=0` now disables skills**, like every other `CHAD_NO_*=0`. It was the
+one switch parsed by value rather than by presence: `CHAD_NO_SEATBELT=0` turns the
+seatbelt off, but `CHAD_NO_SKILLS=0` left skill discovery on. These flags read as set or
+unset, so unset the variable — don't set it to `0` — to keep skills.
+
 **Upgrading costs one cold prefill.** The `write_todos` line in the system prompt now
 describes the JSON list the tool actually accepts; it had advertised a markdown
 checklist the tool rejects, so a model that followed its prompt burned a step on a

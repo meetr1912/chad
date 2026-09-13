@@ -145,10 +145,6 @@ class GenStats:
     def accept_rate(self) -> float:
         return self.draft_accepted / self.draft_proposed if self.draft_proposed else 0.0
 
-    @property
-    def tokens_per_forward(self) -> float:
-        return self.generated_tokens / self.forwards if self.forwards else 0.0
-
 
 @runtime_checkable
 class BaseEngine(Protocol):

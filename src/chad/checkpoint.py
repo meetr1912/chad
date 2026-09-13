@@ -25,6 +25,8 @@ import subprocess
 import time
 from typing import Optional
 
+from . import config
+
 log = logging.getLogger("chad")
 
 _GIT_TIMEOUT_S = 120  # first snapshot of a big tree is seconds; never hang a turn
@@ -44,7 +46,7 @@ _swept = False  # the store lock-down and stale sweep run once per process
 def _history_root() -> str:
     # CHAD_CHECKPOINT_DIR: test/e2e override so suites never write real home state.
     # NOT ~/.chad/history — that name is taken by the TUI's prompt-history FILE.
-    env = os.environ.get("CHAD_CHECKPOINT_DIR")
+    env = config.env_str("CHAD_CHECKPOINT_DIR")
     if env:
         return env
     return os.path.join(os.path.expanduser("~"), ".chad", "checkpoints")

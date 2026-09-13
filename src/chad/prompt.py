@@ -169,9 +169,8 @@ def classify_intent(user_text: str) -> dict:
 
 def _dynamic_context() -> list:
     """The volatile, per-session tail of the system prompt (cwd, workspace snapshot,
-    test command, project docs, skills catalog). Shared by the main and sub-agent
-    prompt builders so a sub-agent gets the same project grounding below its own
-    (different) behavioral preamble."""
+    test command, project docs, skills catalog) — the project grounding that sits
+    below the behavioral preamble."""
     dynamic = [
         "\n\n# Environment",
         f"- OS: {platform.system()} {platform.release()} ({platform.machine()})",
@@ -330,8 +329,8 @@ def _env_manifest() -> str:
     """The lever-gated (`env_manifest`) session-start toolchain inventory — the
     environment analogue of the workspace map, answering the which/--version/pip-list
     probe class before it is asked (probes measured fail-enriched 3.33 vs
-    2.46/trial). Built once per session in ambient.py, so the sub-agent prompt reuses
-    it without re-probing; "" (no block) when off or nothing detected."""
+    2.46/trial). Built once per session in ambient.py rather than re-probed per
+    prompt build; "" (no block) when off or nothing detected."""
     from . import ambient
     try:
         return ambient.env_manifest()

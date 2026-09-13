@@ -569,7 +569,7 @@ class Agent:
         # Mid-run steering (improve 01): callable() -> list[str] of user redirections
         # typed while the turn runs, drained between steps and injected into the live
         # transcript (a pure append — the warm KV prefix stays valid) instead of
-        # forcing interrupt + re-prefill. None (headless/bench/sub-agent) = off.
+        # forcing interrupt + re-prefill. None (headless/bench) = off.
         self._drain_steering = drain_steering
         # ATIF trajectory capture, off unless CHAD_TRAJECTORY_JSON is set.
         self._atif = atif.recorder()
@@ -772,7 +772,7 @@ class Agent:
         ))
         # Debug hook (env-gated, off by default): dump the first decoded render so a
         # rendered-prompt difference across environments can be diffed. Best-effort.
-        dump = os.environ.get("CHAD_DUMP_RENDER")
+        dump = config.env_str("CHAD_DUMP_RENDER")
         if dump and not getattr(self, "_dumped_render", False):
             try:
                 with open(dump, "w") as f:

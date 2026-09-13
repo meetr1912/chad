@@ -11,7 +11,7 @@ must never lose a trial because telemetry broke).
 
 **Why derive from `agent.messages` rather than instrument the tool dispatch.**
 `run_turn` appends `{"role": "tool", ...}` from ~9 different sites (validation rejects,
-edit nudges, sub-agent returns, the loop-break paths), several behind their own `continue`.
+edit nudges, done-gate rejections, the loop-break paths), several behind their own `continue`.
 Hooking each one would rot the moment a tenth appears. The message list is the single
 place every one of them converges, so we rebuild the trajectory from it after each step.
 

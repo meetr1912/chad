@@ -34,7 +34,6 @@ from chad.guardrails import (
     edit_failed_to_land,
     extend_step_cap,
     is_destructive_bash,
-    is_readonly_bash,
     is_repeat_loop,
     landing_nudge,
     loop_should_abort,
@@ -314,27 +313,6 @@ def test_nudge_for_no_calls():
     kind8, nudge8 = nudge_for_no_calls("Let me look at the failing test first.",
                                        hit_cap=False, **base)
     check("dangling-intent preamble is not nudged here", kind8 is None and nudge8 is None)
-
-
-def test_is_readonly_bash():
-    ro = ["ls -la /app", "grep -rn foo src | head -20", "cat a.py; wc -l a.py",
-          "git log --oneline -5 && git diff HEAD~1", "find . -name '*.py' 2>/dev/null",
-          "cd /app && grep foo bar.py", "sed -n '1,20p' file.py",
-          "git status", "echo hi 2>&1", "stat /app/out.npy || ls /app"]
-    for c in ro:
-        check(f"read-only: {c}", is_readonly_bash(c))
-    action = ["git merge branch2 --no-edit", "apt-get install -y git",
-              "mkdir -p /app/repo && cd /app/repo && git init",
-              "python3 find_dist.py", "make test", "pip install numpy",
-              "echo x > /app/out.txt", "sed -i 's/a/b/' f.py",
-              "git fetch /app/b.bundle HEAD:branch1", "tar xf a.tar",
-              "cp a b", "rm -f x", "./run.sh", "curl -o f http://x",
-              "git checkout branch1"]
-    for c in action:
-        check(f"action: {c}", not is_readonly_bash(c))
-    # Unknown commands are conservatively ACTION (never harass ops with the gate).
-    check("unknown head is action", not is_readonly_bash("frobnicate --all"))
-    check("empty command is read-only", is_readonly_bash(""))
 
 
 def test_landing_nudge():
@@ -857,7 +835,6 @@ if __name__ == "__main__":
     test_loop_guard()
     test_loop_guard_resets_on_landed_edit()
     test_nudge_for_no_calls()
-    test_is_readonly_bash()
     test_landing_nudge()
     test_extend_step_cap()
     test_thrash_guard()

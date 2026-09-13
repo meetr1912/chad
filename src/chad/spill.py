@@ -25,6 +25,8 @@ import re
 import shutil
 import time
 
+from . import config
+
 # How many files of each kind a session dir keeps, newest-first. `bash` and `result`
 # fire a handful of times per turn; a single compaction pass can trim dozens of tool
 # results at once (measured: ~6 per compacted session, with a long tail), so `compact`
@@ -49,7 +51,7 @@ def base_dir() -> str:
     """Root under which every session's spill dir lives. Resolved fresh each call
     (the eval harness repoints HOME per task). Never under cwd: a stray file would
     pollute the project's git status and fail the plan-mode untouched-tree check."""
-    return os.environ.get("CHAD_SPILL_DIR") or os.path.join(
+    return config.env_str("CHAD_SPILL_DIR") or os.path.join(
         os.path.expanduser("~"), ".cache", "chad", "spill")
 
 

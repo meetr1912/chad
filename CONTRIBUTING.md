@@ -72,3 +72,6 @@ Two areas corrupt more than the line you touched, so lean on the existing tests:
 
 ruff and mypy are the law. Match the surrounding comment density and naming, and write code
 that reads like the code already there.
+
+`build/` and `*.egg-info` are regenerable artifacts; delete them before a repo-wide grep or
+a local wheel build.

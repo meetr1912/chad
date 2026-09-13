@@ -1,6 +1,11 @@
-"""Context-economy metric for the symbolic stack (plan: tokens-to-target).
+"""Context-economy metric for the symbolic stack (tokens-to-target).
 
-The symbolic stack is the context engine: its quality is how many tokens of tool
+HISTORICAL: the symbolic stack was measured, rejected, and removed before 2.0.0
+(see docs/design.md, "Why the tool surface is five tools"). This script imports
+`chad.lsp` and the `RepoMap` symbol methods, which went with it, so it does NOT run
+against this tree — it is kept as the record of the measurement.
+
+The symbolic stack was the context engine: its quality is how many tokens of tool
 output the model must ingest to reach a correct edit. For each polyglot fixture
 language this measures three fixed navigation tasks:
 
@@ -13,8 +18,6 @@ language this measures three fixed navigation tasks:
 
 Tokens use repomap._estimate_tokens, the same accounting the map budgets with, so
 numbers are comparable to repo_map's own budget. No model load, no network.
-
-Run: uv run python benchmarks/ctxengine/measure.py [--json]
 """
 
 import json

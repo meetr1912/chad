@@ -575,8 +575,8 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
 - `CHAD_NO_SKILLS`: turns off [Agent Skill](#agent-skills-agentskillsio) discovery
   entirely, so no `/<skill>` command resolves. Skills no longer touch the system prompt,
   so this is no longer needed to keep your personal skills out of a benchmark; set it
-  when you want them unreachable from chad at all. Unlike the other `CHAD_NO_*` vars this
-  one wants a real truthy value (`1`/`true`/`yes`/`on`).
+  when you want them unreachable from chad at all. Like every other `CHAD_NO_*` flag it
+  reads as set or unset: any non-empty value, `0` included, turns discovery off.
 - `CHAD_NO_FASTPATH`: disables the fused-projection + compiled decode step installed
   at load for the dense `qwen3_5` hybrid (`mlx_fastpath.py`): the MLP `gate|up` concat, the
   GDN `in_proj` concat, and the compiled S=1 layer step. It is a silent no-op on any other

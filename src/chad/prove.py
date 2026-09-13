@@ -301,7 +301,7 @@ def _scorecard(results, meta):
 def run(args):
     """Entry point (dispatched from cli.main on the literal task `prove`).
     Returns the process exit code."""
-    from . import cli
+    from . import cli, config
     if args.backend != "mlx":
         sys.stderr.write(
             f"chad prove verifies the local in-process engine; --backend "
@@ -312,7 +312,7 @@ def run(args):
         cli._preflight("mlx")
     except SystemExit:
         return 2
-    if os.environ.get("CHAD_MODEL") or getattr(args, "model", None):
+    if config.env_str("CHAD_MODEL") or getattr(args, "model", None):
         sys.stderr.write("[prove pins the shipped model — CHAD_MODEL and --model are "
                          "ignored for this run]\n")
     # Pinned to the shipped default rather than a smaller stand-in: prove exists to

@@ -75,6 +75,7 @@ except Exception as _e:  # noqa: BLE001 — any import-time failure, not just Im
     OAuthToken = None                                             # type: ignore[assignment,misc]
     _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
+from . import config
 from .diag import log
 
 # How long the interactive login waits for the human to approve in the browser and the
@@ -97,7 +98,7 @@ def oauth_enabled() -> bool:
     if _SDK_ERROR:
         log.warning("mcp: OAuth unavailable, SDK auth import failed: %s", _SDK_ERROR)
         return False
-    val = os.environ.get("CHAD_MCP_OAUTH", "")
+    val = config.env_str("CHAD_MCP_OAUTH", "")
     return val.strip().lower() not in ("", "0", "false", "no", "off")
 
 

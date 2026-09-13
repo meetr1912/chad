@@ -30,7 +30,7 @@ Four client responsibilities, mirroring `skills.py`:
 
 Everything degrades gracefully: a server that's missing, misconfigured, slow to
 connect, or that crashes mid-session contributes no tools and never takes the agent
-down — exactly like a language server that won't start in `lsp.py`.
+down — the same degrade-don't-die contract skills.py follows.
 
 State (the cwd-keyed registry of live connections) lives at module level like
 `skills._registry`, is rebuilt when cwd changes, and is torn down by
@@ -625,7 +625,7 @@ def service() -> "_Registry":
 def reset_session():
     """Tear down all server connections and force reconnection on next use. Called when
     a new Agent / `/reset` starts so a prior session's servers don't leak forward
-    (mirrors skills.reset_session and lsp's rebind-stops-old-server)."""
+    (mirrors skills.reset_session)."""
     global _registry
     if _registry is not None:
         _registry.close()

@@ -203,66 +203,6 @@ def reverts_working_tree(command: str) -> bool:
     return bool(command) and any(p.search(command) for p in _REVERT_PATTERNS)
 
 
-# Command heads that only OBSERVE state. Used by the investigation gate: a bash step
-# whose every segment starts with one of these (and redirects nothing to a file) is
-# investigation; anything else — `git merge`, `apt-get install`, `mkdir`, `tar x`,
-# a redirect — is ACTION and must reset the read-only streak (otherwise the gate can
-# count an entire git/ops workflow as "investigation" and demand an edit at a decision
-# point where there is nothing to edit yet).
-_READONLY_HEADS = frozenset((
-    "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg",
-    "find", "file", "stat", "wc", "which", "type", "pwd", "echo", "printf", "du",
-    "df", "ps", "env", "printenv", "sort", "uniq", "cut", "tr", "diff", "cmp",
-    "md5sum", "sha1sum", "sha256sum", "strings", "xxd", "hexdump", "od",
-    "readlink", "realpath", "basename", "dirname", "test", "[", "true", "false",
-    "date", "whoami", "id", "uname", "hostname", "tree", "awk", "sed", "jq",
-    "column", "nl", "tac", "sleep",
-))
-_READONLY_GIT_SUBS = frozenset((
-    "log", "status", "diff", "show", "describe", "rev-parse", "ls-files",
-    "ls-remote", "ls-tree", "blame", "reflog", "shortlog", "grep", "cat-file",
-    "rev-list", "name-rev", "var", "count-objects",
-))
-# Harmless stderr plumbing stripped before the "any redirect ⇒ mutating" check.
-_STDERR_REDIR_RE = re.compile(r"2>\s*&1|2>\s*/dev/null|&>\s*/dev/null|>\s*/dev/null")
-_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|[;|]")
-
-
-def is_readonly_bash(command: str) -> bool:
-    """Conservatively true when a bash command only OBSERVES state: every pipeline
-    segment's head is in the read-only allowlist (`cd`/`env`-style prefixes skipped;
-    `git <readonly-sub>` allowed; `sed -i` excluded) and nothing is redirected to a
-    file. Anything unrecognized is NOT read-only — for the investigation gate that
-    is the safe direction (an ops step wrongly counted as investigation harasses the
-    model; a read wrongly counted as action merely delays the gate)."""
-    if not command.strip():
-        return True
-    cleaned = _STDERR_REDIR_RE.sub("", command)
-    if ">" in cleaned or "<(" in cleaned:
-        return False
-    for seg in _SEGMENT_SPLIT_RE.split(cleaned):
-        words = seg.strip().split()
-        # skip wrappers/prefixes that don't decide the verb
-        while words and (words[0] == "cd" or "=" in words[0] or words[0] in
-                         ("env", "sudo", "command", "builtin", "time", "nice")):
-            if words[0] == "cd":  # `cd x && grep …`: drop `cd` + its argument
-                words = words[2:]
-            else:
-                words = words[1:]
-        if not words:
-            continue
-        head = words[0]
-        if head == "git":
-            if len(words) < 2 or words[1] not in _READONLY_GIT_SUBS:
-                return False
-        elif head not in _READONLY_HEADS:
-            return False
-        elif head == "sed" and any(w.startswith("-i") or w.startswith("--in-place")
-                                   for w in words[1:]):
-            return False
-    return True
-
-
 def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
     """Update the (did_work, made_edit, unverified_edit) guardrail flags after one
     tool result; returns the new triple. A substantive tool counts as real work; a

@@ -9,6 +9,9 @@ or make a garbled budget knob crash startup.
 Run: `uv run python tests/test_config.py`
 """
 
+import pathlib
+import re
+
 import pytest
 
 from chad import config
@@ -94,9 +97,29 @@ def test_env_float(monkeypatch):
     check("non-numeric -> default, no raise", config.env_float("CHAD_X", 1.5) == 1.5)
 
 
+def test_env_reads_go_through_config():
+    """Nothing outside the three deliberate exceptions parses a CHAD_* var by hand.
+
+    The rules above are only the product's behavior while every knob funnels through
+    them: a hand-rolled read is a second convention nobody documented, which is how
+    `CHAD_NO_SKILLS` came to invert the `CHAD_NO_*=0` meaning every sibling flag has.
+    Extend `allowed` only with a comment saying why that site cannot use a helper."""
+    allowed = {
+        "config.py",   # the helpers themselves
+        "levers.py",   # wants the raw comma list, not a typed scalar
+        "cli.py",      # a deliberately strict int/float parser that rejects a typo
+    }
+    pat = re.compile(r'os\.(?:environ\.get|getenv)\("CHAD_')
+    src = pathlib.Path(__file__).resolve().parent.parent / "src" / "chad"
+    offenders = sorted(f.name for f in src.glob("*.py")   # top level only; parakeet/ is vendored
+                       if pat.search(f.read_text()) and f.name not in allowed)
+    check("no hand-rolled CHAD_* env reads", not offenders, f"offenders: {offenders}")
+
+
 if __name__ == "__main__":
     for t in (test_flag, test_eq, test_env_str, test_env_int, test_env_float):
         with pytest.MonkeyPatch.context() as mp:
             t(mp)
+    test_env_reads_go_through_config()
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
