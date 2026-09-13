@@ -606,6 +606,11 @@ CHAD_DISABLE=all uv run chad                # the bare model + tool loop
 
 ### Safety & A/B opt-outs
 
+**One thing no permission mode waves through.** A `write`/`edit` whose real path is
+outside the working directory (or under `.git/hooks`) always asks, even in auto-accept
+and yolo; headless runs block it and tell the model why. The prompt names the resolved
+path, so a symlink out of the workspace shows where the write actually lands.
+
 These flip behavior off rather than tune it. The two safety opt-outs **weaken** chad's
 defenses. Leave them unset in normal use; they exist for measurement and edge cases.
 
@@ -654,9 +659,14 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
   temp dirs, and caches; reads and network open. Only the spawned shell child is ever
   sandboxed. Set this only when the sandbox itself breaks a legitimate workflow.
 - `CHAD_NO_ENV_GUARD`: bash children normally get a **filtered** copy of the
-  environment: variable names shaped like credentials (`…_TOKEN`, `…_SECRET`,
-  `…_API_KEY`, …) are dropped, name-pattern only, values never read. Set this for a
-  session whose commands legitimately need a credential (e.g. `gh`, deploy scripts).
+  environment: variable names shaped like credentials are dropped — `…_TOKEN`,
+  `…_SECRET`, `…_PASSWORD`, `…_API_KEY`, `…_KEY`, `…_PAT`, `…_AUTH`, `…_DSN`,
+  `…_TOKEN_FILE`, plus `SSH_AUTH_SOCK`, `DATABASE_URL` and `AWS_PROFILE` by name. The
+  one value the guard reads is a `…_URL` carrying userinfo (`scheme://user:pass@host`),
+  dropped because the name gives no hint that it holds a password. Set this for a
+  session whose commands legitimately need a credential (e.g. `gh`, deploy scripts) — a
+  stripped variable is absent, never corrupted, so a command that needs one fails
+  clearly.
 - `CHAD_PROTECT_GIT`: an opt-in tier on top of the yolo sandbox: the workspace's
   `.git` (and a worktree's external gitdir) is write-DENIED, so an unreviewed command
   cannot destroy project history. The cost is real: every `.git`-writing git command

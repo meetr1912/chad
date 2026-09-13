@@ -399,6 +399,44 @@ def test_under_plans_resolves_symlinks(tmp_path, monkeypatch):
           tools._under_plans("plans/link.md") is False)
 
 
+# --- outside_workspace: the containment check for in-process writes --------------
+
+def test_outside_workspace_resolves_before_judging(tmp_path, monkeypatch):
+    """write/edit never enter the bash seatbelt, so the boundary is this function:
+    it judges where a path REALLY lands, not how it is spelled."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "x.py").write_text("x = 1\n")
+    check("a file in the workspace is inside",
+          tools.outside_workspace("sub/x.py") is False)
+    check("a path that does not exist yet is judged by its parents",
+          tools.outside_workspace("new/dir/x.py") is False)
+    check("`..` escape is outside", tools.outside_workspace("../x") is True)
+
+    outside = tmp_path.parent / "outside_ws.txt"
+    check("an absolute path elsewhere is outside",
+          tools.outside_workspace(str(outside)) is True)
+
+    os.symlink(outside, tmp_path / "link.txt")
+    check("a symlink inside pointing out is outside",
+          tools.outside_workspace("link.txt") is True)
+
+    check(".git/hooks is outside even though it is under the root",
+          tools.outside_workspace(".git/hooks/pre-commit") is True)
+    check("the rest of .git is not singled out",
+          tools.outside_workspace(".git/config") is False)
+
+
+def test_outside_workspace_takes_an_explicit_root(tmp_path):
+    """The root is a parameter so a caller can ask about a directory it is not in."""
+    (tmp_path / "in.txt").write_text("")
+    check("inside the given root",
+          tools.outside_workspace(str(tmp_path / "in.txt"), root=str(tmp_path)) is False)
+    check("outside the given root",
+          tools.outside_workspace(str(tmp_path.parent / "out.txt"),
+                                  root=str(tmp_path)) is True)
+
+
 # --- write_todos: the wire format ---------------------------------------------
 # The tool's format is a markdown checklist — the same text it prints back — because
 # that is what a model writes unprompted. Every other shape it has been observed to

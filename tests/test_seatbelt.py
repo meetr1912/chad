@@ -220,15 +220,45 @@ def test_bash_env_strips_credential_shaped_names(monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "k")
     monkeypatch.setenv("MY_DB_PASSWORD", "k")
     monkeypatch.setenv("SOME_CLIENT_SECRET", "k")
+    # The carriers the suffix list used to miss: a live agent socket, connection
+    # strings with an embedded password, a bare *_KEY, a PAT, a token on disk.
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("DATABASE_URL", "postgres://u:p@h/db")
+    monkeypatch.setenv("SENTRY_DSN", "https://x@sentry.io/1")
+    monkeypatch.setenv("STRIPE_KEY", "k")
+    monkeypatch.setenv("GH_PAT", "k")
+    monkeypatch.setenv("REGISTRY_AUTH", "k")
+    monkeypatch.setenv("MY_SESSION_TOKEN", "k")
+    monkeypatch.setenv("GOOGLE_TOKEN_FILE", "/x/t.json")
+    monkeypatch.setenv("AWS_PROFILE", "prod")
     monkeypatch.setenv("TOKEN_COUNT", "5")            # TOKEN not at the end: keep
     monkeypatch.setenv("TOKENIZERS_PARALLELISM", "1")  # likewise
+    monkeypatch.setenv("CHAD_MODEL", "m")
+    monkeypatch.setenv("PYTHONPATH", "/x")
+    monkeypatch.setenv("HOMEBREW_KEYRING_PATH", "/x")  # KEY mid-word: keep
     env = tools._bash_env()
     assert env is not None
     for gone in ("AWS_SECRET_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "GITHUB_TOKEN",
-                 "MY_DB_PASSWORD", "SOME_CLIENT_SECRET"):
+                 "MY_DB_PASSWORD", "SOME_CLIENT_SECRET", "SSH_AUTH_SOCK",
+                 "DATABASE_URL", "SENTRY_DSN", "STRIPE_KEY", "GH_PAT",
+                 "REGISTRY_AUTH", "MY_SESSION_TOKEN", "GOOGLE_TOKEN_FILE",
+                 "AWS_PROFILE"):
         assert gone not in env
-    for kept in ("PATH", "TOKEN_COUNT", "TOKENIZERS_PARALLELISM"):
+    for kept in ("PATH", "HOME", "TOKEN_COUNT", "TOKENIZERS_PARALLELISM",
+                 "CHAD_MODEL", "PYTHONPATH", "HOMEBREW_KEYRING_PATH"):
         assert kept in env
+
+
+def test_bash_env_strips_a_url_only_when_it_carries_credentials(monkeypatch):
+    """The one value check: a connection string hides its password in a name
+    (REDIS_URL, MONGO_URL) that gives no hint, while a plain address must survive."""
+    monkeypatch.setenv("REDIS_URL", "redis://user:pw@cache.internal:6379/0")
+    monkeypatch.setenv("MONGO_URL", "mongodb://mongo:27017")
+    monkeypatch.setenv("CHAD_BASE_URL", "http://localhost:8080/v1")
+    env = tools._bash_env()
+    assert env is not None
+    assert "REDIS_URL" not in env
+    assert "MONGO_URL" in env and "CHAD_BASE_URL" in env
 
 
 def test_bash_env_off_means_inherit(monkeypatch):

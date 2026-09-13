@@ -67,12 +67,19 @@ def confirm_preview(name: str, args: dict, max_lines: int = 6) -> str:
         if len(lines) > max_lines:
             body += f"\n    … (+{len(lines) - max_lines} more lines)"
         return body
+    def where(p):
+        # Name the file that will REALLY change: a symlink or a `..` in the path moves
+        # the write somewhere the raw string does not show, and that is exactly the
+        # case the human is being asked about.
+        p = str(p or "?")
+        real = os.path.realpath(p)
+        return p if real == os.path.abspath(p) else f"{p}  →  {real}"
     if name == "bash":
         return clip(args.get("command", ""))
     if name == "write":
-        return f"{args.get('path','?')}\n{head(args.get('content',''))}"
+        return f"{where(args.get('path','?'))}\n{head(args.get('content',''))}"
     if name == "edit":
-        return (f"{args.get('path','?')}\n  - {clip(args.get('old',''))}"
+        return (f"{where(args.get('path','?'))}\n  - {clip(args.get('old',''))}"
                 f"\n  + {clip(args.get('new',''))}")
     if name.startswith("mcp__"):
         # An MCP tool can do anything (write files, hit an API, send a message); show

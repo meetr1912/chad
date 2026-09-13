@@ -51,6 +51,23 @@ def _under_plans(path: str) -> bool:
     return p == root or p.startswith(root + os.sep)
 
 
+def outside_workspace(path: str, root: str | None = None) -> bool:
+    """True when `path`'s REAL location (symlinks resolved) is not under the workspace
+    root, or is under its .git/hooks.
+
+    `write`/`edit` run in-process, outside the bash seatbelt, and open whatever path
+    the model hands them — so this is the only containment check they have. Callers
+    escalate to the confirm prompt on True; they never hard-deny, because writing to
+    ~/.chad, a temp dir or a sibling repo is a legitimate thing to be asked for.
+    .git/hooks is inside the root but counts as outside: a hook file is code the next
+    git command runs, with no diff to review."""
+    root = os.path.realpath(root or os.getcwd())
+    p = os.path.realpath(path)
+    inside = p == root or p.startswith(root + os.sep)
+    hooks = os.path.join(root, ".git", "hooks")
+    return (not inside) or p == hooks or p.startswith(hooks + os.sep)
+
+
 def _kill_group(p):
     """Kill the whole process group, not just the /bin/sh parent. `shell=True`
     spawns `/bin/sh -c <command>`; p.kill() SIGKILLs only that shell, leaving
@@ -64,14 +81,34 @@ def _kill_group(p):
 
 
 # Environment variable names shaped like credentials, dropped from spawned shell
-# children. Name-pattern only: values are never inspected (a value test would
-# itself be a secret-handling liability), and the pattern is anchored at the end
-# so AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, and DB_PASSWORD match while PATH,
-# TOKENIZERS_PARALLELISM, and friends pass through. CHAD_NO_ENV_GUARD opts out
-# for a session whose commands legitimately need a credential.
+# children. A DENYLIST here, where mcp.py uses an allowlist for the servers it
+# spawns, because the two children need opposite things: an arbitrary shell command
+# is the user's own toolbox and breaks without their real environment (PATH, HOME,
+# proxy settings, language runtimes), while an MCP server needs a dozen variables and
+# nothing else. So bash keeps everything except what looks like a secret.
+# The patterns are anchored — at the end for suffixes, at both ends for whole names —
+# so AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, SSH_AUTH_SOCK and DB_PASSWORD match while
+# PATH, TOKENIZERS_PARALLELISM, PYTHONPATH and a HOMEBREW_KEYRING_PATH pass through.
+# CHAD_NO_ENV_GUARD opts out for a session whose commands legitimately need a
+# credential (a deploy, a gh push) — a stripped variable is absent, never corrupted,
+# so the command fails with a clear "not set" rather than a confusing auth error.
 _ENV_SECRET_RE = re.compile(
-    r"(?i)(TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|API_?KEY|"
-    r"ACCESS_KEY(_ID)?|SECRET_KEY|PRIVATE_KEY)$")
+    r"(?i)((TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|API_?KEY|"
+    r"ACCESS_KEY(_ID)?|SECRET_KEY|PRIVATE_KEY)$"
+    r"|_(KEY|DSN|PAT|AUTH|TOKEN_FILE)$"
+    r"|^(SSH_AUTH_SOCK|DATABASE_URL|AWS_PROFILE)$)")
+
+
+def _is_credential_url(name: str, value: str) -> bool:
+    """True for a `*_URL` whose value carries userinfo (`scheme://user:pass@host`).
+
+    The one place the guard looks at a value instead of a name: a connection string
+    hides its password in plain sight, and the name (REDIS_URL, MONGO_URL) gives no
+    hint. A URL with no `@` before the host is just an address and stays."""
+    if not name.upper().endswith("_URL"):
+        return False
+    i = value.find("://")
+    return i >= 0 and "@" in value[i + 3:].split("/", 1)[0]
 
 
 def _bash_env() -> dict | None:
@@ -81,7 +118,8 @@ def _bash_env() -> dict | None:
     clear absence, not a corrupted value."""
     if config.flag("CHAD_NO_ENV_GUARD"):
         return None
-    return {k: v for k, v in os.environ.items() if not _ENV_SECRET_RE.search(k)}
+    return {k: v for k, v in os.environ.items()
+            if not _ENV_SECRET_RE.search(k) and not _is_credential_url(k, v)}
 
 
 def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:

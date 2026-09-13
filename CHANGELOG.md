@@ -4,6 +4,21 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**A write outside your workspace always asks — auto and yolo included.** `write` and
+`edit` run in-process, outside the Seatbelt profile that wraps bash, so the modes that
+exist to stop asking about edits were waving through a `~/.zshrc`, a `~/.ssh/config`, or
+a `.git/hooks/pre-commit` on the promise that an edit's blast radius is a diff in this
+repo. A path whose *real* location (symlinks resolved) is outside the working directory,
+or under `.git/hooks`, now goes to the confirm prompt in every mode, and the preview
+names where the write actually lands rather than the path as written. It escalates, it
+never hard-denies: writing to `~/.chad`, a temp dir or a sibling repo is a legitimate
+request, just not one to apply unseen — but a headless run, with nobody to ask, blocks it
+and tells the model why. In the same pass the bash environment guard picked up the
+credential carriers its suffix list missed: `SSH_AUTH_SOCK` (your live agent socket),
+`DATABASE_URL` and `…_DSN`, a bare `…_KEY`, `…_PAT`, `…_AUTH`, `…_TOKEN_FILE`,
+`AWS_PROFILE`, and any `…_URL` whose value carries a `user:pass@` (`CHAD_NO_ENV_GUARD`
+is still the escape hatch).
+
 **`chad serve` is gone, and the cache quarantine with it.** chad runs the model in-process
 on MLX or as a client of a llama.cpp server; nothing drove chad as a *backend*, so the HTTP
 server, its `serve` subcommand, and its `/warm` and `/cache` endpoints are deleted rather

@@ -18,6 +18,7 @@ Mirrors the fake-engine style of test_completion_engine.py; hermetic via `tmp_pa
 """
 
 import json
+import os
 import shlex
 import sys
 
@@ -137,6 +138,7 @@ def test_template_ids_unwraps_batchencoding():
 def test_agent_loop_writes_file_reads_it_back_then_terminates(tmp_path, monkeypatch):
     """write → bash → done: two real tool dispatches through a real run_turn, a real
     filesystem effect, and clean termination (no spin to max_steps)."""
+    monkeypatch.chdir(tmp_path)          # tmp_path is the WORKSPACE, as in a real run
     target = tmp_path / "note.txt"       # .txt: a doc write, so no verify-before-done nudge
     body = "hello from the scripted loop\n"
     script = [
@@ -188,6 +190,7 @@ def test_agent_loop_surfaces_a_real_dispatch_failure(tmp_path, monkeypatch):
     as the tool result rather than pretending the file was written. (The churn
     handoff would rightly bounce the empty-diff done first — disabled here; this test
     is about dispatch, and the handoff has its own coverage in test_done_audit.py.)"""
+    monkeypatch.chdir(tmp_path)          # tmp_path is the WORKSPACE, as in a real run
     not_a_dir = tmp_path / "file.txt"
     not_a_dir.write_text("i am a file, not a directory\n")
     doomed = not_a_dir / "child.txt"     # parent is a file -> os.makedirs / open fails
@@ -264,6 +267,7 @@ def test_step_cap_extends_while_turn_lands_verified_changes(tmp_path, monkeypatc
     window re-earns its extension with an edit+verify, so the loop reaches `done`."""
     # Orthogonal to the deliverable recheck (it would add a step and skew the cap
     # accounting this test pins); disable that lever here.
+    monkeypatch.chdir(tmp_path)          # tmp_path is the WORKSPACE, as in a real run
     f = tmp_path / "f.py"
     # Distinct args per step — identical repeated calls would (correctly) trip the
     # repeat-loop guard instead of exercising the cap.
@@ -329,6 +333,7 @@ def test_no_empty_diff_gate_blocks_done_with_unverified_edit(tmp_path, monkeypat
     no guard fired) becomes a resumable hard stop. (Gate-focused: the
     churn handoff — one audit bounce before this stop — is disabled here and
     covered in test_done_audit.py.)"""
+    monkeypatch.chdir(tmp_path)          # tmp_path is the WORKSPACE, as in a real run
     f = tmp_path / "m.py"
     f.write_text("x = 1\n")
     script = [
@@ -435,6 +440,7 @@ def test_steering_injects_between_steps_and_run_continues(tmp_path, monkeypatch)
     """The steer lands in `messages` after step 0's tool result and before step 1's
     assistant turn, framed as an overriding tool-role message; the run continues to
     `done` (interrupted stays False)."""
+    monkeypatch.chdir(tmp_path)          # tmp_path is the WORKSPACE, as in a real run
     target = tmp_path / "note.txt"
     steer_text = "actually, stop — the OTHER file is the target"
     script = [
@@ -871,3 +877,114 @@ def test_repeated_invalid_call_escalates(tmp_path):
     assert len(rejections) == 2
     assert reject_escalation("edit") not in rejections[0]
     assert rejections[1].endswith(reject_escalation("edit"))
+
+
+# --- The workspace boundary: write/edit outside cwd reach a human in every mode ----
+
+def _recorder():
+    """A confirm callback that records what it was asked about and answers `answer`."""
+    seen = []
+
+    def make(answer):
+        def confirm(name, args):
+            seen.append((name, args.get("path")))
+            return answer
+        return confirm
+    return seen, make
+
+
+def test_yolo_write_inside_the_workspace_is_not_questioned(tmp_path, monkeypatch):
+    """The boundary must not cost yolo its whole point: an ordinary in-workspace write
+    still lands with nobody asked."""
+    monkeypatch.chdir(tmp_path)
+    seen, make = _recorder()
+    target = tmp_path / "inside.txt"
+    agent = _agent([_tool_call("write", path=str(target), content="in\n"),
+                    _tool_call("done", summary="wrote inside.txt")],
+                   confirm=make(True))
+
+    agent.run_turn("create inside.txt")
+
+    assert seen == []
+    assert target.read_text() == "in\n"
+
+
+def test_yolo_write_outside_the_workspace_still_asks(tmp_path, monkeypatch):
+    """write/edit run outside the bash seatbelt, so a path that resolves out of the
+    working directory is escalated to the human even in yolo."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(ws)
+    seen, make = _recorder()
+    outside = tmp_path / "outside.txt"
+    agent = _agent([_tool_call("write", path=str(outside), content="out\n"),
+                    _tool_call("done", summary="wrote outside.txt")],
+                   confirm=make(True))
+
+    agent.run_turn("create outside.txt")
+
+    assert seen == [("write", str(outside))]     # asked once, about that path
+    assert outside.read_text() == "out\n"        # approved -> it lands
+
+
+def test_a_declined_outside_write_does_not_land(tmp_path, monkeypatch):
+    """Declining is a plain human "no": the file is untouched and the model is told so."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(ws)
+    seen, make = _recorder()
+    outside = tmp_path / "outside.txt"
+    agent = _agent([_tool_call("write", path=str(outside), content="out\n"),
+                    _tool_call("done", summary="claims success"),
+                    _tool_call("done", summary="claims success."),
+                    _tool_call("done", summary="claims success!")],
+                   confirm=make(False))
+
+    agent.run_turn("create outside.txt")
+
+    assert seen == [("write", str(outside))]
+    assert not outside.exists()
+    results = [m["content"] for m in agent.messages
+               if m.get("role") == "tool" and m.get("name") == "write"]
+    assert results == ["[denied by user]"]
+
+
+def test_headless_outside_write_is_blocked_with_a_reason(tmp_path, monkeypatch):
+    """No TTY and no callback: there is nobody to escalate to, so the write is blocked
+    and the model gets the resolved path and the reason instead of a bare refusal."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(ws)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    outside = tmp_path / "outside.txt"
+    agent = _agent([_tool_call("write", path=str(outside), content="out\n"),
+                    _tool_call("done", summary="claims success"),
+                    _tool_call("done", summary="claims success."),
+                    _tool_call("done", summary="claims success!")])
+
+    agent.run_turn("create outside.txt")
+
+    assert not outside.exists()
+    results = [m["content"] for m in agent.messages
+               if m.get("role") == "tool" and m.get("name") == "write"]
+    assert len(results) == 1
+    assert results[0].startswith("[blocked: write outside the workspace")
+    assert str(os.path.realpath(outside)) in results[0]
+
+
+def test_a_symlink_out_of_the_workspace_is_caught(tmp_path, monkeypatch):
+    """The check is on the REAL path: an in-workspace name that links out still asks."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    monkeypatch.chdir(ws)
+    (tmp_path / "target.txt").write_text("old\n")
+    os.symlink(tmp_path / "target.txt", ws / "innocent.txt")
+    seen, make = _recorder()
+    agent = _agent([_tool_call("edit", path="innocent.txt", old="old", new="new"),
+                    _tool_call("done", summary="edited innocent.txt")],
+                   confirm=make(True))
+
+    agent.run_turn("change old to new in innocent.txt")
+
+    assert seen == [("edit", "innocent.txt")]
+    assert (tmp_path / "target.txt").read_text() == "new\n"

@@ -52,6 +52,7 @@ from .tools import (
     clear_todos,
     dispatch_for,
     is_mutating,
+    outside_workspace,
     unfinished_todos,
 )
 from .validate import VALIDATE, coerce_and_validate, legacy_validate, render_repair
@@ -846,7 +847,26 @@ class Agent:
         dangerous = (name == "bash" and isinstance(args, dict)
                      and not config.flag("CHAD_NO_DESTRUCTIVE_GUARD")
                      and guardrails.is_destructive_bash(str(args.get("command", ""))))
-        if not is_mutating(name) or auto_approves(self.mode, name):
+        # Workspace boundary: `write`/`edit` run in-process, outside the bash seatbelt,
+        # and open whatever path they are given — this check is their only containment.
+        # A path that really resolves outside the working directory (or into .git/hooks,
+        # code the next git command runs) reaches a human in EVERY mode, auto and yolo
+        # included, because those modes wave edits through on the promise that the blast
+        # radius is a diff in this repo. It escalates to the prompt, it never hard-denies:
+        # writing to ~/.chad, a temp dir or a sibling repo is a legitimate request — just
+        # not one to apply unseen. Headless there is nobody to ask, so it blocks.
+        escalate = (name in AUTO_EDIT_TOOLS and isinstance(args, dict)
+                    and outside_workspace(str(args.get("path", "") or "")))
+        if escalate:
+            if self._confirm_cb is None and not sys.stdin.isatty():
+                target = os.path.realpath(str(args.get("path", "") or ""))
+                self._emit("info", f"  [blocked {name} outside the workspace — nobody to "
+                                   f"approve it: {target}]")
+                self._deny_reason = (
+                    f"[blocked: write outside the workspace ({target}) is not "
+                    "auto-approved in a headless run; run interactively to confirm]")
+                return False
+        elif not is_mutating(name) or auto_approves(self.mode, name):
             if not dangerous:
                 return True
             if self._confirm_cb is None and not sys.stdin.isatty():
