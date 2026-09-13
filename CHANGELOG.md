@@ -4,6 +4,99 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**`chad serve` is gone, and the cache quarantine with it.** chad runs the model in-process
+on MLX or as a client of a llama.cpp server; nothing drove chad as a *backend*, so the HTTP
+server, its `serve` subcommand, and its `/warm` and `/cache` endpoints are deleted rather
+than hardened. The remote client stops probing a server for those extensions: against any
+llama-server the warm-prefix checkpoint is simply skipped, because the KV cache lives in
+the server process where chad cannot reach it. `Engine.push_cache`/`pop_cache` and the
+spill checkpoints they wrote go with it — their last caller left in 2.0.0. Warm-prefix
+checkpoint filenames are unchanged, so an existing on-disk warm start still hits.
+
+**mlx 0.32.2 is admitted.** The exact `mlx==0.32.0` pin from 2.0.1 kept 0.32.1 out and
+every later point release with it. 0.32.2 is now re-gated on the shipped model by the
+pin comment's own rule — greedy output byte-identical to 0.32.0 on both a no-think prompt
+and a thinking turn with the drafter on, decode within noise — so the dependency becomes
+`>=0.32.0,!=0.32.1,<=0.32.2`: exactly the releases that have been checked. An open upper
+bound would admit the next release ungated, which is how 0.32.1 reached `uvx chad-code`
+users in the first place.
+
+**Saved sessions no longer keep your secrets.** A resumable transcript stored every tool
+argument and result verbatim, so one `cat .env` left a token on disk and replayed it into
+the model on the next `-c`. Known-prefix secrets (bearer tokens, `sk-`/`ghp_`/`xox` keys,
+`aws_secret_access_key`, `api_key`) are masked before the file is written; the in-memory
+transcript is untouched, and bare high-entropy blobs are left alone so a git sha survives
+a resume. The edit-checkpoint shadow repos get the same treatment: mode `0700`, secret-
+shaped files excluded (and untracked if an older shadow already committed one), and any
+shadow with no snapshot for 30 days swept once per process.
+
+**Plan mode cannot be walked out of through a symlink.** The read-only promise is one
+tested function now instead of an inline condition the tests re-implemented, and the write
+gate resolves the target's symlinks against the real working directory — so a `plans`
+entry that is itself a link, which a cloned repo can ship, no longer carries an
+unconfirmed plan-mode write wherever it points.
+
+**A salvaged tool call runs what the model actually wrote.** When a `<tool_call>` body
+does not parse, chad retries after repairing trailing commas, Python constants and bare
+keys. Those repairs ran over the whole call text, string values included, so a rescued
+`bash` could run `assert x is null` where the model wrote `assert x is None`, and a
+rescued `write` could put `true` into the file — with a tool result that looked like a
+normal run. The repairs now apply only *between* string literals; a call that parsed only
+because the inside of a string was rewritten falls through to the malformed-call nudge.
+
+**A turn that raises no longer corrupts the ones after it.** The engine keeps a ledger of
+which token ids are resident in the KV cache, and because the shipped hybrid cache cannot
+be trimmed, the next turn trusts it: a cache holding tokens the ledger does not know about
+means every later turn prefills on top of them, with no error anywhere. Any exception once
+a prefill has started now drops the cache, which is the only truthful ledger; the
+speculative loops keep theirs only when every attention layer's offset still matches its
+length. The TUI keeps the same engine alive after a turn error, so one exception used to
+be enough. Warm-prefix checkpoints also key on the effective context length now (above the
+native window the model loads with a rope override, so the same ids cached under it are a
+different cache) — existing checkpoints miss once and are rebuilt.
+
+**Three guardrails now behave the way they were described.** A bash command that cleanly
+reverts the working tree (`git checkout -- .`, `git reset --hard`, `git stash`) un-sets the
+made-an-edit flags, so the empty-diff gate re-arms instead of accepting `done` on a clean
+tree. Only a command that *executes* code clears the unverified-edit flag — `sed … | cat -A`
+no longer counts as verification — while the everyday shapes of a real test run
+(`VAR=value` prefixes, `timeout`, a path-qualified `.venv/bin/python`, `coverage run`) do,
+so a model that did run its tests is not sent back to run them again. And a call batched
+alongside `done` now runs, through the ordinary validate/gate/confirm/dispatch path,
+before the done-gates judge the turn; it used to be dropped on the floor.
+
+**Starting chad is quicker, and an idle prompt stops working.** `--help`, `--version` and
+`chad levers` imported the inference engine, and with it mlx_lm and transformers, before
+argparse even ran; the CLI binds those on first use and `chad --help` drops from ~0.9 s to
+0.05 s. Loading a model under a context override no longer loads every weight twice (the
+logits are bit-identical either way). And the TUI refresher, which redrew twenty times a
+second for the life of the process, now redraws an idle prompt only when something it
+shows has changed — a running turn and an open mic still tick.
+
+**Bounded caches instead of unbounded ones.** On an empty `bash` grep the definition
+pointer parsed every code file in the repo, synchronously, and could re-walk the tree on
+every later miss; it is memoized per identifier and gives up after one second. The
+repo-map disk cache was never evicted and unpickled a stale file in full before checking
+its version — a cache file now opens with a JSON header that is checked before the body is
+read, stale files are deleted, and the first save in a process sweeps the directory: files
+idle for 30 days first, then the oldest until it is under 256 MB.
+
+**`chad-bench` measures the configuration you asked it for.** Both benchmarks built the
+engine directly and left the KV-cache width at its dataclass default, so `CHAD_KV_BITS`
+was ignored and an A/B against the shipped default came back as a clean null — not an
+error, a wash. Both call sites share one constructor now, and the report echoes the cache
+width and the measured bytes per token, which is the one number that cannot lie about
+which cache got built. Separately, a DFlash2 sidecar is loaded at the width it was *built*
+at rather than the caller's default: an 8-bit sidecar used to fail its shape check and be
+dropped by the catch-all, leaving the run decoding with no drafter and nothing saying so.
+
+**Not user-visible**: one `make gate` target that CONTRIBUTING, RELEASING and CI all run;
+`uv run pytest -q` is model-free by default (`CHAD_MODEL_TESTS=1` opts into the tier that
+downloads a proxy model); mypy is green on Apple Silicon and runs there in CI; a
+plain-language pass over the README and docs; a llama.cpp DFlash2 arm and three more
+measured nights in `benchmarks/`; and new tests for the CLI mode matrix, the `run_turn`
+exit branches and per-test session isolation.
+
 **Six small correctness fixes**, independent of each other and each user-visible:
 
 - **A new session starts with an empty plan.** The todo list is module state that
@@ -80,6 +173,8 @@ hallucinated tasks from the first token. A fresh `uvx chad-code` resolved 0.32.1
 the broken behavior; the same wheel forced to `mlx==0.32.0` behaves normally (A/B on the
 same prompt and repo). Until the point release is re-gated against chad's QSDPA/DFlash2
 kernels, the dependency is an exact `mlx==0.32.0` pin. No harness or model changes.
+(Superseded: the pin now admits later point releases once they have been re-gated — the
+current range is in `pyproject.toml`.)
 
 If you installed while 2.0.0 was current and saw garbled output, upgrade
 (`uvx chad-code@latest` or `pip install -U chad-code`) — nothing else is needed.

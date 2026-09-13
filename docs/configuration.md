@@ -1,7 +1,40 @@
 # Configuration & reference
 
-*Extending chad (Agent Skills, MCP servers) and the full flag/env-var reference. For the
-basics, see the [README](../README.md).*
+*Steering chad (project instructions, Agent Skills, MCP servers, plan mode) and the full
+flag/env-var reference. For the basics, see the [README](../README.md).*
+
+## Project instructions (CLAUDE.md / AGENTS.md)
+
+Standing instructions for a project — conventions, the commands you want used, things not
+to touch — go in a markdown file at the root of that project. chad looks for exactly two
+names in the **working directory**, in this order:
+
+| Order | File        |
+| ----- | ----------- |
+| 1     | `CLAUDE.md` |
+| 2     | `AGENTS.md` |
+
+**The first one that exists wins, and that is the only one read.** `CLAUDE.md` shadows
+`AGENTS.md`; they are never merged, and a repo that carries both is only using the first.
+Only the working directory is searched — not parent directories, not `~` — so the file
+you get is the one belonging to the project you launched chad in.
+
+The first **4000 characters** are used and the rest is dropped silently, so put what
+matters at the top. The text is appended to the system prompt under a
+`# Project instructions (<filename>)` heading, below the cache boundary with the other
+per-project context (working directory, workspace listing). That placement is the whole
+cost story: the static half of the prompt stays byte-identical across projects and keeps
+its global checkpoint, while your instructions are part of the few-hundred-token project
+tail that is prefilled once and then restored from that project's own warm-start
+checkpoint — not re-sent on every turn.
+
+**`/init` writes one for you.** It orients itself with `bash`, reads whichever of
+`README` / `pyproject.toml` / `package.json` / `go.mod` / `Cargo.toml` / `Makefile` exist,
+and writes a concise `CLAUDE.md` — an overview, the main components, the *actual*
+build/run/test commands copied out of the config it read, and any conventions worth
+noting. If a `CLAUDE.md` is already there it reads and improves it rather than clobbering
+it. The file is an ordinary write, so it goes through the usual confirmation in `normal`
+mode.
 
 ## Agent Skills (agentskills.io)
 
@@ -170,6 +203,62 @@ cwd-keyed registry: the SDK's async event loop runs in a background thread (one
 inside the coroutine so a hung server can never wedge the agent. Wired into
 `tools.active_schemas`/`dispatch_for`/`is_mutating`, the validator (`validate.py`), and the
 agent loop (`agent.py`).
+
+## Plan mode
+
+`--plan`, or shift-tab round to `plan mode`, makes the session read-only with exactly one
+exception: `write` and `edit` are allowed when the path resolves inside **`./plans/`**.
+Every other mutating tool — `bash` included, so no commands run — is refused with a note
+telling the model to investigate read-only and write its plan instead. A write under
+`plans/` is the expected move, so it does not ask for confirmation; nothing else in plan
+mode gets the chance to. The gate resolves symlinks against the real working directory, so
+a `plans` entry that is itself a link cannot carry a write somewhere else.
+
+**What you get back is a file.** A change request is answered with one self-contained
+`plans/NNN-kebab-title.md` (continuing whatever number sequence is already there), holding
+everything an executor needs without the chat: context, file paths with current-state
+excerpts, numbered steps, verify commands, and what is out of scope. `./plans/` is created
+on that first write, and it is an ordinary directory in your repo — commit it or add it to
+`.gitignore`, chad does not care. A plain *question* asked in plan mode is answered in
+prose instead; it does not manufacture a plan file.
+
+**Handing the plan back.** When a plan-mode turn finishes having written a file, chad
+prints `plan ready → <path>` and waits. Type to steer (the plan turn continues), or press
+**ctrl-g** — or run **`/accept`** — to accept it: the context is cleared, the session drops
+back to the permission mode it had before plan mode, and a fresh turn starts with an
+instruction to read that file and execute each step, running the verification commands at
+the end. Accepting is the only handoff; a plan left un-accepted is just a file on disk.
+
+## Slash commands
+
+Typed in the TUI (`/` opens a completion menu listing these alongside every installed
+skill). Most are local to the harness and cost nothing in context; `/init` and `/accept`
+are the two that start a real turn.
+
+| Command | What it does |
+| ------- | ------------ |
+| `/help` | commands & keybindings |
+| `/init` | analyze the project, write `CLAUDE.md` (a real turn — the model does the work) |
+| `/skills` | list installed Agent Skills (run one with `/<name>`) |
+| `/mcp` | MCP server status |
+| `/mcp trust` | trust this project's `.mcp.json` servers |
+| `/mcp login` | authenticate an MCP server (OAuth) |
+| `/compact` | reclaim context now |
+| `/ctx` | where the context window is going, in tokens |
+| `/undo` | revert files to the last edit checkpoint |
+| `/restore` | list edit checkpoints; `/restore <hash>` reverts to one |
+| `/resume` | list recent sessions; `/resume <n>` forks one |
+| `/reset` | clear the conversation + KV cache |
+| `/clear` | clear the conversation + KV cache |
+| `/model` | show model + context window |
+| `/mode` | cycle permission mode |
+| `/speech` | toggle voice mode — all-local STT (Parakeet-on-MLX) + TTS (`say`) |
+| `/accept` | accept a pending plan and implement it |
+| `/exit` | quit chad |
+| `/quit` | quit chad |
+
+A builtin always wins a name clash with a skill, so `/<name>` reaches a skill only when no
+builtin owns that name.
 
 ## Context window (agentic coding needs room)
 
