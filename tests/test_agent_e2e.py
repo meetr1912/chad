@@ -21,8 +21,8 @@ import json
 import shlex
 import sys
 
-from chad import tools
-from chad.agent import Agent
+from chad import guardrails, tools
+from chad.agent import Agent, reject_escalation
 from chad.base_engine import BaseEngine, GenStats
 
 # The interpreter running the tests, not whatever `python` PATH happens to hold.
@@ -738,3 +738,97 @@ def test_a_stale_plan_from_an_earlier_turn_does_not_ambush_done(tmp_path, monkey
     assert not [m for m in agent.messages
                 if m.get("role") == "tool" and m.get("name") == "done"]
     tools.clear_todos()
+
+
+# --- run_turn exit branches: each ends the turn with a result its caller reads -------
+
+class _InterruptingEngine(ScriptedEngine):
+    """Raises the user's stop flag while producing scripted turn `stop_on` (1-based) —
+    a ctrl-c landing mid-generation. The agent's `should_stop` reads `stopped`."""
+
+    def __init__(self, script, stop_on):
+        super().__init__(script)
+        self.stop_on = stop_on
+        self.stopped = False
+
+    def generate(self, prompt_ids, max_tokens=2048, on_token=None, should_stop=None, **kw):
+        text, stats = super().generate(prompt_ids, max_tokens, on_token,
+                                       should_stop=should_stop, **kw)
+        if should_stop is not None and self._i == self.stop_on:
+            self.stopped = True
+        return text, stats
+
+
+def test_interrupt_ends_turn_and_marks_agent():
+    """ctrl-c mid-generation ends the turn as `[interrupted]`, and the partial turn is
+    stored with its think block closed: an unclosed one re-renders as a divergent prefix
+    and forces a full re-prefill on the next turn."""
+    script = ["look before acting\n</think>\n\n" + _tool_call("bash", command="echo step1"),
+              "still reasoning about the"]   # the template opened <think>; never closed
+    eng = _InterruptingEngine(script, stop_on=2)
+    agent = Agent(eng, mode="yolo", thinking=True, should_stop=lambda: eng.stopped)
+
+    result = agent.run_turn("fix the crash in utils.py")
+
+    assert result == "[interrupted]"
+    assert agent.interrupted is True
+    assert any(m.get("role") == "tool" and m.get("name") == "bash" for m in agent.messages)
+    last = agent.messages[-1]
+    assert last["role"] == "assistant"
+    assert last["content"].startswith("still reasoning")
+    assert last["content"].endswith("</think>")
+
+
+def test_interrupt_while_a_tool_call_is_generated_does_not_dispatch_it(tmp_path):
+    """The stop check sits between generation and dispatch: a write the user interrupted
+    must not land."""
+    target = tmp_path / "f.py"
+    eng = _InterruptingEngine([_tool_call("write", path=str(target), content="x = 1\n")],
+                              stop_on=1)
+    agent = Agent(eng, mode="yolo", thinking=False, should_stop=lambda: eng.stopped)
+
+    assert agent.run_turn("create f.py") == "[interrupted]"
+    assert not target.exists()
+
+
+def test_hard_governor_returns_budget_sentinel(monkeypatch):
+    """A turn that spends its token budget with no landed+verified change gets exactly
+    one soft nudge, then ends with the `[budget]` result and a banked progress note."""
+    monkeypatch.delenv("CHAD_NO_GOVERNOR", raising=False)
+    script = [_tool_call("bash", command=f"echo probe{i}") for i in range(4)]
+    agent = _agent(script, turn_budget_tokens=10)   # the first prompt alone overshoots it
+
+    result = agent.run_turn("fix the crash in utils.py")
+
+    assert result.startswith(guardrails.BUDGET_SENTINEL)
+    assert agent.budget_note and result.endswith(agent.budget_note)
+    nudges = [m for m in agent.messages if m.get("content") == guardrails.GOVERNOR_SOFT_NUDGE]
+    assert len(nudges) == 1
+
+
+def test_loop_abort_returns_stuck_message():
+    """The same call set five times: nudged on the 3rd and 4th, aborted on the 5th."""
+    script = [_tool_call("bash", command="echo same")] * 5
+    agent = _agent(script)
+
+    result = agent.run_turn("fix the crash in utils.py")
+
+    assert "stuck in a loop" in result
+    nudges = [m for m in agent.messages if "[loop detected" in m.get("content", "")]
+    assert len(nudges) == 2
+    assert agent.engine._i == len(script)
+
+
+def test_repeated_invalid_call_escalates(tmp_path):
+    """The same schema-invalid call twice: the first rejection is the plain repair
+    message, the second adds the stop-repeating escalation."""
+    bad = _tool_call("edit", path=str(tmp_path / "x.py"))   # no `old` / `new`
+    agent = _agent([bad, bad, "x.py does not exist yet."])
+
+    agent.run_turn("what does x.py contain?")
+
+    rejections = [m["content"] for m in agent.messages
+                  if m.get("role") == "tool" and m.get("name") == "edit"]
+    assert len(rejections) == 2
+    assert reject_escalation("edit") not in rejections[0]
+    assert rejections[1].endswith(reject_escalation("edit"))

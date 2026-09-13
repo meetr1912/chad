@@ -1,11 +1,16 @@
 """Unit tests for session persistence (session.py) — save/load round-trip + isolation.
 
+The store itself (session.SESS_DIR) is pointed at a per-test tmp dir by conftest.
+
 Run: `uv run python tests/test_session.py`
 """
 import json
 import os
+import pathlib
 import tempfile
 import time
+
+import pytest
 
 from chad import session
 
@@ -22,11 +27,16 @@ def check(name, cond, detail=""):
         raise AssertionError(f"{name}  {detail}")
 
 
+def _proj(tmp_path, name):
+    """A real project dir to key sessions on. A str, because it lands in JSON as `cwd`."""
+    d = tmp_path / name
+    d.mkdir()
+    return str(d)
+
+
 def test_session(tmp_path):
-    # tmp_path is pytest's per-test temp dir fixture; the __main__ runner passes its own.
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_a_")
-    b = tempfile.mkdtemp(prefix="proj_b_")
+    a = _proj(tmp_path, "proj_a")
+    b = _proj(tmp_path, "proj_b")
 
     # nothing saved yet
     check("load empty -> None", session.load_session(a) is None)
@@ -58,8 +68,7 @@ def test_session(tmp_path):
 def test_session_perms_0600(tmp_path):
     # The conversation store records full tool args/results, so it must never be
     # world-readable: save_session creates it 0600 (os.replace preserves the mode).
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_perms_")
+    a = _proj(tmp_path, "proj_perms")
     msgs = [{"role": "user", "content": "secret bash command"}]
     p = session.save_session(a, msgs, {})
     check("perms save returns path", bool(p) and os.path.isfile(p))
@@ -72,8 +81,7 @@ def test_session_perms_0600(tmp_path):
 def test_mint_list_and_fork(tmp_path):
     # Multiple sessions per cwd; resume of an old session forks (new file) and leaves the
     # original byte-for-byte untouched — the entire branching feature.
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_fork_")
+    a = _proj(tmp_path, "proj_fork")
 
     check("minted id shape", session.new_session_id().count("-") == 2)
 
@@ -104,8 +112,7 @@ def test_mint_list_and_fork(tmp_path):
 
 
 def test_prune_keeps_newest(tmp_path):
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_prune_")
+    a = _proj(tmp_path, "proj_prune")
     for i in range(session.RETAIN + 5):
         session.save_session(a, [{"role": "user", "content": f"t{i}"}], {},
                              session_id=f"20260101-0000{i:02d}-{i:04x}")
@@ -118,8 +125,7 @@ def test_prune_keeps_newest(tmp_path):
 
 def test_adopt_legacy(tmp_path):
     # A pre-043 single-slot <cwdhash>.json is adopted as one session on first listing.
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_legacy_")
+    a = _proj(tmp_path, "proj_legacy")
     os.makedirs(session.SESS_DIR, exist_ok=True)
     legacy = session._legacy_path(a)
     with open(legacy, "w") as f:
@@ -136,8 +142,7 @@ def test_adopt_legacy(tmp_path):
 
 
 def test_index_0600_and_corrupt_tolerated(tmp_path):
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_idx_")
+    a = _proj(tmp_path, "proj_idx")
     session.save_session(a, [{"role": "user", "content": "hi"}], {},
                          session_id="20260101-000000-abcd")
     ip = session._index_path(a)
@@ -156,8 +161,7 @@ def test_persisted_copy_masks_known_prefix_secrets(tmp_path):
     # A credential echoed into a tool result or a tool-call argument must not reach disk:
     # the file outlives the session and is replayed on resume. A git sha must survive,
     # prose is never touched, and the in-memory transcript keeps the real values.
-    session.SESS_DIR = os.path.join(tmp_path, "sessions")
-    a = tempfile.mkdtemp(prefix="proj_redact_")
+    a = _proj(tmp_path, "proj_redact")
     tok = "abcdefghijklmnopqrstuvwxyz0123456789ABCD"  # 40 chars
     sha = "a3f9c1e2b4d6071829abcdef0123456789abcdef"
     call = "<tool_call>\n" + json.dumps({"name": "bash", "arguments": {
@@ -187,13 +191,13 @@ def test_persisted_copy_masks_known_prefix_secrets(tmp_path):
 
 
 if __name__ == "__main__":
-    with tempfile.TemporaryDirectory() as home:
-        test_session(home)
-        test_session_perms_0600(home)
-        test_mint_list_and_fork(home)
-        test_prune_keeps_newest(home)
-        test_adopt_legacy(home)
-        test_index_0600_and_corrupt_tolerated(home)
-        test_persisted_copy_masks_known_prefix_secrets(home)
+    for test in (test_session, test_session_perms_0600, test_mint_list_and_fork,
+                 test_prune_keeps_newest, test_adopt_legacy,
+                 test_index_0600_and_corrupt_tolerated,
+                 test_persisted_copy_masks_known_prefix_secrets):
+        # Same isolation conftest gives each test under pytest.
+        with tempfile.TemporaryDirectory() as home, pytest.MonkeyPatch.context() as mp:
+            mp.setattr(session, "SESS_DIR", os.path.join(home, "sessions"))
+            test(pathlib.Path(home))
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

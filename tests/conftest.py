@@ -32,6 +32,15 @@ def _spill_tmpdir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _session_tmpdir(tmp_path, monkeypatch):
+    """Point the saved-session store (session.SESS_DIR, bound at import) at a per-test
+    tmp dir. Any test that persists an Agent or drives `chad -c` / `--resume` would
+    otherwise read and write the developer's real ~/.chad/sessions."""
+    from chad import session
+    monkeypatch.setattr(session, "SESS_DIR", str(tmp_path / "sessions"))
+
+
+@pytest.fixture(autouse=True)
 def _fresh_ambient(monkeypatch):
     """Isolate ambient session state between tests, and stub the
     env-manifest builder: every Agent/prompt construction would otherwise spawn

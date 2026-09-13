@@ -7,8 +7,11 @@ must NOT change the file). Pure + fast — no model load.
 Run: `uv run python tests/test_edit.py`
 """
 
-import os
+import itertools
+import pathlib
 import tempfile
+
+import pytest
 
 from chad.tools import tool_edit
 
@@ -25,22 +28,29 @@ def check(name, cond, detail=""):
         raise AssertionError(f"{name}  {detail}")
 
 
-def run(before, old, new):
-    """Apply tool_edit to a temp file; return (result_string, file_contents_after)."""
-    d = tempfile.mkdtemp(prefix="edit_")
-    p = os.path.join(d, "f.py")
-    with open(p, "w") as f:
-        f.write(before)
-    res = tool_edit(p, old, new)
-    with open(p) as f:
-        after = f.read()
-    return res, after
+def _runner(root):
+    """`run(before, old, new)`: apply tool_edit to a fresh file under `root`; return
+    (result_string, file_contents_after). Every call gets its own directory."""
+    n = itertools.count()
+
+    def run(before, old, new):
+        p = root / f"edit_{next(n)}" / "f.py"
+        p.parent.mkdir()
+        p.write_text(before)
+        res = tool_edit(str(p), old, new)
+        return res, p.read_text()
+    return run
+
+
+@pytest.fixture
+def run(tmp_path):
+    return _runner(tmp_path)
 
 
 GEO = "def area(w, h):\n    return w * h\n"
 
 
-def test_edit():
+def test_edit(run):
     # 1) exact match — fast path
     res, after = run(GEO, "    return w * h", "    return w * h * 2")
     check("exact applies", res.startswith("[edited") and "w * h * 2" in after, res)
@@ -101,7 +111,7 @@ def test_edit():
     check("no-op rejected", "no-op" in res and after == GEO, res)
 
 
-def test_ws_recovery_prefers_file_indentation():
+def test_ws_recovery_prefers_file_indentation(run):
     """Iter-2: on the whitespace-flexible path the model's
     RELATIVE indents are the least trustworthy part of the edit. A same-line-count
     replacement takes each replaced line's indent from the FILE, so a garbled-indent
@@ -117,7 +127,7 @@ def test_ws_recovery_prefers_file_indentation():
           after == "def f():\n    a = 1\n    b = compute(a, x)\n", repr(after))
 
 
-def test_ws_only_edit_applies_verbatim():
+def test_ws_only_edit_applies_verbatim(run):
     """Iter-2: an indentation-ONLY fix used to normalize to
     '[no-op edit]' — a broken indent was literally unrepairable through this tool
     and the model fell back to blind sed. When reindenting reproduces the file
@@ -129,7 +139,7 @@ def test_ws_only_edit_applies_verbatim():
           after == "def f():\n    a = 1\n    b = 2\n", repr(after))
 
 
-def test_syntax_break_lands_with_warning():
+def test_syntax_break_lands_with_warning(run):
     """A syntax-breaking edit lands (the model's edit is the model's edit) and the
     warning rides the SAME result, so the very next step sees it."""
     res, after = run("x = 1\n", "x = 1", "x = (1")
@@ -142,7 +152,7 @@ def test_syntax_break_lands_with_warning():
           res.startswith("[edited") and "no longer parses" in res, res)
 
 
-def test_already_broken_file_stays_editable():
+def test_already_broken_file_stays_editable(run):
     """Prong 1 boundary: when `before` is ALREADY broken, indent_reject stays out of the
     way (parse of `before` fails), so a fix that passes through a still-broken state is
     never stranded — the already-broken repair path keeps working."""
@@ -151,7 +161,7 @@ def test_already_broken_file_stays_editable():
     check("broken-file edit lands", res.startswith("[edited") and "a = 111" in after, res)
 
 
-def test_failed_edit_shows_visible_whitespace():
+def test_failed_edit_shows_visible_whitespace(run):
     """Prong 2: a no-op / not-found edit hands back the target lines with
     leading whitespace made visible (· space, → tab), so the model copies the exact
     indentation instead of re-guessing the column count."""
@@ -172,7 +182,7 @@ TAB_OBJ = (
 )
 
 
-def test_ws_recovery_inserted_line_takes_neighbor_indent():
+def test_ws_recovery_inserted_line_takes_neighbor_indent(run):
     # ky-timeoutMessage (session dbf9dee0/20260713): model's old/new carry wrong
     # absolute AND relative tabs; the inserted line must inherit its resolved
     # neighbor's file indent, not first-line math.
@@ -185,7 +195,7 @@ def test_ws_recovery_inserted_line_takes_neighbor_indent():
           "\n\ttimeoutMessage: true,\n" in after, repr(after))
 
 
-def test_ws_recovery_insert_after_opener_indents_one_unit():
+def test_ws_recovery_insert_after_opener_indents_one_unit(run):
     old = "\texport const keys = {\n\t\tjson: true,"
     new = "\texport const keys = {\n\t\t\tfirst: true,\n\t\tjson: true,"
     res, after = run(TAB_OBJ, old, new)
@@ -193,7 +203,7 @@ def test_ws_recovery_insert_after_opener_indents_one_unit():
           repr(after))
 
 
-def test_recovery_result_echoes_landed_indentation():
+def test_recovery_result_echoes_landed_indentation(run):
     old = "\texport const keys = {\n\t\tjson: true,\n\t\ttimeout: true,\n\t};"
     new = ("\texport const keys = {\n\t\tjson: true,\n\t\ttimeout: true,\n"
            "\t\t\ttimeoutMessage: true,\n\t};")
@@ -202,7 +212,7 @@ def test_recovery_result_echoes_landed_indentation():
     check("echo: shows landed tabs", "→timeoutMessage: true," in res, res)
 
 
-def test_ws_only_edit_result_echoes_landed_indentation():
+def test_ws_only_edit_result_echoes_landed_indentation(run):
     # `old` strips to the file lines but is NOT an exact substring (no leading tab), so
     # this exercises the ws-flexible verbatim path — not the exact-match fast path, which
     # the plan keeps echo-free. ('s literal `old` accidentally exact-matched.)
@@ -212,15 +222,17 @@ def test_ws_only_edit_result_echoes_landed_indentation():
 
 
 if __name__ == "__main__":
-    test_edit()
-    test_ws_recovery_prefers_file_indentation()
-    test_ws_only_edit_applies_verbatim()
-    test_already_broken_file_stays_editable()
-    test_failed_edit_shows_visible_whitespace()
-    test_ws_recovery_inserted_line_takes_neighbor_indent()
-    test_ws_recovery_insert_after_opener_indents_one_unit()
-    test_recovery_result_echoes_landed_indentation()
-    test_ws_only_edit_result_echoes_landed_indentation()
+    with tempfile.TemporaryDirectory() as d:
+        r = _runner(pathlib.Path(d))
+        test_edit(r)
+        test_ws_recovery_prefers_file_indentation(r)
+        test_ws_only_edit_applies_verbatim(r)
+        test_already_broken_file_stays_editable(r)
+        test_failed_edit_shows_visible_whitespace(r)
+        test_ws_recovery_inserted_line_takes_neighbor_indent(r)
+        test_ws_recovery_insert_after_opener_indents_one_unit(r)
+        test_recovery_result_echoes_landed_indentation(r)
+        test_ws_only_edit_result_echoes_landed_indentation(r)
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)
 

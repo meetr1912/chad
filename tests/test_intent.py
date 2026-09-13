@@ -10,7 +10,10 @@ Run: `uv run python tests/test_intent.py`
 """
 
 import os
+import pathlib
 import tempfile
+
+import pytest
 
 from chad.agent import _has_open_tool_call, expand_mentions
 from chad.prompt import _detect_test_command, build_system_prompt, classify_intent
@@ -141,97 +144,82 @@ def test_open_tool_call():
           not _has_open_tool_call("Here's what the function does: it sums two numbers."))
 
 
-def test_mentions():
-    d = tempfile.mkdtemp(prefix="mentions_")
-    cwd = os.getcwd()
-    os.chdir(d)
-    try:
-        with open("geo.py", "w") as f:
-            f.write("def area(w, h):\n    return w * h\n")
-        # resolves a real file
-        aug, att = expand_mentions("why is @geo.py slow?")
-        check("mention resolves", att == ["geo.py"], f"att={att}")
-        check("mention inlines content", "def area" in aug and "Attached" in aug)
-        # trailing punctuation trimmed
-        _, att2 = expand_mentions("see @geo.py.")
-        check("trailing punct trimmed", att2 == ["geo.py"], f"att={att2}")
-        # email is NOT a mention (no whitespace before @)
-        _, att3 = expand_mentions("ping me at foo@bar.com about it")
-        check("email not a mention", att3 == [], f"att={att3}")
-        # nonexistent file -> no expansion
-        txt = "look at @nope.py"
-        aug4, att4 = expand_mentions(txt)
-        check("nonexistent ignored", att4 == [] and aug4 == txt)
-        # dedup
-        _, att5 = expand_mentions("@geo.py and @geo.py again")
-        check("dedup", att5 == ["geo.py"], f"att={att5}")
-        # directory mention -> listing (not file content)
-        os.makedirs("pkg", exist_ok=True)
-        open("pkg/a.py", "w").close()
-        open("pkg/b.py", "w").close()
-        aug6, att6 = expand_mentions("what's in @pkg?")
-        check("dir resolves", att6 == ["pkg"], f"att={att6}")
-        check("dir lists entries", "a.py" in aug6 and "b.py" in aug6 and "directory listing" in aug6)
-    finally:
-        os.chdir(cwd)
+def test_mentions(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    with open("geo.py", "w") as f:
+        f.write("def area(w, h):\n    return w * h\n")
+    # resolves a real file
+    aug, att = expand_mentions("why is @geo.py slow?")
+    check("mention resolves", att == ["geo.py"], f"att={att}")
+    check("mention inlines content", "def area" in aug and "Attached" in aug)
+    # trailing punctuation trimmed
+    _, att2 = expand_mentions("see @geo.py.")
+    check("trailing punct trimmed", att2 == ["geo.py"], f"att={att2}")
+    # email is NOT a mention (no whitespace before @)
+    _, att3 = expand_mentions("ping me at foo@bar.com about it")
+    check("email not a mention", att3 == [], f"att={att3}")
+    # nonexistent file -> no expansion
+    txt = "look at @nope.py"
+    aug4, att4 = expand_mentions(txt)
+    check("nonexistent ignored", att4 == [] and aug4 == txt)
+    # dedup
+    _, att5 = expand_mentions("@geo.py and @geo.py again")
+    check("dedup", att5 == ["geo.py"], f"att={att5}")
+    # directory mention -> listing (not file content)
+    os.makedirs("pkg", exist_ok=True)
+    open("pkg/a.py", "w").close()
+    open("pkg/b.py", "w").close()
+    aug6, att6 = expand_mentions("what's in @pkg?")
+    check("dir resolves", att6 == ["pkg"], f"att={att6}")
+    check("dir lists entries", "a.py" in aug6 and "b.py" in aug6 and "directory listing" in aug6)
 
 
-def test_detect_test_command():
-    d = tempfile.mkdtemp(prefix="testcmd_")
-    cwd = os.getcwd()
-    os.chdir(d)
-    try:
-        # No recognizable config -> "" (model falls back to generic guidance).
-        check("nothing detected -> empty", _detect_test_command() == "")
+def test_detect_test_command(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    # No recognizable config -> "" (model falls back to generic guidance).
+    check("nothing detected -> empty", _detect_test_command() == "")
 
-        # CI yaml is authoritative — the exact failure from the trace: a `run:` step
-        # invoking unittest via uv. The `run: ` prefix is excluded; runner kept.
-        os.makedirs(".github/workflows", exist_ok=True)
-        with open(".github/workflows/ci.yml", "w") as f:
-            f.write("jobs:\n  test:\n    steps:\n"
-                    "      - run: uv run python -m unittest discover ./tests\n")
-        check("CI unittest detected",
-              _detect_test_command() == "uv run python -m unittest discover ./tests",
-              f"got {_detect_test_command()!r}")
+    # CI yaml is authoritative — the exact failure from the trace: a `run:` step
+    # invoking unittest via uv. The `run: ` prefix is excluded; runner kept.
+    os.makedirs(".github/workflows", exist_ok=True)
+    with open(".github/workflows/ci.yml", "w") as f:
+        f.write("jobs:\n  test:\n    steps:\n"
+                "      - run: uv run python -m unittest discover ./tests\n")
+    check("CI unittest detected",
+          _detect_test_command() == "uv run python -m unittest discover ./tests",
+          f"got {_detect_test_command()!r}")
 
-        # CI wins over a pyproject pytest fallback when both are present.
-        with open("pyproject.toml", "w") as f:
-            f.write("[tool.pytest.ini_options]\n")
-        check("CI takes priority over pyproject",
-              _detect_test_command().startswith("uv run python -m unittest"))
+    # CI wins over a pyproject pytest fallback when both are present.
+    with open("pyproject.toml", "w") as f:
+        f.write("[tool.pytest.ini_options]\n")
+    check("CI takes priority over pyproject",
+          _detect_test_command().startswith("uv run python -m unittest"))
 
-        # Without CI, pytest config implies pytest; uv.lock selects the `uv run` prefix.
-        os.remove(".github/workflows/ci.yml")
-        check("pyproject pytest, no uv -> bare", _detect_test_command() == "python -m pytest")
-        open("uv.lock", "w").close()
-        check("pyproject pytest + uv.lock -> uv run",
-              _detect_test_command() == "uv run python -m pytest")
+    # Without CI, pytest config implies pytest; uv.lock selects the `uv run` prefix.
+    os.remove(".github/workflows/ci.yml")
+    check("pyproject pytest, no uv -> bare", _detect_test_command() == "python -m pytest")
+    open("uv.lock", "w").close()
+    check("pyproject pytest + uv.lock -> uv run",
+          _detect_test_command() == "uv run python -m pytest")
 
-        # A Makefile test target outranks the pyproject fallback.
-        with open("Makefile", "w") as f:
-            f.write("test:\n\tpytest -q\n")
-        check("Makefile test target detected", _detect_test_command() == "make test")
-    finally:
-        os.chdir(cwd)
+    # A Makefile test target outranks the pyproject fallback.
+    with open("Makefile", "w") as f:
+        f.write("test:\n\tpytest -q\n")
+    check("Makefile test target detected", _detect_test_command() == "make test")
 
 
-def test_non_utf8_project_docs_dont_crash():
+def test_non_utf8_project_docs_dont_crash(tmp_path, monkeypatch):
     # A project doc / build file that isn't UTF-8 (a latin-1 CLAUDE.md with an é byte,
     # a latin-1 pyproject.toml) must NOT crash build_system_prompt — the once-
     # unguarded open().read() raised UnicodeDecodeError and the agent wouldn't construct.
-    d = tempfile.mkdtemp(prefix="latin1_")
-    cwd = os.getcwd()
-    os.chdir(d)
-    try:
-        with open("CLAUDE.md", "wb") as f:
-            f.write("# Guide\nCaf\xe9 rules - na\xefve bytes here.\n".encode("latin-1"))
-        with open("pyproject.toml", "wb") as f:
-            f.write("[tool.pytest.ini_options]\n# \xe9\n".encode("latin-1"))
-        prompt = build_system_prompt()  # must not raise
-        check("prompt built despite non-utf8 docs", isinstance(prompt, str) and len(prompt) > 0)
-        check("latin-1 doc surfaced (bytes replaced, not crashed)", "Guide" in prompt)
-    finally:
-        os.chdir(cwd)
+    monkeypatch.chdir(tmp_path)
+    with open("CLAUDE.md", "wb") as f:
+        f.write("# Guide\nCaf\xe9 rules - na\xefve bytes here.\n".encode("latin-1"))
+    with open("pyproject.toml", "wb") as f:
+        f.write("[tool.pytest.ini_options]\n# \xe9\n".encode("latin-1"))
+    prompt = build_system_prompt()  # must not raise
+    check("prompt built despite non-utf8 docs", isinstance(prompt, str) and len(prompt) > 0)
+    check("latin-1 doc surfaced (bytes replaced, not crashed)", "Guide" in prompt)
 
 
 def test_plan_prefix():
@@ -335,9 +323,10 @@ if __name__ == "__main__":
     test_intent()
     test_run_intent()
     test_open_tool_call()
-    test_mentions()
-    test_detect_test_command()
-    test_non_utf8_project_docs_dont_crash()
+    for test in (test_mentions, test_detect_test_command,
+                 test_non_utf8_project_docs_dont_crash):
+        with tempfile.TemporaryDirectory() as d, pytest.MonkeyPatch.context() as mp:
+            test(pathlib.Path(d), mp)
     test_plan_prefix()
     test_clip_tool_result()
     test_clip_tool_result_reuses_an_existing_spill()
