@@ -113,6 +113,56 @@ def test_edit_truth_table():
         os.chdir(cwd)
 
 
+def test_edit_refuses_a_file_that_is_not_utf8():
+    """Reading with `errors="replace"` would hand the edit a U+FFFD where the odd byte
+    was, and the rewrite would then persist it — one edit corrupting bytes it never
+    touched. Refuse the file instead, and leave it exactly as it was."""
+    cwd = os.getcwd()
+    try:
+        _seed({})
+        raw = "caf\xe9 = 1\nx = 2\n".encode("latin-1")
+        with open("l1.py", "wb") as f:
+            f.write(raw)
+        res = tools.tool_edit("l1.py", "x = 2", "x = 3")
+        check("edit: refuses a non-utf-8 file", res.startswith("[cannot edit"), res)
+        check("edit: names the way through", "use bash" in res, res)
+        check("edit: refused file is byte-identical", _rawbytes("l1.py") == raw)
+    finally:
+        os.chdir(cwd)
+
+
+def test_file_tools_pin_utf8_instead_of_the_locale():
+    """Every file open in `tools.py` names UTF-8. With the locale encoding instead, a
+    container that sets no LANG (the documented --backend llama path) cannot read or
+    write a source file with a single non-ASCII character in it."""
+    import builtins
+    cwd = os.getcwd()
+    real_open = builtins.open
+    seen = []
+
+    def spy(file, mode="r", *a, **kw):
+        # Only the opens tools.py itself makes; other modules have their own contract.
+        if sys._getframe(1).f_globals.get("__name__") == "chad.tools" and "b" not in mode:
+            seen.append((mode, kw.get("encoding")))
+        return real_open(file, mode, *a, **kw)
+
+    try:
+        _seed({"u.py": "café = 1\n"})
+        builtins.open = spy
+        tools.tool_write("w.py", "s = 'héllo'\n")
+        tools.tool_edit("u.py", "café", "thé")
+        builtins.open = real_open
+        check("io: tools.py opened files", len(seen) >= 3, seen)
+        check("io: every text open names utf-8", all(e == "utf-8" for _m, e in seen), seen)
+        check("edit: non-ascii content round-trips",
+              _rawbytes("u.py").decode("utf-8") == "thé = 1\n")
+        check("write: non-ascii content round-trips",
+              _rawbytes("w.py").decode("utf-8") == "s = 'héllo'\n")
+    finally:
+        builtins.open = real_open
+        os.chdir(cwd)
+
+
 # --- tool_bash ----------------------------------------------------------------
 
 # Line clipping ablated: every oversized fixture here is one 40k-char blob, and
@@ -282,6 +332,36 @@ def test_bash_spill():
             os.environ.pop("CHAD_SPILL_DIR", None)
         else:
             os.environ["CHAD_SPILL_DIR"] = old
+
+
+def test_bash_headtail_keeps_a_body_that_fits_under_the_cap():
+    """A body in the narrow band just below the cap, carrying a clip note. The note is
+    metadata ABOUT the body, not part of its budget: counting it sent a body that
+    HEAD + TAIL already covers in full down the truncation path, where `omitted` came
+    out negative and the two slices overlapped — the middle printed twice, under a
+    notice claiming it had been dropped."""
+    marker = "MIDDLE_MARKER"
+    long_line = "x" * (tools.BASH_LINE_CHARS + 50)          # clipped -> one clip note
+    kept = tools.BASH_LINE_CHARS + len("…[line clipped]")
+    rows = "\n".join([marker + "y" * (99 - len(marker))] + ["y" * 99] * 200) + "\n"
+    body = long_line + "\n" + rows[:tools.BASH_MAX_CHARS - 5 - kept - 1]
+    out = tools._bash_headtail(body, spill=False)
+    check("headtail: band body is not truncated", "chars omitted" not in out, out[:160])
+    check("headtail: band body is not duplicated", out.count(marker) == 1, out.count(marker))
+    check("headtail: band body still carries the clip note",
+          "chars clipped from over-long lines" in out, out[-140:])
+
+
+def test_bash_headtail_omits_at_least_one_char_when_it_does_truncate():
+    """One char over the cap is the smallest real truncation: head and tail must abut
+    without overlapping, and the notice must count the single omitted char."""
+    head = ("A" * 99 + "\n") * (tools.BASH_HEAD_CHARS // 100)
+    tail = ("Z" * 99 + "\n") * (tools.BASH_TAIL_CHARS // 100)
+    out = tools._bash_headtail(head + "M" + tail, spill=False)
+    check("headtail: counts one omitted char", "1 chars omitted" in out, out[7990:8120])
+    check("headtail: the omitted char is gone", "M" not in out, out[7990:8120])
+    check("headtail: head kept whole", out.startswith(head), out[:60])
+    check("headtail: tail kept whole", out.endswith(tail), out[-60:])
 
 
 # --- tool_write ---------------------------------------------------------------

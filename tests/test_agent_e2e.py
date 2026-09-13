@@ -756,14 +756,27 @@ def test_a_stale_plan_from_an_earlier_turn_does_not_ambush_done(tmp_path, monkey
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "data.txt"
     target.write_text("42\n")
-    tools.tool_write_todos("[ ] something left over from a previous request")
     agent = _agent([_tool_call("bash", command=f"cat {target}"),
                     _tool_call("done", summary="unrelated task finished")], max_steps=10)
+    # Written after construction: an earlier turn of THIS session, not a leftover from a
+    # previous one (which a new Agent drops — see the next test).
+    tools.tool_write_todos([{"content": "something left over from a previous request",
+                             "status": "pending"}])
 
     assert agent.run_turn("what does data.txt contain?") == "unrelated task finished"
     assert not [m for m in agent.messages
                 if m.get("role") == "tool" and m.get("name") == "done"]
     tools.clear_todos()
+
+
+def test_a_new_agent_starts_with_an_empty_todo_list(tmp_path, monkeypatch):
+    """The todo list is module state that outlives a turn, so a new session would
+    otherwise open with the previous one's plan pinned and gate `done` on it."""
+    monkeypatch.chdir(tmp_path)
+    tools.tool_write_todos([{"content": "left over", "status": "in_progress"}])
+    assert tools.unfinished_todos() == ["left over"]
+    _agent([_tool_call("done", summary="nothing to do")])
+    assert tools.unfinished_todos() == []
 
 
 # --- run_turn exit branches: each ends the turn with a result its caller reads -------

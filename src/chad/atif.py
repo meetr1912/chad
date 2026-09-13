@@ -73,6 +73,32 @@ def _metrics(stat: dict) -> dict:
             "cached_tokens": stat.get("cached_tokens", 0)}
 
 
+# First-seen timestamps, keyed by the identity of the message each step describes.
+# The segment is rebuilt from scratch after every step, so a step's timestamp has to be
+# recovered from somewhere or the whole trajectory reads as written at the final flush
+# (which looks synthetic under a leaderboard integrity review). Recovering it by POSITION
+# was only sound while the transcript was append-only, and it is not: compaction deletes
+# messages out of the middle, after which every surviving step inherited some earlier
+# message's stamp. So the stamp follows the message object itself.
+#
+# The entry keeps a strong reference to that dict, which is what makes `id()` safe as a
+# key — the address cannot be recycled for a different message while the entry lives.
+# Entries for messages that have left the transcript are dropped on the next rebuild, so
+# the table tracks the live transcript and nothing more. Observing, never mutating: the
+# message dicts are the agent's own and are rendered, saved and resumed.
+_STAMPS: dict[int, tuple[dict, str]] = {}
+
+
+def _stamp(m: dict) -> str:
+    """The time `m` was first seen in a rebuild, minted on first sight."""
+    hit = _STAMPS.get(id(m))
+    if hit is not None and hit[0] is m:
+        return hit[1]
+    ts = _now()
+    _STAMPS[id(m)] = (m, ts)
+    return ts
+
+
 def steps_from_messages(messages: list, model_name: Optional[str],
                         stats: list) -> list[dict]:
     """Convert one Agent's `messages` into ATIF steps (without global `step_id`s).
@@ -81,17 +107,25 @@ def steps_from_messages(messages: list, model_name: Optional[str],
     assistant step that produced the call. Results are paired with tool calls positionally;
     surplus results (an edit nudge, a validation reject with no matching call) attach with
     `source_call_id: None`, which ATIF permits.
+
+    Each step carries the timestamp its message was FIRST seen with (see `_STAMPS`), so
+    rebuilding after a step re-stamps only what is genuinely new.
     """
+    live = {id(m) for m in messages}
+    for stale in [k for k in _STAMPS if k not in live]:
+        del _STAMPS[stale]
     steps: list[dict] = []
     i, agent_seen = 0, 0
     while i < len(messages):
         m = messages[i]
         role, content = m.get("role"), m.get("content") or ""
         if role == "system":
-            steps.append({"source": "system", "message": content, "timestamp": _now()})
+            steps.append({"source": "system", "message": content,
+                          "timestamp": _stamp(m)})
             i += 1
         elif role == "user":
-            steps.append({"source": "user", "message": content, "timestamp": _now()})
+            steps.append({"source": "user", "message": content,
+                          "timestamp": _stamp(m)})
             i += 1
         elif role == "assistant":
             reasoning, visible = split_think(content)
@@ -103,7 +137,7 @@ def steps_from_messages(messages: list, model_name: Optional[str],
                 j += 1
 
             step: dict[str, Any] = {"source": "agent", "message": visible,
-                                    "timestamp": _now()}
+                                    "timestamp": _stamp(m)}
             if model_name:
                 step["model_name"] = model_name
             if reasoning.strip():
@@ -164,22 +198,13 @@ class TrajectoryRecorder:
             return len(self._segments) - 1
 
     def set_segment(self, idx: int, steps: list[dict]) -> None:
-        """Replace a segment's steps, KEEPING each existing step's first-seen timestamp.
+        """Replace a segment's steps.
 
-        `steps_from_messages` rebuilds the whole segment after every step and stamps
-        `_now()` on every step it emits — so without this merge, each rewrite dragged
-        every prior step's timestamp forward to the dump time, and a submitted
-        trajectory showed ~all steps at the moment of the final flush (which reads as
-        synthetic under a leaderboard integrity review). The transcript is append-only
-        within a turn (compaction rewrites content in place, never reorders), so
-        matching by position is stable: step i keeps the timestamp it was first dumped
-        with, and only genuinely new steps get fresh ones."""
+        The steps arrive already stamped with the time each one's message was first
+        seen (`steps_from_messages`), so the rebuild after every step carries the old
+        timestamps forward on its own and this is a plain replacement."""
         with self._lock:
             if 0 <= idx < len(self._segments):
-                prev = self._segments[idx]
-                for i, s in enumerate(steps[:len(prev)]):
-                    if "timestamp" in prev[i]:
-                        s["timestamp"] = prev[i]["timestamp"]
                 self._segments[idx] = steps
 
     def to_dict(self) -> dict:
@@ -241,3 +266,4 @@ def recorder() -> Optional[TrajectoryRecorder]:
 def _reset_for_tests() -> None:
     global _RECORDER, _INIT
     _RECORDER, _INIT = None, False
+    _STAMPS.clear()

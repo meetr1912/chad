@@ -256,7 +256,12 @@ def _bash_headtail(s: str, spill: bool = True) -> str:
         clip_note = (f"\n[… {removed} chars clipped from over-long lines "
                      f"(each capped at {BASH_LINE_CHARS} chars){where} …]")
     s = clipped
-    if len(s) + len(clip_note) <= BASH_MAX_CHARS:
+    # The body alone decides whether to truncate; the clip note is metadata ABOUT the
+    # body, not part of its budget. Counting it pushed bodies in the narrow band just
+    # under the cap into the truncation branch below, where HEAD + TAIL already covers
+    # the whole body — so `omitted` came out negative and the head and tail slices
+    # overlapped, printing the middle twice under a notice claiming it was dropped.
+    if len(s) <= BASH_MAX_CHARS:
         return s + clip_note
     omitted = len(s) - BASH_HEAD_CHARS - BASH_TAIL_CHARS
     if path is None and spill:
@@ -281,15 +286,19 @@ def _bash_headtail(s: str, spill: bool = True) -> str:
 
 
 def tool_write(path: str, content: str) -> str:
+    # UTF-8 explicitly, never the locale encoding: a container with no locale set
+    # (LANG unset -> ASCII on some runtimes) would otherwise fail to write any source
+    # file with a non-ASCII character in it, and the source tree's encoding has nothing
+    # to do with the machine chad happens to run on.
     before = None
     if os.path.exists(path):
         try:
-            with open(path, errors="replace") as f:
+            with open(path, encoding="utf-8", errors="replace") as f:
                 before = f.read()
         except OSError:
             pass
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(content)
     result = f"[wrote {len(content)} bytes to {_rel(path)}]"
     warn = syntaxgate.check_syntax(path, before)
@@ -561,7 +570,7 @@ def _landed_hint(block: str) -> str:
 def _apply_edit(path: str, before: str, after: str, note: str) -> str:
     if after == before:
         return "[no-op edit: the replacement leaves the file unchanged]"
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(after)
     result = f"[edited {_rel(path)}{note}]"
     warn = syntaxgate.check_syntax(path, before)
@@ -573,8 +582,16 @@ def _apply_edit(path: str, before: str, after: str, note: str) -> str:
 def tool_edit(path: str, old: str, new: str) -> str:
     if not os.path.exists(path):
         return f"[no such file: {path}]"
-    with open(path) as f:
-        data = f.read()
+    # Strict UTF-8, and a clear refusal when that fails. `errors="replace"` would be
+    # worse than an error here: the replacement characters come back in `data`, and the
+    # rewrite below would then persist them — an edit to one line silently corrupting
+    # every non-UTF-8 byte in the rest of the file.
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = f.read()
+    except UnicodeDecodeError:
+        return (f"[cannot edit {_rel(path)}: not UTF-8 text; use bash for binary or "
+                "legacy-encoded files]")
     if old == new:
         return ("[no-op edit: old and new are identical; change the content or stop]"
                 + _indent_hint(data, old))

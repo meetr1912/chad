@@ -160,11 +160,18 @@ def _install_socket_guard():
 
 def _verify(task):
     """Re-seed the check script from its read-only source, then run it. The re-write
-    is the anti-spoof: an agent edit to a seeded check.py is overwritten here."""
-    with open(task["check_path"], "w") as f:
-        f.write(task["check"])
-    vr = subprocess.run([sys.executable, task["check_path"]],
-                        capture_output=True, text=True, timeout=60)
+    is the anti-spoof: an agent edit to a seeded check.py is overwritten here.
+
+    A check that hangs (the agent left a server running, a `input()` in the code under
+    test) or cannot be run at all is a failed task, not a crashed run: this is the one
+    call standing between a finished proof and its scorecard."""
+    try:
+        with open(task["check_path"], "w") as f:
+            f.write(task["check"])
+        vr = subprocess.run([sys.executable, task["check_path"]],
+                            capture_output=True, text=True, timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
     out = (vr.stdout or "") + (vr.stderr or "")
     return vr.returncode == 0 and task["expect"] in out
 
@@ -254,6 +261,10 @@ def _scorecard(results, meta):
         lines.append(f"  {r['name']:24s} {mark:7s} {r['wall']:6.1f}s"
                      f"  {r['tok_per_s']:5.1f} tok/s decode")
         if not r["passed"]:
+            if r.get("error"):
+                # The task raised instead of finishing: name it, or the generic advice
+                # below sends the user chasing thermal throttling for a bug.
+                lines.append(f"    task raised {r['error']} — see the stderr log above")
             lines.append("    task failed — transcript: ~/.chad/session.log · "
                          "common causes: memory pressure from other apps, thermal "
                          "throttling. Tasks are designed to be repeatable — close "
@@ -354,7 +365,18 @@ def run(args):
     try:
         for i, task in enumerate(TASKS):
             sys.stderr.write(f"task {i + 1}/{len(TASKS)}: {task['name']} ...\n")
-            r = _run_one(eng, task, capture_ttft=(i == 0))
+            t0 = time.time()
+            try:
+                r = _run_one(eng, task, capture_ttft=(i == 0))
+            except Exception as e:  # noqa: BLE001 — one broken task is a failed row
+                # A task that raises is a failed task, not a failed run: the remaining
+                # tasks still have something to say, and the scorecard — which this
+                # command exists to print — must not be lost to a traceback.
+                r = {"name": task["name"], "passed": False,
+                     "wall": round(time.time() - t0, 1), "timed_out": False,
+                     "tok_per_s": 0.0, "gen_tokens": 0, "ttft_s": None,
+                     "error": type(e).__name__}
+                sys.stderr.write(f"  [{type(e).__name__}: {e}]\n")
             sys.stderr.write(f"  {'PASS' if r['passed'] else 'FAIL'} "
                              f"{r['wall']:.1f}s\n")
             results.append(r)

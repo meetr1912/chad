@@ -138,7 +138,7 @@ def write(text: str, kind: str = "bash") -> str | None:
             _sweep_stale(os.path.dirname(d))
         path = os.path.join(d, f"{kind}-{next(_IDS)}.log")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", errors="replace") as f:
+        with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
             f.write(text)
         _prune(d)
         return os.path.abspath(path)

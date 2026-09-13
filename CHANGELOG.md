@@ -2,6 +2,40 @@
 
 Notable, user-visible changes.
 
+## [Unreleased]
+
+**Six small correctness fixes**, independent of each other and each user-visible:
+
+- **A new session starts with an empty plan.** The todo list is module state that
+  outlives a turn by design, so `/reset`, `/accept`, `/resume` and every fresh agent
+  inherited the previous session's leftovers — the pinned panel kept showing a dead
+  plan, and the `done` guardrail questioned the first turn about someone else's open
+  items.
+- **The file tools read and write UTF-8 instead of the locale encoding.** Where no
+  locale is set (the documented `--backend llama` container path) `edit` raised a
+  decode error on any file with a non-ASCII character in it. A file that genuinely is
+  not UTF-8 now gets a clear refusal rather than a rewrite that would persist a
+  replacement character over every odd byte.
+- **Long bash output in the narrow band just under the cap is no longer "truncated".**
+  A body pushed over the budget by its own clip note took the truncation path, where
+  the omitted-character count came out negative and the head and tail slices
+  overlapped — the middle printed twice, under a notice saying it had been dropped.
+- **A legacy single-slot session file is removed only once it has been copied.** A
+  failed write used to delete the only copy of that conversation; a file that will not
+  parse is now renamed aside instead of deleted.
+- **`chad prove` always prints its scorecard.** A check script that hangs is a failed
+  task and a task that raises is a failed row, instead of a traceback in place of the
+  scorecard and `results.json`.
+- **Trajectory timestamps follow their message.** They were carried across rebuilds by
+  position, so after the first compaction every surviving step reported an earlier
+  message's time.
+
+**Upgrading costs one cold prefill.** The `write_todos` line in the system prompt now
+describes the JSON list the tool actually accepts; it had advertised a markdown
+checklist the tool rejects, so a model that followed its prompt burned a step on a
+rejected call. Changing the prompt changes the stable prefix every warm-start
+checkpoint is keyed on, so the first run after upgrading re-prefills it once.
+
 ## [2.0.3] — 2026-09-08
 
 **Fix: the on-disk warm start now hits in every directory.** The system-prompt KV

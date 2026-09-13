@@ -49,6 +49,7 @@ from .tools import (
     TERMINAL,
     active_schemas,
     alias_to_bash,
+    clear_todos,
     dispatch_for,
     is_mutating,
     unfinished_todos,
@@ -458,12 +459,16 @@ class Agent:
                  ctx_limit_fn=None):
         self.engine = engine
         # A fresh session clears stale skill activation state and reaps prior MCP
-        # processes (matches engine._reset_cache on /reset).
+        # processes (matches engine._reset_cache on /reset). The todo list is module
+        # state that outlives a turn by design, so it too must be dropped here —
+        # otherwise a new session opens with the previous one's leftovers pinned, and
+        # the `done` guardrail questions the first turn about someone else's plan.
         from . import skills
         skills.reset_session()
         from . import mcp
         mcp.reset_session()
         ambient.reset()
+        clear_todos()
         self.mode = mode or ("yolo" if yolo else "normal")
         self.thinking = thinking  # a reasoning model; toggles <think> blocks
         # Steps per WINDOW, not a hard kill: a window that landed+verified a change

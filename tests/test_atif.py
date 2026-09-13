@@ -125,24 +125,47 @@ def test_step_ids_are_sequential_from_one_across_segments():
     assert [s["step_id"] for s in doc["steps"]] == list(range(1, 9))
 
 
-def test_set_segment_keeps_first_seen_timestamps(monkeypatch):
-    """The segment is rebuilt (and re-stamped `_now()`) after every step; without the
-    positional timestamp merge, every rewrite dragged all prior steps' timestamps
-    forward to the dump time — a submitted trajectory then showed ~all steps at the
-    final flush, which reads as synthetic under a leaderboard integrity review. Step i
-    must keep the timestamp it was FIRST dumped with; only new steps get fresh ones."""
+def test_timestamps_are_kept_across_rebuilds(monkeypatch):
+    """The segment is rebuilt (and re-emitted) after every step; without first-seen
+    timestamps every rewrite dragged all prior steps forward to the dump time, and a
+    submitted trajectory showed ~all steps at the final flush, which reads as synthetic
+    under a leaderboard integrity review. A step keeps the time its message was FIRST
+    seen; only genuinely new messages get fresh ones."""
     ticks = iter(f"2026-07-19T00:00:{i:02d}+00:00" for i in range(60))
     monkeypatch.setattr(atif, "_now", lambda: next(ticks))
     rec = atif.TrajectoryRecorder("/dev/null")
     seg = rec.new_segment()
-    rec.set_segment(seg, atif.steps_from_messages(_messages()[:3], "m", []))
+    msgs = _messages()
+    rec.set_segment(seg, atif.steps_from_messages(msgs[:3], "m", []))
     original_ts = [s["timestamp"] for s in rec.to_dict()["steps"]]
-    rebuilt = atif.steps_from_messages(_messages(), "m", [])  # 2 more messages appended
-    assert [s["timestamp"] for s in rebuilt[:len(original_ts)]] != original_ts  # re-stamped
-    rec.set_segment(seg, rebuilt)
+    rec.set_segment(seg, atif.steps_from_messages(msgs, "m", []))   # 2 more messages
     steps = rec.to_dict()["steps"]
     assert [s["timestamp"] for s in steps[:len(original_ts)]] == original_ts
     assert all("timestamp" in s for s in steps[len(original_ts):])
+    assert steps[-1]["timestamp"] not in original_ts    # the new step is stamped now
+
+
+def test_timestamps_follow_the_message_through_a_compaction_deletion(monkeypatch):
+    """Compaction deletes messages out of the middle of the transcript. Carrying prior
+    timestamps forward by POSITION then handed every surviving step some earlier
+    message's stamp — the stamp has to follow the message itself."""
+    ticks = iter(f"2026-07-19T00:00:{i:02d}+00:00" for i in range(60))
+    monkeypatch.setattr(atif, "_now", lambda: next(ticks))
+    rec = atif.TrajectoryRecorder("/dev/null")
+    seg = rec.new_segment()
+    msgs = _messages()
+    rec.set_segment(seg, atif.steps_from_messages(msgs, "m", []))
+    before = {s["message"]: s["timestamp"] for s in rec.to_dict()["steps"]}
+
+    del msgs[1]                       # compaction sheds the oldest user turn
+    rec.set_segment(seg, atif.steps_from_messages(msgs, "m", []))
+    after = {s["message"]: s["timestamp"] for s in rec.to_dict()["steps"]}
+
+    assert len(after) == len(before) - 1
+    assert all(after[k] == before[k] for k in after), (before, after)
+    # and the dropped message is not retained by the timestamp table (a tool message
+    # is an observation on the step before it, never a step of its own)
+    assert len(atif._STAMPS) == sum(1 for m in msgs if m["role"] != "tool")
 
 
 def test_final_metrics_sum_across_steps():

@@ -141,6 +141,42 @@ def test_adopt_legacy(tmp_path):
     check("adopt is once-only", len(session.list_sessions(a)) == 1)
 
 
+def test_adopt_legacy_keeps_the_source_when_the_copy_fails(tmp_path, monkeypatch):
+    """The legacy file is the only copy of that conversation. If the adopted session
+    cannot be written, deleting it destroys the user's transcript; keeping it means the
+    next listing simply tries again."""
+    a = _proj(tmp_path, "proj_legacy_unwritable")
+    os.makedirs(session.SESS_DIR, exist_ok=True)
+    legacy = session._legacy_path(a)
+    with open(legacy, "w") as f:
+        json.dump({"cwd": a, "updated": time.time(), "meta": {},
+                   "messages": [{"role": "user", "content": "the only copy"}]}, f)
+    monkeypatch.setattr(session, "_atomic_write_json", lambda *a, **k: False)
+
+    items = session.list_sessions(a)
+    check("nothing adopted", items == [], items)
+    check("legacy file survives a failed write", os.path.isfile(legacy))
+    check("and it still parses", json.load(open(legacy))["messages"][0]["content"]
+          == "the only copy")
+
+
+def test_adopt_legacy_sets_an_unparseable_file_aside(tmp_path):
+    """A legacy file that will not parse is unreadable to us, not worthless to the user:
+    rename it rather than delete it — and renaming also ends the adoption attempt, which
+    would otherwise repeat on every listing."""
+    a = _proj(tmp_path, "proj_legacy_corrupt")
+    os.makedirs(session.SESS_DIR, exist_ok=True)
+    legacy = session._legacy_path(a)
+    with open(legacy, "w") as f:
+        f.write("{ this is not json")
+
+    check("corrupt legacy lists as nothing", session.list_sessions(a) == [])
+    check("corrupt legacy moved aside", os.path.isfile(legacy + ".corrupt"))
+    check("original gone", not os.path.isfile(legacy))
+    check("its bytes are intact",
+          open(legacy + ".corrupt").read() == "{ this is not json")
+
+
 def test_index_0600_and_corrupt_tolerated(tmp_path):
     a = _proj(tmp_path, "proj_idx")
     session.save_session(a, [{"role": "user", "content": "hi"}], {},
@@ -193,6 +229,7 @@ def test_persisted_copy_masks_known_prefix_secrets(tmp_path):
 if __name__ == "__main__":
     for test in (test_session, test_session_perms_0600, test_mint_list_and_fork,
                  test_prune_keeps_newest, test_adopt_legacy,
+                 test_adopt_legacy_sets_an_unparseable_file_aside,
                  test_index_0600_and_corrupt_tolerated,
                  test_persisted_copy_masks_known_prefix_secrets):
         # Same isolation conftest gives each test under pytest.

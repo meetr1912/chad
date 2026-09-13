@@ -827,6 +827,9 @@ class TUI:
         )
         self._pending_plan = None
         self._pending_budget_note = None
+        # The new Agent drops the tool-side todo list; the pinned panel reads this copy,
+        # so clear it too or the old plan stays on screen with nothing behind it.
+        self._todos = []
         self._interrupt.clear()        # the new turn must start un-interrupted
         self.engine.reset()
         return True

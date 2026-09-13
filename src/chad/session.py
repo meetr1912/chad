@@ -144,29 +144,40 @@ def _update_index(cwd: str, session_id: str, messages: list, updated: float) -> 
 
 def _adopt_legacy(cwd: str) -> None:
     """Migrate a pre-043 `<cwdhash>.json` file into the sessioned store as one session,
-    then remove it so it is adopted exactly once. Best-effort."""
+    then remove it so it is adopted exactly once. Best-effort.
+
+    The source file is the ONLY copy of that conversation, so it is removed only once a
+    copy is known to exist: the adopted session was written (or was already there from
+    an earlier adoption). A file that will not parse is renamed aside rather than
+    deleted — it is unreadable to us, not worthless to the user — and renaming it also
+    ends the adoption attempt, which would otherwise repeat on every listing."""
     legacy = _legacy_path(cwd)
     if not os.path.isfile(legacy):
         return
     try:
         data = _load_path(legacy)
         os.makedirs(_dir(cwd), exist_ok=True)
-        if data:
-            updated = data.get("updated") or time.time()
-            # Derive a stable id from the legacy file's own timestamp so re-listing is
-            # idempotent even if the write below races; -0000 marks the adopted slot.
-            sid = time.strftime("%Y%m%d-%H%M%S", time.localtime(updated)) + "-0000"
-            target = _session_path(cwd, sid)
-            if not os.path.exists(target):
-                _atomic_write_json(target, {
-                    "cwd": data.get("cwd", os.path.abspath(cwd)),
-                    "session_id": sid,
-                    "updated": updated,
-                    "meta": data.get("meta", {}),
-                    "messages": data["messages"],
-                })
+        if not data:
+            os.replace(legacy, legacy + ".corrupt")
+            return
+        updated = data.get("updated") or time.time()
+        # Derive a stable id from the legacy file's own timestamp so re-listing is
+        # idempotent even if the write below races; -0000 marks the adopted slot.
+        sid = time.strftime("%Y%m%d-%H%M%S", time.localtime(updated)) + "-0000"
+        target = _session_path(cwd, sid)
+        adopted = os.path.exists(target)
+        if not adopted:
+            adopted = _atomic_write_json(target, {
+                "cwd": data.get("cwd", os.path.abspath(cwd)),
+                "session_id": sid,
+                "updated": updated,
+                "meta": data.get("meta", {}),
+                "messages": data["messages"],
+            })
+            if adopted:
                 _update_index(cwd, sid, data["messages"], updated)
-        os.remove(legacy)
+        if adopted:
+            os.remove(legacy)
     except OSError:
         pass
 

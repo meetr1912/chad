@@ -600,3 +600,17 @@ def test_ctx_is_not_swallowed_as_steering_midturn():
     tui._busy = True
     tui._on_accept(_Buff("/ctx"))
     assert list(tui._steer_queue) == [] and list(tui._queue) == []
+
+
+# ---------------------------------------------------------------------------
+# /reset, /accept and /resume all route through `_fresh_agent`, which drops the
+# conversation and the KV cache. The pinned todo panel reads the TUI's own copy of
+# the plan, so it has to be dropped with them.
+# ---------------------------------------------------------------------------
+
+def test_fresh_agent_clears_the_pinned_todo_panel():
+    tui, _ = _worker_tui()
+    tui.engine.reset = lambda: None    # bare Engine: no weights, no cache to rebuild
+    tui._todos = [{"content": "from the previous session", "status": "in_progress"}]
+    assert tui._fresh_agent("normal") is True
+    assert tui._todos == []
