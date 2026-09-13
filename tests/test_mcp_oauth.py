@@ -46,8 +46,7 @@ from chad import mcp, mcp_oauth
 def _isolate_home(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    monkeypatch.setenv("HOME", str(home))
     return home
 
 
@@ -298,8 +297,7 @@ def test_tokens_present_connects_and_exposes_tools(http_server, tmp_path, monkey
 def test_login_headless_degrades_gracefully(tmp_path, monkeypatch):
     """No browser available AND the callback never lands: login returns a clear failure
     string, never raises, never hangs. Uses a closed loopback port so the connect fails
-    fast; the redirect handler's webbrowser.open is forced to raise."""
-    import webbrowser
+    fast; the browser opener handed to login raises."""
     home = _isolate_home(tmp_path, monkeypatch)
     # Point at a dead port so the OAuth connect fails quickly rather than waiting on a
     # real authorization server (we are testing degradation, not the happy path).
@@ -307,14 +305,15 @@ def test_login_headless_degrades_gracefully(tmp_path, monkeypatch):
     workdir = tmp_path / "work"; workdir.mkdir()
     monkeypatch.chdir(workdir)
     _enable_flag(monkeypatch)
-    monkeypatch.setattr(webbrowser, "open",
-                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no display")))
-    # Shrink the login timeout so an abandoned flow doesn't slow the suite.
-    monkeypatch.setattr(mcp_oauth, "_LOGIN_TIMEOUT", 1.0)
+
+    def no_display(url: str) -> bool:
+        raise RuntimeError("no display")
+
     mcp.reset_session()
     msgs = []
-    result = mcp.login("hosted", emit=msgs.append)
-    assert isinstance(result, str)
+    # A short login timeout so an abandoned flow doesn't slow the suite.
+    result = mcp.login("hosted", emit=msgs.append, timeout=1.0, open_browser=no_display)
+    assert result.startswith("hosted: ")
     assert "login failed" in result or "did not produce a token" in result
     assert mcp_oauth.has_tokens("hosted") is False       # nothing persisted
     mcp.reset_session()

@@ -11,7 +11,6 @@ the validate.py schema fallback (coercion + unknown-tool listing with no duplica
 """
 
 import json
-import os
 import socket
 import sys
 import textwrap
@@ -140,6 +139,15 @@ _DUP_SERVER = textwrap.dedent('''\
 ''')
 
 
+def _isolate_home(tmp_path, monkeypatch):
+    """Point HOME (and so `~`) at an isolated dir so the developer's real ~/.chad never
+    leaks in. Returns the home Path."""
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     """A project dir with a .mcp.json pointing at the fake server, an isolated HOME so
@@ -147,10 +155,7 @@ def project(tmp_path, monkeypatch):
     Tears down MCP connections before and after so no registry/process leaks across tests."""
     server_py = tmp_path / "server.py"
     server_py.write_text(_SERVER)
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     config = {"mcpServers": {"demo": {"command": sys.executable, "args": [str(server_py)]}}}
     (tmp_path / ".mcp.json").write_text(json.dumps(config))
     monkeypatch.chdir(tmp_path)
@@ -190,9 +195,7 @@ def test_active_schemas_includes_mcp(project):
 
 
 def test_no_config_no_tools(tmp_path, monkeypatch):
-    home = tmp_path / "home"; home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     monkeypatch.chdir(tmp_path)
     mcp.reset_session()
     assert mcp.schemas() == []
@@ -256,6 +259,32 @@ def test_render_result_reads_snake_case_is_error():
     assert mcp._render_result(res).startswith("[tool reported an error]")
 
 
+def test_render_result_non_text_blocks():
+    """A text resource inlines its body; a blob, or an empty text body, is named by URI;
+    any other block kind is noted by its type."""
+    from mcp.types import CallToolResult
+    res = CallToolResult.model_validate({"content": [
+        {"type": "text", "text": "hello"},
+        {"type": "resource", "resource": {"uri": "file:///a.txt", "text": "body"}},
+        {"type": "resource", "resource": {"uri": "file:///b.bin", "blob": "AAAA"}},
+        {"type": "resource", "resource": {"uri": "file:///c.txt", "text": ""}},
+        {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+        {"type": "resource_link", "uri": "file:///d", "name": "d"},
+    ]})
+    assert mcp._render_result(res) == "\n".join([
+        "hello", "body", "[resource: file:///b.bin]", "[resource: file:///c.txt]",
+        "[image content omitted]", "[resource_link content omitted]"])
+
+
+def test_render_result_structured_only_and_empty():
+    """No content blocks: structured_content is shown as JSON, and a result with neither
+    says so rather than rendering as an empty string."""
+    from mcp.types import CallToolResult
+    res = CallToolResult.model_validate({"content": [], "structuredContent": {"n": 1}})
+    assert mcp._render_result(res) == '{\n  "n": 1\n}'
+    assert mcp._render_result(CallToolResult.model_validate({"content": []})) == "[no content]"
+
+
 # ---------------------------------------------------------------------------
 # validate.py integration (schema fallback, no duplication)
 # ---------------------------------------------------------------------------
@@ -291,28 +320,25 @@ def test_confirm_preview_shows_mcp_args():
 # Config merge + robustness
 # ---------------------------------------------------------------------------
 
-def test_project_overrides_user(tmp_path, monkeypatch):
+def test_project_overrides_user(tmp_path):
+    # `home` is passed explicitly, so the real ~ is never consulted.
     home = tmp_path / "home"; (home / ".chad").mkdir(parents=True)
     (home / ".chad" / "mcp.json").write_text(json.dumps(
         {"mcpServers": {"demo": {"command": "user-cmd"},
                         "useronly": {"command": "u"}}}))
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
     (tmp_path / ".mcp.json").write_text(json.dumps(
         {"mcpServers": {"demo": {"command": "project-cmd"}}}))
     servers, _ = mcp._load_config(str(tmp_path), str(home))
     by = {n: s for n, s, _ in servers}
     scope = {n: sc for n, s, sc in servers}
-    assert by["demo"]["command"] == "project-cmd"   # project wins
+    assert by["demo"].command == "project-cmd"      # project wins
     assert "useronly" in by                         # user-only kept
     assert scope["demo"] == "project"               # merged entry takes project scope
     assert scope["useronly"] == "user"              # user-only keeps user scope
 
 
 def test_malformed_config_is_skipped(tmp_path, monkeypatch):
-    home = tmp_path / "home"; home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     (tmp_path / ".mcp.json").write_text("{ this is not json ")
     monkeypatch.chdir(tmp_path)
     mcp.reset_session()
@@ -323,9 +349,7 @@ def test_malformed_config_is_skipped(tmp_path, monkeypatch):
 
 def test_disabled_server_skipped(tmp_path, monkeypatch):
     server_py = tmp_path / "server.py"; server_py.write_text(_SERVER)
-    home = tmp_path / "home"; home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     (tmp_path / ".mcp.json").write_text(json.dumps(
         {"mcpServers": {"demo": {"command": sys.executable, "args": [str(server_py)],
                                  "disabled": True}}}))
@@ -339,35 +363,32 @@ def test_unusable_sdk_degrades_gracefully(tmp_path, monkeypatch):
     """An `mcp` SDK whose symbols chad can't import costs the operator their MCP tools
     and a warning — never the agent. The SDK import is guarded (chad.mcp is imported
     unconditionally when an Agent is built, so an ImportError there is an unskippable
-    traceback on startup); this covers the resulting no-SDK state."""
-    home = tmp_path / "home"; home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    traceback on startup); this covers the resulting no-SDK state, handed to the registry
+    the way the import guard's `_SDK_ERROR` is."""
+    _isolate_home(tmp_path, monkeypatch)
     (tmp_path / ".mcp.json").write_text(json.dumps(
         {"mcpServers": {"demo": {"command": sys.executable, "args": ["-c", "pass"]}}}))
-    monkeypatch.chdir(tmp_path)
     mcp._set_trusted(str(tmp_path))
-    monkeypatch.setattr(mcp, "_SDK_ERROR", "ImportError: cannot import name 'x'")
-    mcp.reset_session()
-    assert mcp.schemas() == []                          # nothing exposed to the model
-    assert mcp.service().clients == []                  # nothing connected
-    assert any("MCP disabled" in w for w in mcp.service().warnings)
-    assert any("MCP disabled" in ln for ln in mcp.summary_lines())
-    mcp.reset_session()
+    reg = mcp._Registry(str(tmp_path), sdk_error="ImportError: cannot import name 'x'")
+    try:
+        assert reg.schemas() == []                      # nothing exposed to the model
+        assert reg.clients == []                        # nothing connected
+        assert any("MCP disabled" in w for w in reg.warnings)
+        assert any("MCP disabled" in ln for ln in reg.summary_lines())
+    finally:
+        reg.close()
 
 
 def test_unusable_sdk_silent_without_servers(tmp_path, monkeypatch):
     """No servers configured: nothing to warn about, so the broken SDK is not mentioned
     — an operator who never used MCP sees no new noise."""
-    home = tmp_path / "home"; home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(mcp, "_SDK_ERROR", "ImportError: cannot import name 'x'")
-    mcp.reset_session()
-    assert mcp.service().warnings == []
-    assert "no MCP servers configured" in mcp.summary_lines()[0]
-    mcp.reset_session()
+    _isolate_home(tmp_path, monkeypatch)
+    reg = mcp._Registry(str(tmp_path), sdk_error="ImportError: cannot import name 'x'")
+    try:
+        assert reg.warnings == []
+        assert "no MCP servers configured" in reg.summary_lines()[0]
+    finally:
+        reg.close()
 
 
 def test_oauth_disabled_when_sdk_unusable(monkeypatch):
@@ -376,14 +397,11 @@ def test_oauth_disabled_when_sdk_unusable(monkeypatch):
     from chad import mcp_oauth
     monkeypatch.setenv("CHAD_MCP_OAUTH", "1")
     assert mcp_oauth.oauth_enabled() is True
-    monkeypatch.setattr(mcp_oauth, "_SDK_ERROR", "ImportError: cannot import name 'x'")
-    assert mcp_oauth.oauth_enabled() is False
+    assert mcp_oauth.oauth_enabled(sdk_error="ImportError: cannot import name 'x'") is False
 
 
 def test_bad_command_degrades_gracefully(tmp_path, monkeypatch):
-    home = tmp_path / "home"; home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     (tmp_path / ".mcp.json").write_text(json.dumps(
         {"mcpServers": {"broken": {"command": "this_binary_does_not_exist_chad"}}}))
     monkeypatch.chdir(tmp_path)
@@ -396,16 +414,6 @@ def test_bad_command_degrades_gracefully(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 # Trust gate (project-level ./.mcp.json is untrusted until /mcp trust)
 # ---------------------------------------------------------------------------
-
-def _isolate_home(tmp_path, monkeypatch):
-    """Point ~ at an isolated dir so the developer's real ~/.chad never leaks in.
-    Returns the home Path."""
-    home = tmp_path / "home"
-    home.mkdir(exist_ok=True)
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
-    return home
-
 
 def _write_project(tmp_path, server_py, name="demo", server_src=_SERVER, **spec):
     server_py.write_text(server_src)
@@ -606,9 +614,7 @@ def http_server():
 def _http_config(tmp_path, monkeypatch, url, **extra):
     """Isolate HOME, write a trusted project ./.mcp.json with one HTTP server, chdir, and
     reset the session so the next service() connects over HTTP. Returns nothing."""
-    home = tmp_path / "home"; home.mkdir(exist_ok=True)
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     spec = {"type": "http", "url": url}
     spec.update(extra)
     (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {"web": spec}}))
@@ -666,9 +672,7 @@ def test_http_connect_timeout_degrades(tmp_path, monkeypatch):
 
 
 def test_dead_endpoint_does_not_block_healthy_server(http_server, tmp_path, monkeypatch):
-    home = tmp_path / "home"; home.mkdir(exist_ok=True)
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(home) if p == "~" or p.startswith("~/") else p)
+    _isolate_home(tmp_path, monkeypatch)
     dead = _free_port()
     cfg = {"mcpServers": {
         "web": {"type": "http", "url": http_server.url},
@@ -695,7 +699,7 @@ def test_stdio_env_withholds_secrets_by_default():
     # A parent environment carrying a secret + the essentials the subprocess needs.
     parent = {"PATH": "/usr/bin", "HOME": "/home/me", "LANG": "en_US.UTF-8",
               "TERM": "xterm", "OPENAI_API_KEY": "sk-secret", "AWS_SECRET_KEY": "top"}
-    env = mcp._stdio_env(parent, None)
+    env = mcp._stdio_env(parent, {})
     assert env["PATH"] == "/usr/bin"                 # essentials pass through
     assert env["HOME"] == "/home/me"
     assert env["LANG"] == "en_US.UTF-8"
@@ -715,12 +719,14 @@ def test_stdio_env_config_extra_merges_and_wins():
 def test_stdio_env_full_env_escape_hatch():
     # CHAD_MCP_FULL_ENV=1 restores the historical full inherit for the rare server.
     parent = {"PATH": "/usr/bin", "SECRET": "s", "CHAD_MCP_FULL_ENV": "1"}
-    env = mcp._stdio_env(parent, None)
+    env = mcp._stdio_env(parent, {})
     assert env["SECRET"] == "s"                      # everything inherited
     assert env["PATH"] == "/usr/bin"
 
 
 def test_stdio_env_extra_non_dict_ignored():
-    # A malformed `env:` (not an object) must not crash the transport build.
-    env = mcp._stdio_env({"PATH": "/usr/bin"}, "not-a-dict")
+    # A malformed `env:` (not an object) must not crash the transport build: the config
+    # decode reads it as no extra entries.
+    spec = mcp._ServerSpec.decode({"command": "srv", "env": "not-a-dict"})
+    env = mcp._stdio_env({"PATH": "/usr/bin"}, spec.env)
     assert env == {"PATH": "/usr/bin"}

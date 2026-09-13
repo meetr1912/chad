@@ -50,7 +50,9 @@ import json
 import os
 import threading
 import time
+import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 import anyio
@@ -92,22 +94,23 @@ _POLL = 1.0
 # Feature flag — ALL OAuth code is gated here. Off by default.
 # ---------------------------------------------------------------------------
 
-def oauth_enabled() -> bool:
+def oauth_enabled(sdk_error: "str | None" = _SDK_ERROR) -> bool:
     """True only when the operator has opted into OAuth via `CHAD_MCP_OAUTH`. With this
     off, no OAuth code runs and the stdio/bearer/HTTP paths are unaffected. An SDK whose
-    auth symbols we couldn't import reads as off, so the callers' existing "OAuth
-    unavailable" path handles it — nothing here can raise."""
-    if _SDK_ERROR:
-        log.warning("mcp: OAuth unavailable, SDK auth import failed: %s", _SDK_ERROR)
+    auth symbols we couldn't import (`sdk_error`: by default this module's own import
+    failure) reads as off, so the callers' existing "OAuth unavailable" path handles it —
+    nothing here can raise."""
+    if sdk_error:
+        log.warning("mcp: OAuth unavailable, SDK auth import failed: %s", sdk_error)
         return False
     val = config.env_str("CHAD_MCP_OAUTH", "")
     return val.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def is_oauth(spec: dict) -> bool:
-    """Whether a server spec opts into OAuth (an `auth: oauth` marker on an http
-    server). Independent of the feature flag — the flag decides whether we act on it."""
-    return isinstance(spec, dict) and str(spec.get("auth", "")).lower() == "oauth"
+    """Whether a server's config object opts into OAuth (an `auth: oauth` marker on an
+    http server). Independent of the feature flag — the flag decides whether we act on it."""
+    return str(spec.get("auth", "")).lower() == "oauth"
 
 
 # ---------------------------------------------------------------------------
@@ -124,8 +127,7 @@ _io_lock = threading.Lock()
 
 
 def tokens_path() -> str:
-    # Uses the same os.path.expanduser indirection the rest of mcp.py relies on so tests
-    # isolate HOME by monkeypatching expanduser.
+    # Resolved on every call rather than at import, so the store follows HOME.
     return os.path.join(os.path.expanduser("~"), ".chad", "mcp_tokens.json")
 
 
@@ -149,11 +151,35 @@ def _write_all(data: dict) -> None:
     os.chmod(path, 0o600)
 
 
+def _entry(data: dict, server_key: str) -> dict:
+    """One server's object in the decoded store; {} when absent or not an object."""
+    entry = data.get(server_key)
+    return entry if isinstance(entry, dict) else {}
+
+
+def _read_section(server_key: str, section: str) -> "dict | None":
+    """One stored object (`tokens` or `client_info`) for a server, or None when it is
+    absent or not an object."""
+    value = _entry(_read_all(), server_key).get(section)
+    return value if isinstance(value, dict) else None
+
+
+def _write_section(server_key: str, section: str, value: dict) -> None:
+    """Replace one stored object for a server, keeping the server's other fields and every
+    other server's entry exactly as they are on disk."""
+    with _io_lock:
+        data = _read_all()
+        entry = _entry(data, server_key)
+        entry[section] = value
+        data[server_key] = entry
+        _write_all(data)
+
+
 def has_tokens(server_key: str) -> bool:
     """Sync helper for the connect-time 'needs login?' decision: does the store hold an
     access token for this server? (Presence only — never inspects/logs the value.)"""
-    entry = _read_all().get(server_key)
-    return bool(isinstance(entry, dict) and (entry.get("tokens") or {}).get("access_token"))
+    tokens = _read_section(server_key, "tokens")
+    return bool(tokens and tokens.get("access_token"))
 
 
 class FileTokenStorage:
@@ -167,9 +193,8 @@ class FileTokenStorage:
         self._key = server_key
 
     async def get_tokens(self) -> "OAuthToken | None":
-        entry = _read_all().get(self._key) or {}
-        raw = entry.get("tokens")
-        if not isinstance(raw, dict):
+        raw = _read_section(self._key, "tokens")
+        if raw is None:
             return None
         try:
             return OAuthToken.model_validate(raw)
@@ -178,19 +203,11 @@ class FileTokenStorage:
             return None
 
     async def set_tokens(self, tokens: "OAuthToken") -> None:
-        with _io_lock:
-            data = _read_all()
-            entry = data.get(self._key)
-            if not isinstance(entry, dict):
-                entry = {}
-            entry["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
-            data[self._key] = entry
-            _write_all(data)
+        _write_section(self._key, "tokens", tokens.model_dump(mode="json", exclude_none=True))
 
     async def get_client_info(self) -> "OAuthClientInformationFull | None":
-        entry = _read_all().get(self._key) or {}
-        raw = entry.get("client_info")
-        if not isinstance(raw, dict):
+        raw = _read_section(self._key, "client_info")
+        if raw is None:
             return None
         try:
             return OAuthClientInformationFull.model_validate(raw)
@@ -199,14 +216,8 @@ class FileTokenStorage:
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
-        with _io_lock:
-            data = _read_all()
-            entry = data.get(self._key)
-            if not isinstance(entry, dict):
-                entry = {}
-            entry["client_info"] = client_info.model_dump(mode="json", exclude_none=True)
-            data[self._key] = entry
-            _write_all(data)
+        _write_section(self._key, "client_info",
+                       client_info.model_dump(mode="json", exclude_none=True))
 
 
 # ---------------------------------------------------------------------------
@@ -316,17 +327,19 @@ def make_noninteractive_provider(server_url: str, storage: "FileTokenStorage",
 
 def make_login_provider(server_url: str, storage: "FileTokenStorage",
                         loopback: "LoopbackServer", scope: str | None = None,
-                        emit=None, timeout: float = _LOGIN_TIMEOUT) -> "OAuthClientProvider":
-    """Provider for the INTERACTIVE `/mcp login` flow: opens the browser (printing the
-    URL as a headless fallback) and catches the redirect on the loopback server. Bounded
-    by `timeout` so an abandoned/headless login fails cleanly instead of hanging."""
+                        emit=None, timeout: float = _LOGIN_TIMEOUT,
+                        open_browser: Callable[[str], bool] = webbrowser.open,
+                        ) -> "OAuthClientProvider":
+    """Provider for the INTERACTIVE `/mcp login` flow: opens the browser with
+    `open_browser` (printing the URL as a headless fallback) and catches the redirect on
+    the loopback server. Bounded by `timeout` so an abandoned/headless login fails
+    cleanly instead of hanging."""
     say = emit or (lambda _m: None)
 
     async def redirect_handler(auth_url: str) -> None:
         opened = False
         try:
-            import webbrowser
-            opened = bool(webbrowser.open(auth_url))
+            opened = bool(open_browser(auth_url))
         except Exception:  # noqa: BLE001 — no display / no browser
             opened = False
         if opened:

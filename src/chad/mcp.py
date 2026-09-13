@@ -42,7 +42,9 @@ import atexit
 import json
 import os
 import threading
-from typing import Optional
+import webbrowser
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 import anyio
 from anyio.from_thread import BlockingPortal, start_blocking_portal
@@ -53,7 +55,8 @@ from anyio.from_thread import BlockingPortal, start_blocking_portal
 # constructor, so an ImportError here is a traceback on `chad` with no way past it. (It
 # happened: mcp 2.0 removed `streamablehttp_client`.) The dep is capped in pyproject;
 # this is the backstop, so an incompatible SDK costs the operator their MCP tools and a
-# warning line instead of the agent. `_SDK_ERROR` is checked in `_Registry._connect`.
+# warning line instead of the agent. `_SDK_ERROR` is the `_Registry`'s default
+# `sdk_error`, checked in `_Registry._connect`.
 #
 # mcp 2.x API: `streamable_http_client(url, *, http_client=...)` — the caller builds
 # and owns the httpx2 client. `create_mcp_http_client(headers=..., auth=...)` is MCP's
@@ -66,12 +69,14 @@ try:
         create_mcp_http_client,
         streamable_http_client,
     )
-    from mcp.types import PaginatedRequestParams
+    from mcp.types import CallToolResult, PaginatedRequestParams, TextResourceContents, Tool
     _SDK_ERROR: Optional[str] = None
 except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
     # SAFETY: the None sentinels are never dereferenced: `_SDK_ERROR` is set on this
-    # same path and `_Registry._connect` refuses every server while it is set.
-    ClientSession = StdioServerParameters = None    # type: ignore[assignment,misc]
+    # same path and a `_Registry` built with it (the default) refuses every server, so no
+    # session exists and no tool result is ever rendered. `CallToolResult` and `Tool` are
+    # named only in quoted annotations, which never evaluate, so they need no sentinel.
+    ClientSession = StdioServerParameters = TextResourceContents = None  # type: ignore[assignment,misc]
     stdio_client = streamable_http_client = None    # type: ignore[assignment]  # SAFETY: behind _SDK_ERROR
     create_mcp_http_client = PaginatedRequestParams = None  # type: ignore[assignment,misc]  # SAFETY: behind _SDK_ERROR
     _SDK_ERROR = f"{type(_e).__name__}: {_e}"
@@ -105,6 +110,46 @@ _RESULT_MAX_CHARS = 20000
 # Configuration
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _ServerSpec:
+    """One `mcpServers` entry, decoded once when the config is read. A field holding the
+    wrong JSON type reads as absent, so a bad value costs that one setting — never the
+    config load, and never the agent."""
+
+    url: str = ""                             # non-empty selects the HTTP transport
+    headers: Optional[dict] = None            # static HTTP headers (e.g. a bearer token)
+    command: str = ""                         # stdio launch command, used when there is no url
+    args: list = field(default_factory=list)
+    env: dict = field(default_factory=dict)   # merged over the filtered parent environment
+    cwd: Optional[str] = None
+    disabled: bool = False
+    oauth: bool = False                       # `auth: oauth`; acted on only behind the flag
+    scope: Optional[str] = None               # OAuth scope to request
+    timeout: float = _CALL_TIMEOUT
+    connect_timeout: float = _CONNECT_TIMEOUT
+
+    @classmethod
+    def decode(cls, raw: dict) -> "_ServerSpec":
+        url, headers, command = raw.get("url"), raw.get("headers"), raw.get("command")
+        args, env, cwd = raw.get("args"), raw.get("env"), raw.get("cwd")
+        scope, timeout, connect_timeout = (
+            raw.get("scope"), raw.get("timeout"), raw.get("connect_timeout"))
+        return cls(
+            url=url if isinstance(url, str) else "",
+            headers=headers if isinstance(headers, dict) else None,
+            command=command if isinstance(command, str) else "",
+            args=list(args) if isinstance(args, list) else [],
+            env=env if isinstance(env, dict) else {},
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+            disabled=bool(raw.get("disabled")),
+            oauth=mcp_oauth.is_oauth(raw),
+            scope=scope if isinstance(scope, str) and scope else None,
+            timeout=timeout if isinstance(timeout, (int, float)) else _CALL_TIMEOUT,
+            connect_timeout=(connect_timeout if isinstance(connect_timeout, (int, float))
+                             else _CONNECT_TIMEOUT),
+        )
+
+
 def _config_paths(cwd: str, home: str):
     """Config files to read, lowest precedence first (project overrides user), each
     tagged with its trust scope: user-level is authored by the operator (trusted);
@@ -117,11 +162,11 @@ def _config_paths(cwd: str, home: str):
 
 def _load_config(cwd: str = None, home: str = None):
     """Merge MCP server definitions from the config files. Returns an ordered list of
-    (name, spec, scope) where scope is "user" or "project", plus a list of
-    human-readable warnings. Project entries override user entries of the same name,
-    and the merged entry's scope becomes "project" (it now carries attacker-influenced
-    fields, so it must clear the trust gate). Lenient: a malformed file warns and is
-    skipped, it never aborts startup."""
+    (name, spec, scope) where spec is the decoded `_ServerSpec` and scope is "user" or
+    "project", plus a list of human-readable warnings. Project entries override user
+    entries of the same name, and the merged entry's scope becomes "project" (it now
+    carries attacker-influenced fields, so it must clear the trust gate). Lenient: a
+    malformed file warns and is skipped, it never aborts startup."""
     cwd = cwd or os.getcwd()
     home = home or os.path.expanduser("~")
     merged = {}
@@ -148,7 +193,7 @@ def _load_config(cwd: str = None, home: str = None):
                 continue
             if name not in merged:
                 order.append(name)
-            merged[name] = spec
+            merged[name] = _ServerSpec.decode(spec)
             scopes[name] = scope
     return [(n, merged[n], scopes[n]) for n in order], warnings
 
@@ -216,7 +261,7 @@ _MCP_ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR"
                   "TMP", "TEMP", "SHELL", "USER", "LOGNAME")
 
 
-def _stdio_env(environ, extra) -> dict:
+def _stdio_env(environ, extra: dict) -> dict:
     """The environment handed to a stdio MCP subprocess. Minimal allowlist by default
     (see `_MCP_ENV_ALLOW`) so secrets in the parent environment don't leak to arbitrary
     user-configured commands; `CHAD_MCP_FULL_ENV=1` restores the full inherit. The
@@ -228,8 +273,7 @@ def _stdio_env(environ, extra) -> dict:
         env = dict(environ)
     else:
         env = {k: environ[k] for k in _MCP_ENV_ALLOW if k in environ}
-    if isinstance(extra, dict):
-        env.update({k: str(v) for k, v in extra.items()})
+    env.update({k: str(v) for k, v in extra.items()})
     return env
 
 
@@ -247,26 +291,21 @@ def _http_transport(url: str, headers, auth):
     return open_transport()
 
 
-def _transport_for(spec: dict, auth=None):
+def _transport_for(spec: _ServerSpec, auth=None):
     """Return (kind, build) for a server spec, where `build()` is a zero-arg factory
     that yields the SDK transport async context manager. Transport is chosen by
     presence: `url` -> HTTP, else `command` -> stdio (`type` is advisory only).
     `auth` is an optional OAuthClientProvider handed to the httpx2 client factory;
     None keeps the static bearer/header path. Returns (None, None) if neither is
     present."""
-    url = spec.get("url")
-    if isinstance(url, str) and url:
-        headers = spec.get("headers")
-        headers = headers if isinstance(headers, dict) else None
-        return "http", lambda: _http_transport(url, headers, auth)
-    command = spec.get("command")
-    if isinstance(command, str) and command:
-        env = _stdio_env(os.environ, spec.get("env"))
+    if spec.url:
+        return "http", lambda: _http_transport(spec.url, spec.headers, auth)
+    if spec.command:
         params = StdioServerParameters(
-            command=command,
-            args=list(spec.get("args") or []),
-            env=env,
-            cwd=spec.get("cwd") or None,
+            command=spec.command,
+            args=list(spec.args),
+            env=_stdio_env(os.environ, spec.env),
+            cwd=spec.cwd,
         )
         return "stdio", lambda: stdio_client(params)
     return None, None
@@ -276,15 +315,15 @@ def _transport_for(spec: dict, auth=None):
 # Async coroutines run on the portal's event loop
 # ---------------------------------------------------------------------------
 
-async def _list_all_tools(session: "ClientSession"):
+async def _list_all_tools(session: "ClientSession") -> "list[Tool]":
     """Collect every tool across paginated tools/list pages (bounded so a buggy
     server that pages forever can't hang connect). Returns SDK `Tool` objects."""
-    out = []
+    out: "list[Tool]" = []
     cursor = None
     for _ in range(_MAX_LIST_PAGES):
         params = PaginatedRequestParams(cursor=cursor) if cursor else None
         result = await session.list_tools(params=params)
-        out += [t for t in (result.tools or []) if getattr(t, "name", None)]
+        out += [t for t in result.tools if t.name]
         cursor = result.next_cursor
         if not cursor:
             break
@@ -322,35 +361,34 @@ async def _run_conn(conn: "_Conn", build, connect_timeout: float):
         conn._done.set()
 
 
-async def _invoke(session: "ClientSession", raw: str, arguments: dict, timeout: float):
+async def _invoke(session: "ClientSession", raw: str, arguments: dict,
+                  timeout: float) -> "CallToolResult":
     """Call one tool with the per-call timeout INSIDE the coroutine, so a hung server
     cancels this task (freeing the agent thread) instead of wedging the loop."""
     with anyio.fail_after(timeout):
         return await session.call_tool(raw, arguments or {})
 
 
-def _render_result(res) -> str:
+def _render_result(res: "CallToolResult") -> str:
     """Flatten an SDK `CallToolResult` into text for the model. Concatenates text
     content blocks; notes non-text blocks (images/resources) by type. Honors is_error
     by prefixing the text so the model treats it as a failure to react to."""
     parts = []
-    for block in (getattr(res, "content", None) or []):
-        btype = getattr(block, "type", None)
-        if btype == "text":
-            parts.append(str(getattr(block, "text", "")))
-        elif btype == "resource":
-            r = getattr(block, "resource", None)
-            rtext = getattr(r, "text", None) if r is not None else None
-            if rtext:
-                parts.append(str(rtext))
+    for block in res.content:
+        if block.type == "text":
+            parts.append(block.text)
+        elif block.type == "resource":
+            resource = block.resource
+            # Text contents inline their body; a blob, or an empty body, is named by URI.
+            if isinstance(resource, TextResourceContents) and resource.text:
+                parts.append(resource.text)
             else:
-                uri = getattr(r, "uri", "unknown") if r is not None else "unknown"
-                parts.append(f"[resource: {uri}]")
+                parts.append(f"[resource: {resource.uri}]")
         else:
-            parts.append(f"[{btype or 'non-text'} content omitted]")
+            parts.append(f"[{block.type} content omitted]")
     text = "\n".join(p for p in parts if p)
     # Some servers return only structured_content (no content blocks).
-    sc = getattr(res, "structured_content", None)
+    sc = res.structured_content
     if not text and sc is not None:
         try:
             text = json.dumps(sc, ensure_ascii=False, indent=2)
@@ -358,10 +396,9 @@ def _render_result(res) -> str:
             text = str(sc)
     if not text:
         text = "[no content]"
-    # `is_error` (was isError in mcp 1.x): a getattr on the OLD name would default
-    # False forever and tool-reported errors would silently stop being flagged —
-    # pinned by a test that fails on the 1.x spelling.
-    if getattr(res, "is_error", False):
+    # `is_error` is the model attribute; `isError` is only the wire name (and the 1.x
+    # attribute). Pinned by a test that builds the result from camelCase wire JSON.
+    if res.is_error:
         text = "[tool reported an error]\n" + text
     return text[:_RESULT_MAX_CHARS]
 
@@ -375,11 +412,11 @@ class _Conn:
     loop inside `_run_conn`; this object is the synchronous handle the agent thread
     uses to call tools and to tear the connection down."""
 
-    def __init__(self, name: str, spec: dict, transport: str, portal: BlockingPortal):
+    def __init__(self, name: str, spec: _ServerSpec, transport: str, portal: BlockingPortal):
         self.name = name
         self.spec = spec
         self.transport = transport       # "stdio" | "http"
-        self.tools = []                  # SDK Tool objects (empty if connect failed)
+        self.tools: "list[Tool]" = []    # SDK Tool objects (empty if connect failed)
         self.error: Optional[str] = None         # human string if the server is unusable
         self.session: Optional["ClientSession"] = None  # live (loop thread); set on connect
         self.portal = portal             # the registry's, shared by every server
@@ -390,11 +427,9 @@ class _Conn:
     def call(self, raw: str, arguments: dict) -> str:
         """Invoke one tool and return its result text. Raises on transport/timeout
         error; a tool-reported error (is_error) is returned as text via _render_result."""
-        timeout = self.spec.get("timeout")
-        timeout = timeout if isinstance(timeout, (int, float)) else _CALL_TIMEOUT
         if self.session is None:
             raise RuntimeError(f"MCP server {self.name!r} is not connected")
-        res = self.portal.call(_invoke, self.session, raw, arguments, timeout)
+        res = self.portal.call(_invoke, self.session, raw, arguments, self.spec.timeout)
         return _render_result(res)
 
     def close(self):
@@ -416,7 +451,7 @@ class _Registry:
     portal loop. Holds the live connections plus a name -> (conn, tool) index for
     dispatch and a name -> schema/mutating index for validation."""
 
-    def __init__(self, cwd: str):
+    def __init__(self, cwd: str, sdk_error: Optional[str] = _SDK_ERROR):
         self.cwd = cwd
         self.clients = []                 # all _Conn (connected or errored)
         self.by_tool = {}                 # mcp__server__tool -> (conn, raw_tool_name)
@@ -428,27 +463,28 @@ class _Registry:
         self.warnings = []
         self.portal = None
         self._portal_cm = None
+        self._sdk_error = sdk_error       # why the SDK is unusable (the import guard's), or None
         self._connect()
 
     def _connect(self):
         servers, warnings = _load_config(self.cwd)
         self.warnings = list(warnings)
-        if _SDK_ERROR:
+        if self._sdk_error:
             # Unusable SDK: connect nothing, expose no tools, say so once in /mcp and the
             # warning footer. Configured servers are still read so the message only fires
             # for operators who actually have some.
             if servers:
                 self.warnings.append(
                     f"MCP disabled — the installed `mcp` SDK is not compatible with this "
-                    f"chad ({_SDK_ERROR}). Reinstall chad, or pin `mcp<2`.")
-                log.warning("mcp: SDK unusable, no servers connected: %s", _SDK_ERROR)
+                    f"chad ({self._sdk_error}). Reinstall chad, or pin `mcp<2`.")
+                log.warning("mcp: SDK unusable, no servers connected: %s", self._sdk_error)
             return
         trusted = _is_trusted(self.cwd)
 
         # Decide which servers we'll actually connect (after disabled/name/trust gates).
         to_connect = []
         for name, spec, scope in servers:
-            if spec.get("disabled"):
+            if spec.disabled:
                 log.info("mcp: %s disabled in config; skipping", name)
                 continue
             if _SEP in name:
@@ -463,7 +499,7 @@ class _Registry:
                 self.warnings.append(f"{name}: {reason}")
                 log.info("mcp: %s gated — project %s not trusted", name, self.cwd)
                 continue
-            if mcp_oauth.is_oauth(spec):
+            if spec.oauth:
                 # OAuth is opt-in and never auto-connects interactively. Flag off => skip
                 # entirely (no tools, warning). Flag on but no stored tokens => "needs
                 # login" (the operator runs /mcp login; we never block a turn/eval on a
@@ -475,8 +511,7 @@ class _Registry:
                     self.warnings.append(f"{name}: {reason}")
                     log.info("mcp: %s skipped — OAuth feature flag off", name)
                     continue
-                url = spec.get("url")
-                if not (isinstance(url, str) and url):
+                if not spec.url:
                     self.warnings.append(f"{name}: oauth server needs a 'url'")
                     continue
                 if not mcp_oauth.has_tokens(name):
@@ -486,7 +521,7 @@ class _Registry:
                     log.info("mcp: %s needs interactive OAuth login", name)
                     continue
                 storage = mcp_oauth.FileTokenStorage(name)
-                provider = mcp_oauth.make_noninteractive_provider(url, storage, spec.get("scope"))
+                provider = mcp_oauth.make_noninteractive_provider(spec.url, storage, spec.scope)
                 kind, build = _transport_for(spec, auth=provider)
                 to_connect.append((name, spec, kind, build))
                 continue
@@ -507,8 +542,7 @@ class _Registry:
         for name, spec, kind, build in to_connect:
             conn = _Conn(name, spec, kind, self.portal)
             self.clients.append(conn)
-            ct = spec.get("connect_timeout")
-            ct = ct if isinstance(ct, (int, float)) else _CONNECT_TIMEOUT
+            ct = spec.connect_timeout
             self.portal.start_task_soon(_run_conn, conn, build, ct)
             pending.append((conn, ct))
 
@@ -530,7 +564,7 @@ class _Registry:
                 self.warnings.append(f"{full}: duplicate tool name; later copy ignored")
                 continue
             schema = t.input_schema
-            if not isinstance(schema, dict) or schema.get("type") != "object":
+            if schema.get("type") != "object":
                 schema = {"type": "object", "properties": {}}
             self.by_tool[full] = (conn, raw)
             self._param[full] = schema
@@ -568,6 +602,38 @@ class _Registry:
     def tool_names(self):
         return list(self.by_tool)
 
+    def summary_lines(self):
+        """Human-readable rows for the `/mcp` command: one line per server (transport +
+        tool count, or its connection error), each server's tools, then any warnings."""
+        # `and not self.warnings`: a config that produced warnings but no connections
+        # (malformed file, unusable SDK, server with neither url nor command) is NOT "no
+        # servers configured" — that early-out would swallow the one message explaining why.
+        if not self.clients and not self.blocked and not self.needs_login and not self.warnings:
+            return ["no MCP servers configured. Add one to .mcp.json (project) or "
+                    "~/.chad/mcp.json (user): "
+                    '{"mcpServers": {"name": {"command": "...", "args": [...]}}} '
+                    'or {"name": {"type": "http", "url": "https://..."}}']
+        out = []
+        for c in self.clients:
+            if c.error:
+                out.append(f"{c.name} [{c.transport}] — ✗ {c.error}")
+                continue
+            ro = sum(1 for t in c.tools if not _is_mutating(t))
+            out.append(f"{c.name} [{c.transport}] — {len(c.tools)} tool(s) ({ro} read-only)")
+            for t in c.tools:
+                mark = "" if _is_mutating(t) else " (read-only)"
+                desc = " ".join((t.description or "").split())
+                if len(desc) > 70:
+                    desc = desc[:67] + "…"
+                out.append(f"    {PREFIX}{c.name}{_SEP}{t.name}{mark}"
+                           + (f" — {desc}" if desc else ""))
+        for name, reason in self.blocked:
+            out.append(f"{name} — ⊘ blocked ({reason})")
+        for name, reason in self.needs_login:
+            out.append(f"{name} [http/oauth] — ⊷ {reason}")
+        out += warn_footer(self.warnings)
+        return out
+
     def close(self):
         # Unwind every session on the loop thread first, then stop the loop itself.
         for c in self.clients:
@@ -581,24 +647,22 @@ class _Registry:
             self._portal_cm = None
 
 
-def _describe(server: str, tool) -> str:
+def _describe(server: str, tool: "Tool") -> str:
     """Tool description shown to the model, tagged with its origin server so the model
     (and the user reading a trace) knows it's an external MCP tool."""
-    desc = (getattr(tool, "description", None) or "").strip()
+    desc = (tool.description or "").strip()
     head = f"[MCP server '{server}'] "
     return head + desc if desc else head + tool.name
 
 
-def _is_mutating(tool) -> bool:
+def _is_mutating(tool: "Tool") -> bool:
     """Whether a tool needs the confirm gate. MCP `annotations.read_only_hint == true`
-    (readOnlyHint in mcp 1.x — a getattr on the old name would default None and every
-    read-only tool would silently start demanding confirmation; pinned by a test that
-    fails on the 1.x spelling) means the server promises no side effects -> safe to
+    (`readOnlyHint` on the wire and in mcp 1.x; pinned by a test that builds the tool
+    from camelCase wire JSON) means the server promises no side effects -> safe to
     auto-run; anything else is treated as mutating (the safe default: an MCP tool may
     write files, hit an API, or send a message, and we'd rather over-confirm than act
     unprompted)."""
-    ann = getattr(tool, "annotations", None)
-    if ann is not None and getattr(ann, "read_only_hint", None) is True:
+    if tool.annotations is not None and tool.annotations.read_only_hint is True:
         return False
     return True
 
@@ -640,13 +704,16 @@ def trust(cwd: str = None):
     reset_session()
 
 
-def login(name: str, emit=None) -> str:
+def login(name: str, emit=None, *, timeout: float = mcp_oauth._LOGIN_TIMEOUT,
+          open_browser: Callable[[str], bool] = webbrowser.open) -> str:
     """Run the interactive OAuth flow for one configured `auth: oauth` server, persist
     the resulting tokens, and reset the session so the server's tools come live. Wired to
     `/mcp login <server>` in both front-ends. `emit` is an optional callable(str) the
-    front-end passes so the browser URL / progress is shown in its own UI. Returns a
-    human-readable status line and NEVER raises into the caller — a failed/abandoned
-    login degrades to a clear message (the server simply stays unconnected).
+    front-end passes so the browser URL / progress is shown in its own UI. `timeout`
+    bounds the wait for the human's approval and `open_browser` shows them the approval
+    page (the system browser by default). Returns a human-readable status line and NEVER
+    raises into the caller — a failed/abandoned login degrades to a clear message (the
+    server simply stays unconnected).
 
     Why this is its own command (not auto-connect): the first OAuth connect opens a
     browser and blocks on a human approving, then catches a redirect. That cannot happen
@@ -660,17 +727,16 @@ def login(name: str, emit=None) -> str:
     spec = next((s for n, s, _scope in servers if n == name), None)
     if spec is None:
         return f"no MCP server named {name!r} in config."
-    if not mcp_oauth.is_oauth(spec):
+    if not spec.oauth:
         return f"{name} is not an OAuth server (no \"auth\": \"oauth\" in its config)."
-    url = spec.get("url")
-    if not (isinstance(url, str) and url):
+    if not spec.url:
         return f"{name}: oauth server needs a 'url'."
+    url, headers = spec.url, spec.headers
 
     storage = mcp_oauth.FileTokenStorage(name)
     loopback = mcp_oauth.LoopbackServer()
-    provider = mcp_oauth.make_login_provider(url, storage, loopback, spec.get("scope"), emit=say)
-    headers = spec.get("headers")
-    headers = headers if isinstance(headers, dict) else None
+    provider = mcp_oauth.make_login_provider(url, storage, loopback, spec.scope, emit=say,
+                                             timeout=timeout, open_browser=open_browser)
 
     async def _do_login():
         # initialize() triggers the SDK's OAuth flow (401 -> authorize -> browser ->
@@ -678,7 +744,7 @@ def login(name: str, emit=None) -> str:
         # the way. We only need the handshake to complete for that to happen.
         async with _http_transport(url, headers, provider) as streams:
             async with ClientSession(streams[0], streams[1]) as session:
-                with anyio.fail_after(mcp_oauth._LOGIN_TIMEOUT + 30):
+                with anyio.fail_after(timeout + 30):
                     await session.initialize()
 
     try:
@@ -706,7 +772,7 @@ def schemas():
 
 
 def is_mcp_tool(name: str) -> bool:
-    return isinstance(name, str) and name.startswith(PREFIX)
+    return name.startswith(PREFIX)
 
 
 def has_tool(name: str) -> bool:
@@ -732,35 +798,7 @@ def call(name: str, arguments: dict) -> str:
 def summary_lines():
     """Human-readable rows for the `/mcp` command: one line per server (transport +
     tool count, or its connection error), each server's tools, then any warnings."""
-    reg = service()
-    # `and not reg.warnings`: a config that produced warnings but no connections (malformed
-    # file, unusable SDK, server with neither url nor command) is NOT "no servers
-    # configured" — that early-out would swallow the one message explaining why.
-    if not reg.clients and not reg.blocked and not reg.needs_login and not reg.warnings:
-        return ["no MCP servers configured. Add one to .mcp.json (project) or "
-                "~/.chad/mcp.json (user): "
-                '{"mcpServers": {"name": {"command": "...", "args": [...]}}} '
-                'or {"name": {"type": "http", "url": "https://..."}}']
-    out = []
-    for c in reg.clients:
-        if c.error:
-            out.append(f"{c.name} [{c.transport}] — ✗ {c.error}")
-            continue
-        ro = sum(1 for t in c.tools if not _is_mutating(t))
-        out.append(f"{c.name} [{c.transport}] — {len(c.tools)} tool(s) ({ro} read-only)")
-        for t in c.tools:
-            mark = "" if _is_mutating(t) else " (read-only)"
-            desc = " ".join((getattr(t, "description", None) or "").split())
-            if len(desc) > 70:
-                desc = desc[:67] + "…"
-            out.append(f"    {PREFIX}{c.name}{_SEP}{t.name}{mark}"
-                       + (f" — {desc}" if desc else ""))
-    for name, reason in reg.blocked:
-        out.append(f"{name} — ⊘ blocked ({reason})")
-    for name, reason in reg.needs_login:
-        out.append(f"{name} [http/oauth] — ⊷ {reason}")
-    out += warn_footer(reg.warnings)
-    return out
+    return service().summary_lines()
 
 
 @atexit.register
