@@ -5,8 +5,9 @@ executing agent in yolo mode, platform capable, probe green); when any gate says
 tool_bash's spawn is byte-identical to the pre-seatbelt behavior. The profile is a
 deny-writes-outside-allowlist; the note appended on a detected denial is what keeps
 the model from retrying into the wall. Real sandbox application is exercised in the
-darwin-gated e2e at the bottom; everything else forces the gates so the suite passes
-on any platform (and inside CI/test sandboxes, where Seatbelt cannot nest).
+darwin-gated e2e at the bottom; everything else hands a Seatbelt a stand-in for
+sandbox-exec so the suite passes on any platform (and inside CI/test sandboxes, where
+Seatbelt cannot nest).
 """
 import os
 import subprocess
@@ -15,43 +16,45 @@ import pytest
 
 from chad import config, seatbelt, tools
 
-
-@pytest.fixture(autouse=True)
-def _reset_seatbelt(monkeypatch):
-    monkeypatch.setattr(seatbelt, "_ctx", {"active": False, "workspace": None})
-    monkeypatch.setattr(seatbelt, "_profiles", {})
-    monkeypatch.setattr(seatbelt, "_probe_result", None)
+_real_run = subprocess.run
 
 
-def _force_capable(monkeypatch, ok=True):
-    monkeypatch.setattr(seatbelt, "probe", lambda: ok)
+def _enforcing_run(argv):
+    """A sandbox-exec that enforces: only the allowed half of the probe's command
+    runs, so the allowed write lands and the denied one does not."""
+    _real_run(["/bin/sh", "-c", argv[-1].split(";")[0]], capture_output=True, check=False)
+
+
+def _capable():
+    """A Seatbelt whose probe comes back green on any platform."""
+    return seatbelt.Seatbelt(platform_ok=lambda: True, run=_enforcing_run)
 
 
 # -- wrap gating --------------------------------------------------------------
 
 def test_no_wrap_when_opted_out(monkeypatch):
     monkeypatch.setenv("CHAD_NO_SEATBELT", "1")
-    _force_capable(monkeypatch)
-    seatbelt.set_context(True, os.getcwd())
-    assert seatbelt.wrap_argv("echo hi") is None
+    sb = _capable()
+    sb.set_context(True, os.getcwd())
+    assert sb.wrap_argv("echo hi") is None
 
 
-def test_no_wrap_outside_yolo_context(monkeypatch):
-    _force_capable(monkeypatch)
-    seatbelt.set_context(False, None)
-    assert seatbelt.wrap_argv("echo hi") is None
+def test_no_wrap_outside_yolo_context():
+    sb = _capable()
+    sb.set_context(False, None)
+    assert sb.wrap_argv("echo hi") is None
 
 
-def test_no_wrap_when_probe_fails(monkeypatch):
-    _force_capable(monkeypatch, ok=False)
-    seatbelt.set_context(True, os.getcwd())
-    assert seatbelt.wrap_argv("echo hi") is None
+def test_no_wrap_when_probe_fails():
+    sb = seatbelt.Seatbelt(platform_ok=lambda: True, run=lambda argv: None)
+    sb.set_context(True, os.getcwd())
+    assert sb.wrap_argv("echo hi") is None
 
 
-def test_wrap_argv_shape(monkeypatch, tmp_path):
-    _force_capable(monkeypatch)
-    seatbelt.set_context(True, str(tmp_path))
-    argv = seatbelt.wrap_argv("echo hi > f.txt")
+def test_wrap_argv_shape(tmp_path):
+    sb = _capable()
+    sb.set_context(True, str(tmp_path))
+    argv = sb.wrap_argv("echo hi > f.txt")
     assert argv is not None
     assert argv[0] == seatbelt.SANDBOX_EXEC and argv[1] == "-f"
     # The shell is bash where one exists (process substitution is a syntax error
@@ -62,11 +65,11 @@ def test_wrap_argv_shape(monkeypatch, tmp_path):
         assert str(tmp_path.resolve()) in fh.read()
 
 
-def test_profile_cached_per_workspace(monkeypatch, tmp_path):
-    _force_capable(monkeypatch)
-    seatbelt.set_context(True, str(tmp_path))
-    a = seatbelt.wrap_argv("true")[2]
-    b = seatbelt.wrap_argv("false")[2]
+def test_profile_cached_per_workspace(tmp_path):
+    sb = _capable()
+    sb.set_context(True, str(tmp_path))
+    a = sb.wrap_argv("true")[2]
+    b = sb.wrap_argv("false")[2]
     assert a == b
 
 
@@ -144,12 +147,12 @@ def test_profile_checkpoints_denied_even_without_git_tier(tmp_path, monkeypatch)
 
 
 def test_profile_cache_distinguishes_git_tier(monkeypatch, tmp_path):
-    _force_capable(monkeypatch)
-    seatbelt.set_context(True, str(tmp_path))
+    sb = _capable()
+    sb.set_context(True, str(tmp_path))
     monkeypatch.setenv("CHAD_PROTECT_GIT", "1")
-    with_tier = seatbelt.wrap_argv("true")[2]
+    with_tier = sb.wrap_argv("true")[2]
     monkeypatch.delenv("CHAD_PROTECT_GIT")
-    without_tier = seatbelt.wrap_argv("true")[2]
+    without_tier = sb.wrap_argv("true")[2]
     assert with_tier != without_tier
     with open(with_tier, encoding="utf-8") as fh:
         assert str(tmp_path.resolve() / ".git") in fh.read()
@@ -166,49 +169,36 @@ def test_profile_plain_repo_no_carveout(tmp_path):
 # probe() must prove the profile DENIES, not merely that sandbox-exec runs: a
 # profile that fails open would otherwise report confinement it does not have.
 
-_real_run = subprocess.run
-
-
-def _probe_with(monkeypatch, fake_run):
-    monkeypatch.setattr(seatbelt, "available", lambda: True)
-    monkeypatch.setattr(seatbelt.subprocess, "run", fake_run)
-    return seatbelt.probe()
-
-
-def test_probe_rejects_non_enforcing_sandbox(monkeypatch, caplog):
+def test_probe_rejects_non_enforcing_sandbox(caplog):
     """sandbox-exec runs the command fine but enforces nothing (both writes land):
     the probe must come back False, loudly — this is the fail-open case."""
-    def fake(argv, **kw):
-        return _real_run(argv[-3:], capture_output=True, check=False)
+    def runs_everything(argv):
+        _real_run(argv[-3:], capture_output=True, check=False)
+    sb = seatbelt.Seatbelt(platform_ok=lambda: True, run=runs_everything)
     with caplog.at_level("ERROR", logger="chad"):
-        assert _probe_with(monkeypatch, fake) is False
+        assert sb.probe() is False
     assert any("FAILED to enforce" in r.getMessage() for r in caplog.records)
 
 
-def test_probe_rejects_sandbox_that_cannot_run(monkeypatch):
+def test_probe_rejects_sandbox_that_cannot_run():
     """Nothing executes at all (nested sandbox): neither write lands -> False."""
-    def fake(argv, **kw):
-        return subprocess.CompletedProcess(argv, 1)
-    assert _probe_with(monkeypatch, fake) is False
+    sb = seatbelt.Seatbelt(platform_ok=lambda: True, run=lambda argv: None)
+    assert sb.probe() is False
 
 
-def test_probe_accepts_enforcing_sandbox(monkeypatch):
-    """The allowed write lands and the denied one does not -> True. The fake
-    simulates enforcement by executing only the allowed half of the command."""
-    def fake(argv, **kw):
-        return _real_run(["/bin/sh", "-c", argv[-1].split(";")[0]],
-                         capture_output=True, check=False)
-    assert _probe_with(monkeypatch, fake) is True
+def test_probe_accepts_enforcing_sandbox():
+    """The allowed write lands and the denied one does not -> True."""
+    assert _capable().probe() is True
 
 
-def test_probe_result_is_cached(monkeypatch):
+def test_probe_result_is_cached():
     calls = []
-    def fake(argv, **kw):
+    def counting(argv):
         calls.append(argv)
-        return _real_run(["/bin/sh", "-c", argv[-1].split(";")[0]],
-                         capture_output=True, check=False)
-    assert _probe_with(monkeypatch, fake) is True
-    assert seatbelt.probe() is True
+        _enforcing_run(argv)
+    sb = seatbelt.Seatbelt(platform_ok=lambda: True, run=counting)
+    assert sb.probe() is True
+    assert sb.probe() is True
     assert len(calls) == 1
 
 
@@ -284,7 +274,7 @@ def test_bash_env_guard_end_to_end(monkeypatch):
 
 # -- the tool_bash seam -------------------------------------------------------
 
-def test_tool_bash_unwrapped_runs_plain_shell(monkeypatch):
+def test_tool_bash_unwrapped_runs_plain_shell():
     seatbelt.set_context(False, None)
     out = tools.tool_bash("echo plain")
     assert "plain" in out
@@ -308,7 +298,7 @@ def test_tool_bash_wrapped_clean_run_no_note(monkeypatch):
     assert "seatbelt:" not in out
 
 
-def test_unwrapped_denial_output_gets_no_note(monkeypatch):
+def test_unwrapped_denial_output_gets_no_note():
     """'Operation not permitted' from an UNSANDBOXED command (plain EPERM) must not
     be blamed on the seatbelt."""
     seatbelt.set_context(False, None)
@@ -321,19 +311,19 @@ def test_unwrapped_denial_output_gets_no_note(monkeypatch):
 # Gate on the real enforcement probe, not a permissive-profile smoke test: inside a
 # CI/harness sandbox a permissive profile can still apply while a deny profile fails
 # open — exactly the environment where these tests must skip, not fail.
-_can_sandbox = seatbelt.probe()
-seatbelt._probe_result = None  # leave module state pristine for the tests above
+_can_sandbox = seatbelt.Seatbelt().probe()
 
 
 @pytest.mark.skipif(not _can_sandbox, reason="Seatbelt cannot apply here")
-def test_e2e_denies_outside_write_allows_inside(tmp_path, monkeypatch):
-    seatbelt.set_context(True, str(tmp_path))
-    argv = seatbelt.wrap_argv(f"echo ok > {tmp_path}/in.txt")
+def test_e2e_denies_outside_write_allows_inside(tmp_path):
+    sb = seatbelt.Seatbelt()
+    sb.set_context(True, str(tmp_path))
+    argv = sb.wrap_argv(f"echo ok > {tmp_path}/in.txt")
     r = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert r.returncode == 0 and (tmp_path / "in.txt").read_text().strip() == "ok"
 
     probe = os.path.expanduser("~/chad_seatbelt_test_probe")
-    argv = seatbelt.wrap_argv(f"touch {probe}")
+    argv = sb.wrap_argv(f"touch {probe}")
     r = subprocess.run(argv, capture_output=True, text=True, check=False)
     try:
         assert r.returncode != 0
@@ -352,12 +342,13 @@ def test_e2e_enforcement_probe_green():
 def test_e2e_protect_git_denies_gitdir_write(tmp_path, monkeypatch):
     monkeypatch.setenv("CHAD_PROTECT_GIT", "1")
     (tmp_path / ".git").mkdir()
-    seatbelt.set_context(True, str(tmp_path))
-    argv = seatbelt.wrap_argv(f"touch {tmp_path}/.git/droppings")
+    sb = seatbelt.Seatbelt()
+    sb.set_context(True, str(tmp_path))
+    argv = sb.wrap_argv(f"touch {tmp_path}/.git/droppings")
     r = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert r.returncode != 0
     assert not (tmp_path / ".git" / "droppings").exists()
     # the workspace around it stays writable
-    argv = seatbelt.wrap_argv(f"echo ok > {tmp_path}/normal.txt")
+    argv = sb.wrap_argv(f"echo ok > {tmp_path}/normal.txt")
     r = subprocess.run(argv, capture_output=True, text=True, check=False)
     assert r.returncode == 0 and (tmp_path / "normal.txt").read_text().strip() == "ok"

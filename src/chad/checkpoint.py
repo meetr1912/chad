@@ -40,8 +40,6 @@ _DEFAULT_EXCLUDES = (".venv/\nvenv/\nnode_modules/\n__pycache__/\n*.pyc\n"
                      ".mypy_cache/\n.ruff_cache/\n.pytest_cache/\n.DS_Store\n"
                      ".env\n.env.*\n*.pem\n*.key\nid_rsa*\nid_ed25519*\n*.p12\n*.pfx\n")
 
-_swept = False  # the store lock-down and stale sweep run once per process
-
 
 def _history_root() -> str:
     # CHAD_CHECKPOINT_DIR: test/e2e override so suites never write real home state.
@@ -71,21 +69,21 @@ def _git(workspace: str, *args: str) -> subprocess.CompletedProcess:
                           timeout=_GIT_TIMEOUT_S, check=False)
 
 
-def _sync_excludes(workspace: str, sd: str) -> None:
-    """Bring the shadow's info/exclude up to _DEFAULT_EXCLUDES, so a shadow created
-    before a pattern existed gets it on its next snapshot. An exclude only keeps
-    *untracked* files out, so anything the shadow already tracks that now matches is
-    dropped from its index too; the workspace file itself is never touched."""
+def _sync_excludes(workspace: str, sd: str, excludes: str) -> None:
+    """Bring the shadow's info/exclude up to `excludes`, so a shadow created before a
+    pattern existed gets it on its next snapshot. An exclude only keeps *untracked*
+    files out, so anything the shadow already tracks that now matches is dropped from
+    its index too; the workspace file itself is never touched."""
     path = os.path.join(sd, "info", "exclude")
     try:
         with open(path, encoding="utf-8") as fh:
-            if fh.read() == _DEFAULT_EXCLUDES:
+            if fh.read() == excludes:
                 return
     except OSError:
         pass
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(_DEFAULT_EXCLUDES)
+        fh.write(excludes)
     tracked = _git(workspace, "ls-files", "-z", "--cached", "--ignored", "--exclude-standard")
     paths = [p for p in tracked.stdout.split("\0") if p]
     if tracked.returncode == 0 and paths:
@@ -94,7 +92,7 @@ def _sync_excludes(workspace: str, sd: str) -> None:
             log.warning("CHECKPOINT untracking excluded files failed: %s", r.stderr.strip())
 
 
-def _ensure_shadow(workspace: str) -> bool:
+def _ensure_shadow(workspace: str, excludes: str) -> bool:
     sd = shadow_dir(workspace)
     try:
         if not os.path.isdir(sd):
@@ -109,7 +107,7 @@ def _ensure_shadow(workspace: str) -> bool:
                 log.warning("CHECKPOINT shadow init failed: %s", r.stderr.strip())
                 return False
             os.chmod(sd, 0o700)
-        _sync_excludes(workspace, sd)
+        _sync_excludes(workspace, sd, excludes)
         return True
     except (OSError, subprocess.SubprocessError) as e:
         log.warning("CHECKPOINT shadow init failed: %s", e)
@@ -134,48 +132,65 @@ def _sweep_stale(root: str, keep: str, max_age_s: float = _MAX_AGE_S) -> None:
         pass
 
 
-def snapshot(workspace: str, label: str) -> Optional[str]:
-    """Commit the workspace state to the shadow repo; return the short hash, or
-    None if no checkpoint exists after the attempt. An unchanged tree is not a
-    failure — the previous snapshot already covers it, so its hash is returned."""
-    global _swept
-    try:
-        if not _ensure_shadow(workspace):
-            return None
-        sd = shadow_dir(workspace)
-        if not _swept:
-            _swept = True
-            root = _history_root()
-            try:
-                # makedirs applies its mode to the leaf only, and older stores are 0755
-                os.chmod(root, 0o700)
-            except OSError:
-                pass
-            _sweep_stale(root, keep=sd)
-        add = _git(workspace, "add", "-A")
-        if add.returncode != 0:
-            log.warning("CHECKPOINT add failed: %s", add.stderr.strip())
-            return None
-        commit = _git(workspace, "commit", "-q", "-m", label)
-        head = _git(workspace, "rev-parse", "--short", "HEAD")
-        if head.returncode != 0:
-            # Nothing staged AND no prior snapshot — an empty workspace's first
-            # checkpoint. Record the empty state anyway so the timeline exists.
-            commit = _git(workspace, "commit", "-q", "--allow-empty", "-m", label)
+class Snapshotter:
+    """Takes checkpoints whose shadows carry `excludes`. The store lock-down and the
+    stale sweep run on a snapshotter's first snapshot only; chad keeps one for the
+    whole process, so they run once per process."""
+
+    def __init__(self, excludes: str = _DEFAULT_EXCLUDES) -> None:
+        self.excludes = excludes
+        self._swept = False
+
+    def snapshot(self, workspace: str, label: str) -> Optional[str]:
+        """Commit the workspace state to the shadow repo; return the short hash, or
+        None if no checkpoint exists after the attempt. An unchanged tree is not a
+        failure — the previous snapshot already covers it, so its hash is returned."""
+        try:
+            if not _ensure_shadow(workspace, self.excludes):
+                return None
+            sd = shadow_dir(workspace)
+            if not self._swept:
+                self._swept = True
+                root = _history_root()
+                try:
+                    # makedirs applies its mode to the leaf only, and older stores are 0755
+                    os.chmod(root, 0o700)
+                except OSError:
+                    pass
+                _sweep_stale(root, keep=sd)
+            add = _git(workspace, "add", "-A")
+            if add.returncode != 0:
+                log.warning("CHECKPOINT add failed: %s", add.stderr.strip())
+                return None
+            commit = _git(workspace, "commit", "-q", "-m", label)
             head = _git(workspace, "rev-parse", "--short", "HEAD")
             if head.returncode != 0:
-                log.warning("CHECKPOINT commit failed: %s", commit.stderr.strip())
-                return None
-        # The sweep reads sd's mtime, which git does not reliably bump (most of its
-        # writes land in subdirectories), so mark the shadow used explicitly.
-        try:
-            os.utime(sd)
-        except OSError:
-            pass
-        return head.stdout.strip()
-    except (OSError, subprocess.SubprocessError) as e:
-        log.warning("CHECKPOINT snapshot failed: %s", e)
-        return None
+                # Nothing staged AND no prior snapshot — an empty workspace's first
+                # checkpoint. Record the empty state anyway so the timeline exists.
+                commit = _git(workspace, "commit", "-q", "--allow-empty", "-m", label)
+                head = _git(workspace, "rev-parse", "--short", "HEAD")
+                if head.returncode != 0:
+                    log.warning("CHECKPOINT commit failed: %s", commit.stderr.strip())
+                    return None
+            # The sweep reads sd's mtime, which git does not reliably bump (most of its
+            # writes land in subdirectories), so mark the shadow used explicitly.
+            try:
+                os.utime(sd)
+            except OSError:
+                pass
+            return head.stdout.strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("CHECKPOINT snapshot failed: %s", e)
+            return None
+
+
+_SNAPSHOTTER = Snapshotter()
+
+
+def snapshot(workspace: str, label: str) -> Optional[str]:
+    """Checkpoint the workspace with the process's snapshotter (see
+    Snapshotter.snapshot): the short hash, or None when no checkpoint exists."""
+    return _SNAPSHOTTER.snapshot(workspace, label)
 
 
 def snapshots(workspace: str, limit: int = 10) -> list:

@@ -4,8 +4,8 @@ Contract: the user's own .git is never opened or written; untracked-in-user-repo
 files ARE snapshotted (they're exactly what an edit can destroy); restore puts
 snapshotted content back but never deletes files created after the snapshot; every
 failure path returns a value instead of raising (an edit must not die because the
-checkpoint machinery hiccuped). The shadow lives under ~/.chad/history — pointed at
-a tmp HOME here so tests never touch the real one.
+checkpoint machinery hiccuped). The shadow store lives under CHAD_CHECKPOINT_DIR —
+pointed at a per-test tmp dir here so tests never touch the real ~/.chad/checkpoints.
 """
 import os
 import subprocess
@@ -21,8 +21,6 @@ def _own_checkpoint_dir(tmp_path, monkeypatch):
     # conftest already redirects CHAD_CHECKPOINT_DIR for the whole suite; pin it
     # here too so this file stands alone (its assertions depend on an empty root).
     monkeypatch.setenv("CHAD_CHECKPOINT_DIR", str(tmp_path / "ckpt"))
-    # Each test is a fresh process as far as the once-per-process lock-down and sweep go.
-    monkeypatch.setattr(checkpoint, "_swept", False)
 
 
 @pytest.fixture()
@@ -130,8 +128,8 @@ def test_restore_unknown_ref_is_a_message(ws):
 
 
 def test_snapshot_failure_returns_none(ws, monkeypatch):
-    monkeypatch.setattr(checkpoint, "shadow_dir",
-                        lambda _ws: "/dev/null/not/a/dir/shadow.git")
+    # A store root under a regular file: the shadow can never be created.
+    monkeypatch.setenv("CHAD_CHECKPOINT_DIR", "/dev/null/not/a/dir")
     assert checkpoint.snapshot(str(ws), "s") is None
 
 
@@ -152,7 +150,8 @@ def test_store_is_private_even_when_it_predates_the_lock_down(ws):
     finally:
         os.umask(old_umask)
     assert os.stat(root).st_mode & 0o777 == 0o755
-    assert checkpoint.snapshot(str(ws), "s1")
+    # A fresh snapshotter is a fresh process as far as the once-only lock-down goes.
+    assert checkpoint.Snapshotter().snapshot(str(ws), "s1")
     sd = checkpoint.shadow_dir(str(ws))
     for d in (root, os.path.dirname(sd), sd):
         assert os.stat(d).st_mode & 0o777 == 0o700, d
@@ -168,26 +167,23 @@ def test_secret_shaped_files_are_not_snapshotted(ws):
     assert not secrets & files
 
 
-def test_old_shadow_gets_new_excludes_and_stops_carrying_secrets(ws, monkeypatch):
+def test_old_shadow_gets_new_excludes_and_stops_carrying_secrets(ws):
     # A shadow made before the secret patterns existed has already committed .env. The
     # next snapshot rewrites info/exclude AND drops the file from the shadow's index (an
     # exclude alone never untracks), while the workspace copy stays put, even on /undo.
     (ws / ".env").write_text("TOKEN=x\n")
-    current = checkpoint._DEFAULT_EXCLUDES
-    monkeypatch.setattr(checkpoint, "_DEFAULT_EXCLUDES", "__pycache__/\n")
-    checkpoint.snapshot(str(ws), "old")
+    checkpoint.Snapshotter(excludes="__pycache__/\n").snapshot(str(ws), "old")
     assert ".env" in _tree(ws)
 
-    monkeypatch.setattr(checkpoint, "_DEFAULT_EXCLUDES", current)
     checkpoint.snapshot(str(ws), "new")
     with open(os.path.join(checkpoint.shadow_dir(str(ws)), "info", "exclude")) as fh:
-        assert fh.read() == current
+        assert fh.read() == checkpoint._DEFAULT_EXCLUDES
     assert ".env" not in _tree(ws)
     assert checkpoint.restore(str(ws)).startswith("restored")
     assert (ws / ".env").read_text() == "TOKEN=x\n"
 
 
-def test_sweep_removes_stale_shadows_but_never_the_one_being_written(tmp_path, monkeypatch):
+def test_sweep_removes_stale_shadows_but_never_the_one_being_written(tmp_path):
     stale, live = tmp_path / "stale", tmp_path / "live"
     for d in (stale, live):
         d.mkdir()
@@ -197,9 +193,8 @@ def test_sweep_removes_stale_shadows_but_never_the_one_being_written(tmp_path, m
     for d in (stale, live):
         os.utime(checkpoint.shadow_dir(str(d)), (old, old))
 
-    monkeypatch.setattr(checkpoint, "_swept", False)  # a later process
     (live / "f.py").write_text("y\n")
-    assert checkpoint.snapshot(str(live), "s2")
+    assert checkpoint.Snapshotter().snapshot(str(live), "s2")  # a later process
     assert not os.path.exists(os.path.dirname(checkpoint.shadow_dir(str(stale))))
     assert [r[2] for r in checkpoint.snapshots(str(live))] == ["s2", "s1"]
     # used just now, so the next process's sweep keeps it

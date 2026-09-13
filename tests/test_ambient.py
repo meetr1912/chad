@@ -54,9 +54,8 @@ def test_off_is_byte_identical(bare):
                                 "[exit 1]", "[exit 1]\n1 failed")
 
 
-def test_manifest_absent_when_off(bare, monkeypatch):
-    monkeypatch.setattr(ambient, "_build_manifest", lambda: "- present: gcc 13")
-    assert ambient.env_manifest() == ""
+def test_manifest_absent_when_off(bare):
+    assert ambient.env_manifest(lambda: "- present: gcc 13") == ""
     from chad.prompt import build_system_prompt
     assert "Environment manifest" not in build_system_prompt()
 
@@ -122,44 +121,36 @@ def test_zero_hit_grep_gets_definition_pointer(on, srcfile):
     assert "[file]" not in ok
 
 
-def test_def_pointer_is_memoized_per_identifier(on, srcfile, monkeypatch):
+def test_def_pointer_is_memoized_per_identifier(on, srcfile):
     """A repeated zero-hit grep reuses the session's answer instead of asking the
     tags service again; a fresh session asks again."""
-    from chad import repomap
     calls = []
-    real = repomap.RepoMap._find_defs
 
-    def counting(self, *a, **kw):
-        calls.append(a)
-        return real(self, *a, **kw)
+    def counting(ident, should_stop):
+        calls.append(ident)
+        return ambient._tags_lookup(ident, should_stop)
 
-    monkeypatch.setattr(repomap.RepoMap, "_find_defs", counting)
-    grep = {"command": "grep -rn beta src/"}
     for _ in range(2):
-        out = ambient.annotate("bash", grep, "[exit 1]")
-        assert "`beta` is defined at mod.py:5" in out
+        assert "`beta` is defined at mod.py:5" in ambient._def_pointer("beta", counting)
     assert len(calls) == 1
     ambient.reset()
-    ambient.annotate("bash", grep, "[exit 1]")
+    ambient._def_pointer("beta", counting)
     assert len(calls) == 2
 
 
-def test_def_pointer_past_its_budget_says_nothing(on, srcfile, monkeypatch):
+def test_def_pointer_past_its_budget_says_nothing(on, srcfile):
     """A lookup that outlasts its budget hands the result back without a pointer
     instead of stalling it, and never raises."""
     import time
 
-    from chad import repomap
-    monkeypatch.setattr(ambient, "_DEF_POINTER_BUDGET_S", 0.05)
-    real = repomap.RepoMap._code_files
-
-    def slow_walk(self, should_stop=None):
+    def slow_lookup(ident, should_stop):
         time.sleep(0.1)
-        return real(self)
+        return ambient._tags_lookup(ident, lambda: False)  # finishes, budget or not
 
-    monkeypatch.setattr(repomap.RepoMap, "_code_files", slow_walk)
-    out = ambient.annotate("bash", {"command": "grep -rn beta src/"}, "[exit 1]")
-    assert "is defined at" not in out
+    assert ambient._def_pointer("beta", slow_lookup, budget_s=0.05) == ""
+    # the same lookup inside its budget does find it
+    ambient.reset()
+    assert "is defined at" in ambient._def_pointer("beta", slow_lookup, budget_s=5.0)
 
 
 # ---------------------------------------------------------------------------
@@ -310,29 +301,25 @@ def test_baseline_needs_a_pre_edit_run_and_a_post_edit_failure(on):
 # env manifest (E1)
 # ---------------------------------------------------------------------------
 
-def test_manifest_content_and_prompt_block(on, monkeypatch):
+def _no_output(argv):
+    """A version probe that prints nothing, so every tool is reported unversioned."""
+    return ""
+
+
+def test_manifest_content_and_prompt_block(on):
     fake = {"python3": "/usr/bin/python3", "gcc": "/usr/bin/gcc",
             "apt-get": "/usr/bin/apt-get", "pip": "/usr/bin/pip"}
+    printed = {"python3": "Python 3.11.9", "gcc": "gcc (Ubuntu) 13.3.0",
+               "pip": "pip 24.0 from ..."}
 
-    def fake_run(argv, **kw):
-        class P:
-            stdout = {"python3": "Python 3.11.9", "gcc": "gcc (Ubuntu) 13.3.0",
-                      "pip": "pip 24.0 from ..."}.get(argv[0], "")
-            stderr = ""
-        return P()
-
-    # Scoped: `ambient.subprocess` IS the global module, and build_system_prompt
-    # below legitimately uses subprocess.run for the workspace snapshot.
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(ambient.shutil, "which", lambda t: fake.get(t))
-        mp.setattr(ambient.subprocess, "run", fake_run)
-        body = _REAL_BUILD_MANIFEST()
+    body = _REAL_BUILD_MANIFEST(which=fake.get, output=lambda argv: printed.get(argv[0], ""))
     assert "python3 3.11.9" in body and "gcc 13.3.0" in body
     assert "NOT installed: " in body and "cargo" in body and "docker" in body
     assert "package managers: apt-get, pip" in body
 
-    monkeypatch.setattr(ambient, "_build_manifest", lambda: body)
+    # The session's manifest, once built, is the one the system prompt carries.
     ambient.reset()
+    assert ambient.env_manifest(lambda: body) == body
     from chad.prompt import build_system_prompt
     prompt = build_system_prompt()
     assert "# Environment manifest" in prompt
@@ -340,60 +327,54 @@ def test_manifest_content_and_prompt_block(on, monkeypatch):
     assert "python3 3.11.9" in prompt
 
 
-def test_manifest_names_the_search_toolbox_and_its_holes(on, monkeypatch):
+def test_manifest_names_the_search_toolbox_and_its_holes(on):
     """The shell-first arm reads and searches with these binaries and nothing else, so
     whether `rg` is on the host is a fact about that arm's whole read path. Presence is
     reported without a version probe (the version is not what costs a turn), and a
     missing one is named — otherwise the first taught move, `rg -n`, exits 127 and the
     model spends a round trip discovering the host has plain grep."""
     present = {"grep", "sed", "awk", "find"}
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(ambient.shutil, "which",
-                   lambda t: "/usr/bin/x" if t in present else None)
-        mp.setattr(ambient, "_probe_version", lambda t: "")
-        body = _REAL_BUILD_MANIFEST()
+    body = _REAL_BUILD_MANIFEST(which=lambda t: "/usr/bin/x" if t in present else None,
+                                output=_no_output)
     line = next(l for l in body.splitlines() if l.startswith("- search/text:"))
     assert "grep · sed · awk · find" in line
     assert "NOT present: rg, jq" in line
 
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(ambient.shutil, "which",
-                   lambda t: "/usr/bin/x" if t in present | {"rg", "jq"} else None)
-        mp.setattr(ambient, "_probe_version", lambda t: "")
-        full = _REAL_BUILD_MANIFEST()
+    full = _REAL_BUILD_MANIFEST(
+        which=lambda t: "/usr/bin/x" if t in present | {"rg", "jq"} else None,
+        output=_no_output)
     line = next(l for l in full.splitlines() if l.startswith("- search/text:"))
     assert line == "- search/text: rg · grep · sed · awk · find · jq"
 
 
-def test_manifest_built_once_per_session(on, monkeypatch):
+def test_manifest_built_once_per_session(on):
     calls = []
-    monkeypatch.setattr(ambient, "_build_manifest",
-                        lambda: calls.append(1) or "- present: git 2.43")
-    assert ambient.env_manifest() == ambient.env_manifest()
+
+    def build():
+        calls.append(1)
+        return "- present: git 2.43"
+
+    assert ambient.env_manifest(build) == ambient.env_manifest(build)
     assert len(calls) == 1
 
 
-def test_manifest_alias_family_absence(on, monkeypatch):
+def test_manifest_alias_family_absence(on):
     """pip3-without-pip must not report 'NOT installed: pip' — absence is claimed
     only when the whole alias family is missing."""
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(ambient.shutil, "which",
-                   lambda t: "/usr/bin/x" if t in ("pip3", "python") else None)
-        mp.setattr(ambient, "_probe_version", lambda t: "")
-        body = _REAL_BUILD_MANIFEST()
+    body = _REAL_BUILD_MANIFEST(
+        which=lambda t: "/usr/bin/x" if t in ("pip3", "python") else None,
+        output=_no_output)
     assert "pip3" in body and "python" in body
     assert "NOT installed: gcc" in body
     for family in ("pip,", "pip\n", "python3"):
         assert family not in body.split("NOT installed:")[1].split("\n")[0] + "\n"
 
 
-def test_manifest_probe_survives_broken_tool(on, monkeypatch):
-    def boom(argv, **kw):
+def test_manifest_probe_survives_broken_tool(on):
+    def boom(argv):
         raise subprocess.TimeoutExpired(argv, 1.5)
-    monkeypatch.setattr(ambient.subprocess, "run", boom)
-    monkeypatch.setattr(ambient.shutil, "which",
-                        lambda t: "/usr/bin/x" if t in ("gcc", "apt-get") else None)
-    body = _REAL_BUILD_MANIFEST()
+    body = _REAL_BUILD_MANIFEST(
+        which=lambda t: "/usr/bin/x" if t in ("gcc", "apt-get") else None, output=boom)
     assert "gcc" in body  # present, just unversioned
 
 

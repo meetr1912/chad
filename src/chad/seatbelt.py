@@ -25,19 +25,13 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from typing import Optional
+from typing import Callable, Optional
 
 from . import config
 
 log = logging.getLogger("chad")
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
-
-# One-shot enforcement probe. Seatbelt profiles don't nest: when chad itself runs
-# inside a sandbox (CI, a harness container, another agent's shell tool),
-# sandbox-exec fails to apply and would turn EVERY yolo bash call into an error.
-# Probe once per process; on failure run unconfined (logged) rather than broken.
-_probe_result: Optional[bool] = None
 
 # The marker a denied write leaves in command output (EPERM strerror). Used by
 # tool_bash to detect that the profile bit and to append an explanation the model
@@ -48,73 +42,13 @@ DENIAL_NOTE = ("\n[seatbelt: a write outside the workspace was denied — yolo m
                "caches. Work inside the project, or ask the user to run this "
                "command themselves.]")
 
-_ctx: dict = {"active": False, "workspace": None}
-
-# profile path per workspace realpath — the profile embeds absolute paths, so it is
-# only reusable for the same workspace.
-_profiles: dict = {}
-
-
-def set_context(active: bool, workspace: Optional[str]) -> None:
-    """Called by the agent around each tool dispatch. `active` is 'the executing
-    agent is in yolo mode'; whether wrapping actually happens still depends on the
-    platform (see wrap_argv)."""
-    _ctx["active"] = active
-    _ctx["workspace"] = workspace
-
 
 def available() -> bool:
     return sys.platform == "darwin" and os.path.exists(SANDBOX_EXEC)
 
 
-def probe() -> bool:
-    """Does a sandbox applied from this process actually ENFORCE? Cached per process.
-
-    Running `sandbox-exec` successfully proves nothing about confinement: a profile
-    that fails open (OS version drift, a malformed rule) would leave every yolo
-    command reported as confined while writing anywhere it likes — a boundary that
-    lies is worse than no boundary. So the probe exercises both directions of a
-    real deny/allow profile against a throwaway directory pair: the allowed write
-    must land AND the denied write must not. A denied write that lands fails the
-    probe loudly; either failure means yolo bash runs unconfined (and says so)
-    rather than confined-in-name-only."""
-    global _probe_result
-    if _probe_result is not None:
-        return _probe_result
-    if not available():
-        _probe_result = False
-        return False
-    _probe_result = False
-    leaked = False
-    try:
-        with tempfile.TemporaryDirectory(prefix="chad-sb-probe-") as tmp:
-            # Seatbelt matches the KERNEL's view of a path: $TMPDIR is a symlink
-            # (/var/folders -> /private/var/folders), and an allow rule written
-            # against the symlinked spelling silently denies everything under it.
-            root = os.path.realpath(tmp)
-            allowed = os.path.join(root, "allowed")
-            denied = os.path.join(root, "denied")
-            os.mkdir(allowed)
-            os.mkdir(denied)
-            prof = ("(version 1)(allow default)(deny file-write*)"
-                    f'(allow file-write* (subpath "{_scheme_str(allowed)}"))')
-            cmd = (f"printf ok > {shlex.quote(os.path.join(allowed, 'w'))}; "
-                   f"printf no > {shlex.quote(os.path.join(denied, 'w'))}")
-            subprocess.run([SANDBOX_EXEC, "-p", prof, "/bin/sh", "-c", cmd],
-                           capture_output=True, timeout=10, check=False)
-            leaked = os.path.isfile(os.path.join(denied, "w"))
-            _probe_result = (not leaked
-                             and os.path.isfile(os.path.join(allowed, "w")))
-    except (OSError, subprocess.SubprocessError):
-        _probe_result = False
-    if leaked:
-        log.error("SEATBELT profile FAILED to enforce (a write that must be denied "
-                  "landed) — refusing a confinement that would only be claimed; "
-                  "yolo bash runs unconfined")
-    elif not _probe_result:
-        log.warning("SEATBELT unavailable here (nested sandbox or missing "
-                    "support) — yolo bash runs unconfined")
-    return _probe_result
+def _run_to_completion(argv: list[str]) -> None:
+    subprocess.run(argv, capture_output=True, timeout=10, check=False)
 
 
 def _scheme_str(path: str) -> str:
@@ -218,37 +152,133 @@ def profile_text(workspace: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _profile_path(workspace: str) -> str:
-    # Keyed on the git-protection tier as well as the workspace: the profile body
-    # differs, and lever state can change between calls within one process.
-    ws = os.path.realpath(workspace)
-    key = (ws, config.flag("CHAD_PROTECT_GIT"))
-    path = _profiles.get(key)
-    if path and os.path.exists(path):
+class Seatbelt:
+    """Confinement state: the executing agent's context, the enforcement probe's
+    verdict, and the profile written per workspace.
+
+    `platform_ok` answers whether sandbox-exec exists here at all; `run` executes an
+    argv to completion. The probe goes through both, and concludes only from what
+    that run left on disk."""
+
+    def __init__(self, platform_ok: Callable[[], bool] = available,
+                 run: Callable[[list[str]], None] = _run_to_completion) -> None:
+        self._platform_ok = platform_ok
+        self._run = run
+        self._active = False
+        self._workspace: Optional[str] = None
+        # One-shot enforcement probe. Seatbelt profiles don't nest: when chad itself
+        # runs inside a sandbox (CI, a harness container, another agent's shell tool),
+        # sandbox-exec fails to apply and would turn EVERY yolo bash call into an
+        # error. Probe once; on failure run unconfined (logged) rather than broken.
+        self._probe_result: Optional[bool] = None
+        # profile path per (workspace realpath, git tier) — the profile embeds
+        # absolute paths, so it is only reusable for the same workspace.
+        self._profiles: dict[tuple[str, bool], str] = {}
+
+    def set_context(self, active: bool, workspace: Optional[str]) -> None:
+        """`active` is 'the executing agent is in yolo mode'; whether wrapping
+        actually happens still depends on the platform (see wrap_argv)."""
+        self._active = active
+        self._workspace = workspace
+
+    def probe(self) -> bool:
+        """Does a sandbox applied from this process actually ENFORCE? Cached.
+
+        Running `sandbox-exec` successfully proves nothing about confinement: a profile
+        that fails open (OS version drift, a malformed rule) would leave every yolo
+        command reported as confined while writing anywhere it likes — a boundary that
+        lies is worse than no boundary. So the probe exercises both directions of a
+        real deny/allow profile against a throwaway directory pair: the allowed write
+        must land AND the denied write must not. A denied write that lands fails the
+        probe loudly; either failure means yolo bash runs unconfined (and says so)
+        rather than confined-in-name-only."""
+        if self._probe_result is None:
+            self._probe_result = self._enforces()
+        return self._probe_result
+
+    def _enforces(self) -> bool:
+        if not self._platform_ok():
+            return False
+        ok = False
+        leaked = False
+        try:
+            with tempfile.TemporaryDirectory(prefix="chad-sb-probe-") as tmp:
+                # Seatbelt matches the KERNEL's view of a path: $TMPDIR is a symlink
+                # (/var/folders -> /private/var/folders), and an allow rule written
+                # against the symlinked spelling silently denies everything under it.
+                root = os.path.realpath(tmp)
+                allowed = os.path.join(root, "allowed")
+                denied = os.path.join(root, "denied")
+                os.mkdir(allowed)
+                os.mkdir(denied)
+                prof = ("(version 1)(allow default)(deny file-write*)"
+                        f'(allow file-write* (subpath "{_scheme_str(allowed)}"))')
+                cmd = (f"printf ok > {shlex.quote(os.path.join(allowed, 'w'))}; "
+                       f"printf no > {shlex.quote(os.path.join(denied, 'w'))}")
+                self._run([SANDBOX_EXEC, "-p", prof, "/bin/sh", "-c", cmd])
+                leaked = os.path.isfile(os.path.join(denied, "w"))
+                ok = not leaked and os.path.isfile(os.path.join(allowed, "w"))
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+        if leaked:
+            log.error("SEATBELT profile FAILED to enforce (a write that must be denied "
+                      "landed) — refusing a confinement that would only be claimed; "
+                      "yolo bash runs unconfined")
+        elif not ok:
+            log.warning("SEATBELT unavailable here (nested sandbox or missing "
+                        "support) — yolo bash runs unconfined")
+        return ok
+
+    def _profile_path(self, workspace: str) -> str:
+        # Keyed on the git-protection tier as well as the workspace: the profile body
+        # differs, and lever state can change between calls within one process.
+        ws = os.path.realpath(workspace)
+        key = (ws, config.flag("CHAD_PROTECT_GIT"))
+        path = self._profiles.get(key)
+        if path and os.path.exists(path):
+            return path
+        fd, path = tempfile.mkstemp(prefix="chad-seatbelt-", suffix=".sb")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(profile_text(ws))
+        self._profiles[key] = path
+        log.info("SEATBELT profile for %s -> %s", ws, path)
         return path
-    fd, path = tempfile.mkstemp(prefix="chad-seatbelt-", suffix=".sb")
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(profile_text(ws))
-    _profiles[key] = path
-    log.info("SEATBELT profile for %s -> %s", ws, path)
-    return path
+
+    def wrap_argv(self, command: str) -> Optional[list[str]]:
+        """The argv to spawn `command` sandboxed, or None to run it unconfined.
+        None whenever the executing agent is not in yolo mode or the platform can't
+        do Seatbelt — tool_bash falls through to its normal shell=True spawn.
+        CHAD_NO_SEATBELT opts out entirely."""
+        if config.flag("CHAD_NO_SEATBELT"):
+            return None
+        if not self._active or not self.probe():
+            return None
+        workspace = self._workspace or os.getcwd()
+        try:
+            profile = self._profile_path(workspace)
+        except OSError as e:
+            # No profile means no confinement; in yolo that is the unsafe direction,
+            # but killing every bash call is worse — log loudly and run unconfined.
+            log.warning("SEATBELT profile write failed (%s) — running unconfined", e)
+            return None
+        return [SANDBOX_EXEC, "-f", profile, config.shell_path(), "-c", command]
 
 
-def wrap_argv(command: str) -> Optional[list]:
-    """The argv to spawn `command` sandboxed, or None to run it unconfined.
-    None whenever the executing agent is not in yolo mode or the platform can't
-    do Seatbelt — tool_bash falls through to its normal shell=True spawn.
-    CHAD_NO_SEATBELT opts out entirely."""
-    if config.flag("CHAD_NO_SEATBELT"):
-        return None
-    if not _ctx["active"] or not probe():
-        return None
-    workspace = _ctx["workspace"] or os.getcwd()
-    try:
-        profile = _profile_path(workspace)
-    except OSError as e:
-        # No profile means no confinement; in yolo that is the unsafe direction,
-        # but killing every bash call is worse — log loudly and run unconfined.
-        log.warning("SEATBELT profile write failed (%s) — running unconfined", e)
-        return None
-    return [SANDBOX_EXEC, "-f", profile, config.shell_path(), "-c", command]
+# The process's one confinement state: the agent sets its context, tool_bash asks it
+# for an argv, and the probe runs at most once per process.
+_SEATBELT = Seatbelt()
+
+
+def set_context(active: bool, workspace: Optional[str]) -> None:
+    """Called by the agent around each tool dispatch (see Seatbelt.set_context)."""
+    _SEATBELT.set_context(active, workspace)
+
+
+def probe() -> bool:
+    """Whether a sandbox applied from this process enforces (see Seatbelt.probe)."""
+    return _SEATBELT.probe()
+
+
+def wrap_argv(command: str) -> Optional[list[str]]:
+    """The argv to spawn `command` sandboxed, or None (see Seatbelt.wrap_argv)."""
+    return _SEATBELT.wrap_argv(command)

@@ -36,15 +36,15 @@ from collections import namedtuple
 # and the run errored out before the agent took a single step. Symbol
 # ranking is the only thing that actually needs it; `lang_for` and `_lang_tools` already
 # return None on any failure, so the rest of the toolset degrades cleanly instead.
+# Whether the bindings imported is decided once, here; a RepoMap built without them
+# detects no language and parses nothing, and never touches the unbound names.
 try:
     import tree_sitter_language_pack as tlp
     from tree_sitter import Parser, Query, QueryCursor
 except ImportError:  # pragma: no cover — exercised only on wheel-less platforms
-    # SAFETY: every dereference sits inside `lang_for`/`_lang_tools`, whose
-    # `except Exception` turns the error on a None sentinel into the same None the
-    # callers already handle for a language without a grammar.
-    tlp = None                              # type: ignore[assignment]
-    Parser = Query = QueryCursor = None     # type: ignore[assignment,misc]  # SAFETY: as tlp
+    HAVE_TREE_SITTER = False
+else:
+    HAVE_TREE_SITTER = True
 
 from . import config
 from .ignore import IGNORE_DIRS, REPOMAP_EXTRA
@@ -74,7 +74,7 @@ _CACHE_DIR = os.path.expanduser("~/.chad/cache/repomap")
 # file is dead bytes (a real dir reached 146 MB, two thirds of it failing the version check).
 _CACHE_MAX_BYTES = 256 * 1024**2
 _CACHE_MAX_AGE_S = 30 * 86400
-_SWEPT = False              # the dir is swept once per process, on the first save
+_SWEPT_DIRS: set[str] = set()  # each cache dir is swept once per process, on its first save
 
 _WORKER_SRC = """\
 import pickle, sys
@@ -261,15 +261,15 @@ def _unlink(path: str) -> None:
         pass
 
 
-def _sweep_cache_dir(keep: str, max_bytes: int = _CACHE_MAX_BYTES,
+def _sweep_cache_dir(cache_dir: str, keep: str, max_bytes: int = _CACHE_MAX_BYTES,
                      max_age_s: float = _CACHE_MAX_AGE_S) -> None:
-    """Delete cache files untouched for `max_age_s`, then the oldest until the dir
-    fits `max_bytes`. `keep` (the caller's own file) is never deleted but counts
-    toward the total. Best-effort, never raises."""
+    """Delete cache files in `cache_dir` untouched for `max_age_s`, then the oldest
+    until the dir fits `max_bytes`. `keep` (the caller's own file) is never deleted but
+    counts toward the total. Best-effort, never raises."""
     deadline = time.time() - max_age_s
     total, rest = 0, []
     try:
-        with os.scandir(_CACHE_DIR) as it:
+        with os.scandir(cache_dir) as it:
             entries = [e for e in it if e.name.endswith(".pkl")]
     except OSError:
         return
@@ -297,8 +297,11 @@ def _sweep_cache_dir(keep: str, max_bytes: int = _CACHE_MAX_BYTES,
 class RepoMap:
     """Tree-sitter symbol intelligence rooted at a project directory."""
 
-    def __init__(self, root: str = "."):
+    def __init__(self, root: str = ".", cache_dir: str = _CACHE_DIR,
+                 tree_sitter: bool = HAVE_TREE_SITTER):
         self.root = os.path.abspath(root)
+        self.cache_dir = cache_dir      # where the on-disk tags cache is kept
+        self.tree_sitter = tree_sitter  # False: no language is detected, nothing parsed
         self._tooling = {}   # lang -> (Parser, Query) | None
         self._cache = {}     # path -> (mtime, [defs], [(refname, rel, line)])
         self._files = None   # memoized completed _code_files() result; None = uncomputed
@@ -318,7 +321,7 @@ class RepoMap:
 
     def _cache_file(self) -> str:
         return os.path.join(
-            _CACHE_DIR, hashlib.sha256(self.root.encode()).hexdigest()[:16] + ".pkl")
+            self.cache_dir, hashlib.sha256(self.root.encode()).hexdigest()[:16] + ".pkl")
 
     def _cache_header(self) -> bytes:
         return (json.dumps({"v": _CACHE_VERSION, "tag_fields": list(Tag._fields),
@@ -342,10 +345,9 @@ class RepoMap:
         _unlink(path)  # stale, foreign, pre-header or corrupt
 
     def _save_disk_cache(self, keep):
-        global _SWEPT
         keep = set(keep)
         try:
-            os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
+            os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
             blob = pickle.dumps({p: e for p, e in self._cache.items() if p in keep},
                                 protocol=pickle.HIGHEST_PROTOCOL)
             tmp = self._cache_file() + ".tmp"
@@ -356,9 +358,9 @@ class RepoMap:
             os.replace(tmp, self._cache_file())
         except Exception:  # noqa: BLE001 - cache is an optimization, never a failure
             pass
-        if not _SWEPT:
-            _SWEPT = True
-            _sweep_cache_dir(self._cache_file())
+        if self.cache_dir not in _SWEPT_DIRS:
+            _SWEPT_DIRS.add(self.cache_dir)
+            _sweep_cache_dir(self.cache_dir, self._cache_file())
 
     # -- whole-repo extraction ---------------------------------------------
 
@@ -442,6 +444,8 @@ class RepoMap:
     # -- tree-sitter plumbing --------------------------------------------
 
     def lang_for(self, path):
+        if not self.tree_sitter:
+            return None
         try:
             return tlp.detect_language_from_path(path)
         except Exception:
@@ -450,6 +454,8 @@ class RepoMap:
     def _lang_tools(self, lang):
         """(Parser, tags-Query) for a language, lazily built and cached. Grammars
         download on first use; a language without a tags query yields None."""
+        if not self.tree_sitter:
+            return None
         if lang not in self._tooling:
             try:
                 language = tlp.get_language(lang)
