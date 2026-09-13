@@ -9,9 +9,7 @@ updates:
       prefix: ci
 
   # Python deps via uv (reads pyproject.toml + uv.lock). Grouped so a routine bump
-  # is one PR, not one-per-package. mlx/mlx-lm are intentionally upper-bounded in
-  # pyproject (the loader rides on a specific minor) — Dependabot will still open a
-  # PR when a new pin-compatible patch lands; review the loader before widening.
+  # is one PR, not one-per-package. mlx/mlx-lm are hand-gated: see the ignore list.
   - package-ecosystem: uv
     directory: "/"
     schedule:
@@ -23,17 +21,26 @@ updates:
       prefix: deps
     # These carry deliberate upper bounds in pyproject.toml, so a bump across the cap
     # can't resolve — Dependabot would otherwise reopen a red group PR every week.
-    # Patch bumps within the pinned line still flow; widen the cap by hand (after
-    # reviewing the loader / ABI) when you actually want the next minor.
+    # Widen a cap by hand (after re-gating the loader / ABI) when you actually want
+    # the next release.
     ignore:
-      # mlx / mlx-lm: <0.32 — the model loader rides on the 0.31 minor line.
+      # mlx: >=0.32.0,!=0.32.1,<=0.32.2 — every release in that range was admitted by
+      # hand, and patch bumps are ignored too because a patch is exactly how this broke
+      # before: 0.32.1 produced degenerate generations against chad's custom kernels
+      # (hotfixed in 2.0.1). No CI job measures generation quality, so a patch PR would
+      # look like any other green bump. Re-gate the point release, then widen the pin.
       - dependency-name: "mlx"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+        update-types:
+          ["version-update:semver-patch", "version-update:semver-minor", "version-update:semver-major"]
+      # mlx-lm: >=0.31.3,<0.32 — same hand-gated treatment; chad's loading rides on its
+      # qwen3_5/qwen3_5_moe loader, which a release can refactor without a signal here.
       - dependency-name: "mlx-lm"
-        update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # transformers: <5.13 — 5.13 regressed AutoTokenizer.register (import crash).
+        update-types:
+          ["version-update:semver-patch", "version-update:semver-minor", "version-update:semver-major"]
+      # transformers: >=5.0,<5.13 — 5.13 regressed AutoTokenizer.register (import crash).
       - dependency-name: "transformers"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
-      # numpy: <2 — the 2.0 ABI break isn't supported by the mlx dep tree yet.
+      # numpy: >=1.26,<3 — the 2.x line is verified end-to-end, so this rule now guards
+      # only the unreviewed 3.0 major.
       - dependency-name: "numpy"
         update-types: ["version-update:semver-major"]
