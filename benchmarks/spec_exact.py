@@ -54,7 +54,7 @@ def main(argv=None) -> int:
     eng.load()
     eng.temp, eng.top_p, eng.top_k = 0.0, 0.0, 0
     drafter = eng._dflash
-    wins = dict(getattr(mlx_qmm_mma, "_WINS", {}))
+    wins = mlx_qmm_mma.wins()
     print(f"drafter={'yes' if drafter else 'NO'} kv_bits={eng.kv_bits} "
           f"qmm_mma_shapes={len(wins)}", flush=True)
 

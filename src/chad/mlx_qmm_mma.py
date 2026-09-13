@@ -69,11 +69,12 @@ across same-shape weights so nothing stays cache-resident (the probe rotates acr
 the model's own layers, allocating nothing).
 """
 
+import importlib.metadata
 import json
 import os
 import platform
 import time
-from typing import TYPE_CHECKING, Optional, cast
+from typing import TYPE_CHECKING, Callable, Optional, cast
 
 from . import config
 from .diag import log
@@ -266,16 +267,22 @@ def qmm(x, wq, sc, bi, group_size: int, bits: int):
                                group_size=group_size, bits=bits)
 
 
+# The QuantizedLinear.__call__ this module installed, so a repeat install recognizes
+# its own patch instead of wrapping it a second time.
+_patched_call: Optional[Callable[..., "mx.array"]] = None
+
+
 def _install_patch() -> None:
     """Route every ``nn.QuantizedLinear`` through :func:`qmm` (class patch, once).
     Shapes outside the verified table fall straight through to the stock call."""
+    global _patched_call
     import mlx.nn as nn
-    if getattr(nn.QuantizedLinear.__call__, "_chad_qmm_mma", False):
+    if nn.QuantizedLinear.__call__ is _patched_call:
         return
     stock = nn.QuantizedLinear.__call__
 
     def call(self, x):
-        if not _WINS or getattr(self, "mode", "affine") != "affine" \
+        if not _WINS or self.mode != "affine" \
                 or "biases" not in self or self["weight"].ndim != 2:
             return stock(self, x)
         y = qmm(x, self["weight"], self["scales"], self["biases"],
@@ -284,11 +291,10 @@ def _install_patch() -> None:
             y = y + self["bias"]
         return y
 
-    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
-    # does not declare them), and nn.QuantizedLinear is a plain Python class, so the
-    # method is reassignable in place; only the stubs say otherwise.
-    call._chad_qmm_mma = True  # type: ignore[attr-defined]
+    # SAFETY: nn.QuantizedLinear is a plain Python class, so the method is reassignable
+    # in place; only the stubs say otherwise.
     nn.QuantizedLinear.__call__ = call  # type: ignore[method-assign]  # SAFETY: plain class
+    _patched_call = call
 
 
 # ------------------------------------------------------------------ calibration
@@ -334,7 +340,7 @@ def _eligible_groups(*models) -> dict:
             continue
         for _, mod in model.named_modules():
             if (isinstance(mod, nn.QuantizedLinear)
-                    and getattr(mod, "mode", "affine") == "affine"
+                    and mod.mode == "affine"
                     and "biases" in mod):
                 add(mod["weight"], mod["scales"], mod["biases"], mod.group_size, mod.bits)
             if hasattr(mod, "_fused_w"):
@@ -349,8 +355,12 @@ def _cache_key() -> str:
         chip = mx.device_info().get("device_name", "metal")
     except Exception:  # noqa: BLE001
         chip = platform.machine()
-    # getattr: the mlx stubs omit __version__; the attribute exists at runtime
-    ver = getattr(mx, "__version__", "?")
+    # The installed distribution's version: the same string mlx.core.__version__
+    # carries, local-build '+<sha>' segment included.
+    try:
+        ver = importlib.metadata.version("mlx")
+    except importlib.metadata.PackageNotFoundError:
+        ver = "?"
     return f"{chip}-mlx{ver}-k{_KERNEL_VERSION}".replace(" ", "_").replace("/", "_")
 
 
@@ -473,6 +483,12 @@ def disable() -> None:
     """Drop the win table: every call falls through to the stock kernel (the
     class patch stays, inert). For A/B arms and tests."""
     _WINS.clear()
+
+
+def wins() -> dict:
+    """A copy of the verified dispatch table, {(K, N, bits): m_min}; empty while the
+    kernel is disengaged."""
+    return dict(_WINS)
 
 
 def set_wins(wins: Optional[dict]) -> None:

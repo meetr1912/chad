@@ -194,7 +194,6 @@ def test_warm_verify_widths_only_warms_dispatchable_widths(monkeypatch):
         seen["widths"] = sorted(widths)
         return len(seen["widths"])
 
-    monkeypatch.setattr(mlx_qsdpa, "warm_widths", _fake_warm)
     monkeypatch.setenv("CHAD_USE_PLD", "1")
 
     eng = object.__new__(Engine)
@@ -210,7 +209,7 @@ def test_warm_verify_widths_only_warms_dispatchable_widths(monkeypatch):
     eng.pld_wide_min_draft = 8
     eng.model = _StubParams()
 
-    eng._warm_verify_widths()
+    eng._warm_verify_widths(warm=_fake_warm)
 
     cap = mlx_qsdpa._wide_s_max(6)
     assert seen["widths"], "nothing warmed"

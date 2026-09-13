@@ -29,7 +29,6 @@ pytest.importorskip("mlx_lm")
 
 from mlx_lm.models import cache as cache_utils  # noqa: E402
 
-from chad import engine as eng_mod  # noqa: E402
 from test_engine_pld_hybrid import (  # noqa: E402
     BOGUS,
     N_TOKENS,
@@ -68,14 +67,10 @@ def _run(mode, model, reference, stop_condition=None):
             return list(actual[:2]) + [BOGUS] * (num_draft - 2), ngram_max
         return [BOGUS] * num_draft, ngram_max
 
-    real = eng_mod.prompt_lookup_draft_arr
-    eng_mod.prompt_lookup_draft_arr = fake_lookup
-    try:
-        eng = _wide_engine(model)
-        text, stats = eng._generate_pld_wide(PROMPT, N_TOKENS, None, None,
-                                             stop_condition=stop_condition)
-    finally:
-        eng_mod.prompt_lookup_draft_arr = real
+    eng = _wide_engine(model)
+    text, stats = eng._generate_pld_wide(PROMPT, N_TOKENS, None, None,
+                                         stop_condition=stop_condition,
+                                         lookup=fake_lookup)
     return [int(t) for t in text.split()], stats
 
 
@@ -164,11 +159,13 @@ def test_lazy_to_span_entry_is_bit_exact(tiny):
     assert got == ref, f"diverged at {_diverge(ref, got)}"
 
 
-def test_raising_callback_on_the_pipelined_path_keeps_the_turn_cached(tiny, monkeypatch):
+def test_raising_callback_on_the_pipelined_path_keeps_the_turn_cached(tiny):
     """On the cold pipelined path a callback runs while the next forward is already in
     flight. When it raises, the ledger must still match the cache, so the next turn
     extends this one bit-exactly."""
-    monkeypatch.setattr(eng_mod, "prompt_lookup_draft_arr", lambda *a: ([], 0))
+    def no_match(*a):
+        return [], 0
+
     eng = _wide_engine(tiny)
     emitted = []
 
@@ -178,11 +175,11 @@ def test_raising_callback_on_the_pipelined_path_keeps_the_turn_cached(tiny, monk
             raise RuntimeError("ui died")
 
     with pytest.raises(RuntimeError, match="ui died"):
-        eng._generate_pld_wide(PROMPT, N_TOKENS, on_token, None)
+        eng._generate_pld_wide(PROMPT, N_TOKENS, on_token, None, lookup=no_match)
     offsets = [c.offset for c in eng._cache if isinstance(c, cache_utils.KVCache)]
     assert offsets and all(o == len(eng._cached_ids) for o in offsets)
     assert len(eng._cached_ids) > len(PROMPT)          # kept, not dropped
     prompt2 = list(PROMPT) + [int(t) for t in "".join(emitted).split()] + [17, 18, 19]
     ref2 = _greedy(tiny, prompt2, 12)
-    text2, _ = eng._generate_pld_wide(prompt2, 12, None, None)
+    text2, _ = eng._generate_pld_wide(prompt2, 12, None, None, lookup=no_match)
     assert [int(t) for t in text2.split()] == ref2

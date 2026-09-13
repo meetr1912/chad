@@ -33,12 +33,13 @@ attention + quantized swiglu MLP). Anything unexpected → install() is a silent
 no-op (stock behavior). Opt out with CHAD_NO_FASTPATH=1.
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from . import config, mlx_qmm_mma
 from .diag import log
 
 if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
+    import mlx.core as mx
     import mlx.nn as nn
 
 
@@ -75,32 +76,36 @@ def _looks_like_hybrid_dense(model) -> bool:
     """True only for the qwen3_5 DENSE hybrid (Qwen3.8-27B class): per-layer
     [GDN|attention] + a plain quantized swiglu MLP, no experts anywhere."""
     import mlx.nn as nn
-    from mlx_lm.models.qwen3_5 import MLP as DenseMLP
-    from mlx_lm.models.qwen3_5 import GatedDeltaNet
+    from mlx_lm.models import qwen3_5 as q35
 
-    layers = getattr(getattr(getattr(model, "language_model", None), "model", None),
-                     "layers", None)
+    if not isinstance(model, q35.Model):
+        return False
+    layers = model.language_model.model.layers
     if not layers:
         return False
     saw_gdn = saw_attn = False
+    first: Optional[list[nn.QuantizedLinear]] = None   # layer 0's gate, up, down
     for layer in layers:
-        mlp = getattr(layer, "mlp", None)
-        if not isinstance(mlp, DenseMLP):
+        mlp = layer.mlp
+        if not isinstance(mlp, q35.MLP):
             return False
-        for name in ("gate_proj", "up_proj", "down_proj"):
-            m = getattr(mlp, name, None)
-            if not isinstance(m, nn.QuantizedLinear) or hasattr(m, "bias"):
-                return False
+        projs = [m for m in (mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+                 if isinstance(m, nn.QuantizedLinear) and not hasattr(m, "bias")]
+        if len(projs) != 3:
+            return False
+        if first is None:
+            first = projs
         if layer.is_linear:
-            if not isinstance(layer.linear_attn, GatedDeltaNet):
+            if not isinstance(layer.linear_attn, q35.GatedDeltaNet):
                 return False
             saw_gdn = True
         else:
             saw_attn = True
     # gate|up must agree on quant params to concat
-    m0 = layers[0].mlp
-    if (m0.gate_proj.bits != m0.up_proj.bits
-            or m0.gate_proj.group_size != m0.up_proj.group_size):
+    if first is None:
+        return False
+    gate0, up0 = first[0], first[1]
+    if gate0.bits != up0.bits or gate0.group_size != up0.group_size:
         return False
     return saw_gdn and saw_attn
 
@@ -129,15 +134,23 @@ def _concat_dense_gate_up(model) -> None:
     _patch_dense_mlp_call()
 
 
+# The methods this module installed over mlx_lm's classes, so a repeat install
+# recognizes its own patch instead of wrapping it a second time.
+_mlp_call: Optional[Callable[..., "mx.array"]] = None
+_gdn_call: Optional[Callable[..., "mx.array"]] = None
+_layer_call: Optional[Callable[..., "mx.array"]] = None
+
+
 def _patch_dense_mlp_call() -> None:
     """Replace the dense MLP __call__ with the fused-concat version (all S).
     The class is shared with qwen3_next models; foreign instances (no _fused_w)
     take the stock path."""
+    global _mlp_call
     import mlx.core as mx
     from mlx_lm.models import qwen3_5 as q35
     from mlx_lm.models.qwen3_next import swiglu
 
-    if getattr(q35.MLP.__call__, "_chad_fastpath", False):
+    if q35.MLP.__call__ is _mlp_call:
         return
     stock_call = q35.MLP.__call__
 
@@ -151,11 +164,10 @@ def _patch_dense_mlp_call() -> None:
         g, u = mx.split(gu, 2, axis=-1)
         return self.down_proj(swiglu(g, u))
 
-    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
-    # does not declare them), and mlx_lm's classes are plain Python, so the method is
-    # reassignable in place; only the stubs say otherwise.
-    fused_call._chad_fastpath = True  # type: ignore[attr-defined]
+    # SAFETY: mlx_lm's classes are plain Python, so the method is reassignable in
+    # place; only the stubs say otherwise.
     q35.MLP.__call__ = fused_call  # type: ignore[method-assign]  # SAFETY: plain class
+    _mlp_call = fused_call
 
 
 def _concat_gdn_in_projs(model) -> None:
@@ -201,11 +213,12 @@ GDN_COLLECTOR = None
 def _patch_gdn_call() -> None:
     """Stock-graph GDN forward using the fused in_proj (used for S>1; the S==1
     decode path is replaced again by the compiled step in _install_layer_fastpath)."""
+    global _gdn_call
     import mlx.core as mx
     import mlx.nn as nn
     from mlx_lm.models import qwen3_5 as q35
 
-    if getattr(q35.GatedDeltaNet.__call__, "_chad_fastpath", False):
+    if q35.GatedDeltaNet.__call__ is _gdn_call:
         return
     stock_call = q35.GatedDeltaNet.__call__
 
@@ -272,17 +285,17 @@ def _patch_gdn_call() -> None:
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
 
-    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
-    # does not declare them), and mlx_lm's classes are plain Python, so the method is
-    # reassignable in place; only the stubs say otherwise.
-    call._chad_fastpath = True  # type: ignore[attr-defined]
+    # SAFETY: mlx_lm's classes are plain Python, so the method is reassignable in
+    # place; only the stubs say otherwise.
     q35.GatedDeltaNet.__call__ = call  # type: ignore[method-assign]  # SAFETY: plain class
+    _gdn_call = call
 
 
 def _install_layer_fastpath(model) -> None:
     """Per-layer compiled decode step (S==1 only): norms+residuals+block bodies
     fold into one compiled call for the MLP and one for the GDN. Prefill and
     any unexpected cache state fall back to the stock DecoderLayer body."""
+    global _layer_call
     from mlx_lm.models import qwen3_5 as q35
 
     for layer in model.language_model.model.layers:
@@ -293,7 +306,7 @@ def _install_layer_fastpath(model) -> None:
         if layer.is_linear and hasattr(layer.linear_attn, "_fused_w"):
             layer._gdn_fast = _compile_gdn_step(layer)
 
-    if getattr(q35.DecoderLayer.__call__, "_chad_fastpath", False):
+    if q35.DecoderLayer.__call__ is _layer_call:
         return
     stock_layer_call = q35.DecoderLayer.__call__
 
@@ -324,11 +337,10 @@ def _install_layer_fastpath(model) -> None:
         # equal-speed options.
         return stock_layer_call(self, x, mask=mask, cache=cache)
 
-    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
-    # does not declare them), and mlx_lm's classes are plain Python, so the method is
-    # reassignable in place; only the stubs say otherwise.
-    layer_call._chad_fastpath = True  # type: ignore[attr-defined]
+    # SAFETY: mlx_lm's classes are plain Python, so the method is reassignable in
+    # place; only the stubs say otherwise.
     q35.DecoderLayer.__call__ = layer_call  # type: ignore[method-assign]  # SAFETY: plain class
+    _layer_call = layer_call
 
 
 def _compile_gdn_step(layer):

@@ -135,6 +135,7 @@ def test_prefill_progress_callback():
 
     def _make_engine(forward_shapes):
         eng = object.__new__(Engine)  # bypass __init__ (no weights to load)
+        eng._cached_ids = []                # cold: nothing resident yet
         eng._cache = [_FakeCacheItem(), _FakeCacheItem()]
         eng.model = lambda arr, cache=None: forward_shapes.append(int(arr.shape[1]))
         return eng
@@ -1062,7 +1063,12 @@ def _plain_generate_engine(resets):
     eng._cached_ids = []
     eng._sync_to = lambda ids: len(eng._cached_ids)
     eng._prefill = lambda ids, *a, **k: len(ids)
-    eng._reset_cache = lambda: (resets.append(1), setattr(eng, "_cached_ids", []))
+
+    def _reset_cache():
+        resets.append(1)
+        eng._cached_ids = []
+
+    eng._reset_cache = _reset_cache
     return eng
 
 

@@ -8,37 +8,27 @@ the engine keeps two checkpoints: the FULL prefix (same project -> zero prefill)
 static HEAD, the tool schemas + behavioral prompt that are byte-identical in every
 project (any project -> restore the head, prefill only the per-project tail).
 
-Engine tests drive `Engine.warm_prefix` with a fake cache/checkpoint store (no weights);
-agent tests prove `_static_head_ids` is identical across two different directories.
+Engine tests drive `Engine.warm_prefix` with no weights, over real mlx_lm KV caches and
+real checkpoint files: a stand-in `_prefill` stores each token id in the cache as its
+key, so a layer's contents name exactly the tokens resident in it. Agent tests prove
+`_static_head_ids` is identical across two different directories.
 """
 import json
 import os
 import types
 
+import pytest
+
 from chad import engine as E
 
 # --------------------------------------------------------------------------- engine
 
-def _engine(tmp_path, monkeypatch, store):
-    """An Engine with no weights: the cache is two layer-dicts that record the token ids
-    fed into them, checkpoints live in `store` (path -> deep copy) plus a marker file so
-    `os.path.isfile` sees them, and `_prefill` feeds 4-token chunks honouring
-    should_stop between chunks, like the real one."""
-    def make_cache(model):
-        return [{"ids": []}, {"ids": []}]
-
-    def save(path, cache):
-        store[path] = [dict(ids=list(c["ids"])) for c in cache]
-        open(path, "w").write("ckpt")
-
-    def load(path):
-        return [dict(ids=list(c["ids"])) for c in store[path]]
-
-    monkeypatch.setattr(E.cache_utils, "make_prompt_cache", make_cache)
-    monkeypatch.setattr(E.cache_utils, "save_prompt_cache", save)
-    monkeypatch.setattr(E.cache_utils, "load_prompt_cache", load)
-    monkeypatch.setattr(E.cache_utils, "can_trim_prompt_cache", lambda c: False)
-    monkeypatch.setattr(E, "enforce_cache_budget", lambda *a, **k: 0)
+def _engine(tmp_path):
+    """An Engine with no weights over two real KVCache layers, checkpointing into
+    `tmp_path`. `_prefill` feeds 4-token chunks honouring should_stop between chunks,
+    like the real one, and writes each token id into every layer as its key."""
+    mx = pytest.importorskip("mlx.core")
+    pytest.importorskip("mlx_lm")
 
     eng = object.__new__(E.Engine)
     eng.model_id = "test-model"
@@ -46,11 +36,9 @@ def _engine(tmp_path, monkeypatch, store):
     eng.cache_dir = str(tmp_path)
     eng.kv_cache_max_bytes = 0
     eng.model = types.SimpleNamespace(layers=[0, 1])
-    eng._cache = make_cache(None)
-    eng._cached_ids = []
     eng._warm_prefix_ids = None
     eng._warm_head_ids = None
-    eng._rewind_snap = None
+    eng._reset_cache()
     eng.fed = []                       # every _prefill call's ids, in order
 
     def _prefill(ids, should_stop=None, chunk=None, on_progress=None, on_chunk=None):
@@ -60,8 +48,9 @@ def _engine(tmp_path, monkeypatch, store):
             if should_stop and should_stop():
                 break
             piece = ids[done:done + 4]
+            kv = mx.array(piece, dtype=mx.float32).reshape(1, 1, len(piece), 1)
             for layer in eng._cache:
-                layer["ids"].extend(piece)
+                layer.update_and_fetch(kv, kv)
             done += len(piece)
         eng.fed.append(ids[:done])
         return done
@@ -70,87 +59,93 @@ def _engine(tmp_path, monkeypatch, store):
     return eng
 
 
+def _ids(layer):
+    """The token ids resident in one KV layer of an `_engine` cache."""
+    if not layer.offset:
+        return []
+    keys, _ = layer.state
+    return [int(v) for v in keys[0, 0, :, 0].tolist()]
+
+
+def _ckpt_ids(path):
+    """The token ids a checkpoint file holds, read back through mlx_lm's own loader."""
+    return _ids(E.cache_utils.load_prompt_cache(path)[0])
+
+
 HEAD = list(range(100, 112))           # tool schemas + behavioral prompt (12 tokens)
 TAIL_A = [1, 2, 3, 4, 5, 6]            # project A's cwd / listing / docs
 TAIL_B = [7, 8, 9, 10, 11]             # project B's
 
 
-def test_cold_miss_persists_head_and_full(tmp_path, monkeypatch):
-    store = {}
-    eng = _engine(tmp_path, monkeypatch, store)
+def test_cold_miss_persists_head_and_full(tmp_path):
+    eng = _engine(tmp_path)
     status, n = eng.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
     assert (status, n) == ("miss", len(HEAD) + len(TAIL_A))
     assert eng.fed == [HEAD, TAIL_A]                 # head first, then the tail
     assert eng._cached_ids == HEAD + TAIL_A
-    assert eng._cache[0]["ids"] == HEAD + TAIL_A
+    assert _ids(eng._cache[0]) == HEAD + TAIL_A
     assert eng._warm_prefix_ids == HEAD + TAIL_A and eng._warm_head_ids == HEAD
     head_path, full_path = eng._ckpt_path(HEAD), eng._ckpt_path(HEAD + TAIL_A)
     assert os.path.isfile(head_path) and os.path.isfile(full_path)
-    assert store[head_path][0]["ids"] == HEAD        # the head file holds ONLY the head
-    assert store[full_path][0]["ids"] == HEAD + TAIL_A
+    assert _ckpt_ids(head_path) == HEAD              # the head file holds ONLY the head
+    assert _ckpt_ids(full_path) == HEAD + TAIL_A
 
 
-def test_fresh_directory_is_a_partial_hit(tmp_path, monkeypatch):
+def test_fresh_directory_is_a_partial_hit(tmp_path):
     # THE fix: a second project shares nothing with the first except the head, and
     # before 2.0.3 that meant a full cold prefill. Now it restores the head and
     # prefills only its own tail.
-    store = {}
-    first = _engine(tmp_path, monkeypatch, store)
+    first = _engine(tmp_path)
     first.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
 
-    eng = _engine(tmp_path, monkeypatch, store)
+    eng = _engine(tmp_path)
     status, n = eng.warm_prefix(HEAD + TAIL_B, head_ids=HEAD)
     assert (status, n) == ("partial", len(HEAD))
     assert eng.fed == [TAIL_B]                       # only the tail was prefilled
-    assert eng._cache[0]["ids"] == HEAD + TAIL_B     # head from disk + tail fed
+    assert _ids(eng._cache[0]) == HEAD + TAIL_B      # head from disk + tail fed
     assert eng._cached_ids == HEAD + TAIL_B
     assert eng._warm_prefix_ids == HEAD + TAIL_B
     # and project B's full prefix is now checkpointed too: its next session is a hit
     assert os.path.isfile(eng._ckpt_path(HEAD + TAIL_B))
 
 
-def test_same_project_is_a_full_hit(tmp_path, monkeypatch):
-    store = {}
-    first = _engine(tmp_path, monkeypatch, store)
+def test_same_project_is_a_full_hit(tmp_path):
+    first = _engine(tmp_path)
     first.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
-    eng = _engine(tmp_path, monkeypatch, store)
+    eng = _engine(tmp_path)
     status, n = eng.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
     assert (status, n) == ("hit", len(HEAD) + len(TAIL_A))
     assert eng.fed == []                             # zero prefill
-    assert eng._cache[0]["ids"] == HEAD + TAIL_A
+    assert _ids(eng._cache[0]) == HEAD + TAIL_A
 
 
-def test_head_that_is_not_a_prefix_is_ignored(tmp_path, monkeypatch):
-    store = {}
-    eng = _engine(tmp_path, monkeypatch, store)
+def test_head_that_is_not_a_prefix_is_ignored(tmp_path):
+    eng = _engine(tmp_path)
     status, n = eng.warm_prefix(HEAD + TAIL_A, head_ids=[999, 998])
     assert (status, n) == ("miss", len(HEAD) + len(TAIL_A))
     assert eng.fed == [HEAD + TAIL_A]                # one plain prefill, as before
     assert not os.path.isfile(eng._ckpt_path([999, 998]))
     # so is a "head" that is the whole prefix (nothing to gain from a second tier)
-    eng2 = _engine(tmp_path, monkeypatch, {})
+    eng2 = _engine(tmp_path / "fresh")
     eng2.warm_prefix(HEAD + TAIL_A, head_ids=HEAD + TAIL_A)
     assert eng2.fed == [HEAD + TAIL_A]
 
 
-def test_no_head_keeps_the_old_single_tier_contract(tmp_path, monkeypatch):
-    store = {}
-    eng = _engine(tmp_path, monkeypatch, store)
+def test_no_head_keeps_the_old_single_tier_contract(tmp_path):
+    eng = _engine(tmp_path)
     status, n = eng.warm_prefix(HEAD + TAIL_A)
     assert (status, n) == ("miss", len(HEAD) + len(TAIL_A))
     assert eng.fed == [HEAD + TAIL_A]
-    eng2 = _engine(tmp_path, monkeypatch, store)
+    eng2 = _engine(tmp_path)
     assert eng2.warm_prefix(HEAD + TAIL_A) == ("hit", len(HEAD) + len(TAIL_A))
 
 
-def test_interrupted_tail_records_only_fed_tokens_and_persists_nothing(tmp_path,
-                                                                        monkeypatch):
+def test_interrupted_tail_records_only_fed_tokens_and_persists_nothing(tmp_path):
     # The invariant test_interrupted_prefill_records_only_fed_tokens guards, on the new
     # partial path: _cached_ids must equal what is actually resident.
-    store = {}
-    first = _engine(tmp_path, monkeypatch, store)
+    first = _engine(tmp_path)
     first.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
-    eng = _engine(tmp_path, monkeypatch, store)
+    eng = _engine(tmp_path)
     checks = {"n": 0}
 
     def should_stop():
@@ -160,33 +155,36 @@ def test_interrupted_tail_records_only_fed_tokens_and_persists_nothing(tmp_path,
     status, n = eng.warm_prefix(HEAD + TAIL_B, head_ids=HEAD, should_stop=should_stop)
     assert (status, n) == ("partial", len(HEAD))
     assert eng._cached_ids == HEAD + TAIL_B[:4]
-    assert eng._cache[0]["ids"] == HEAD + TAIL_B[:4]
+    assert _ids(eng._cache[0]) == HEAD + TAIL_B[:4]
     assert not os.path.isfile(eng._ckpt_path(HEAD + TAIL_B))
 
 
-def test_divergence_reload_falls_back_to_the_head(tmp_path, monkeypatch):
+def test_divergence_reload_falls_back_to_the_head(tmp_path):
     # _sync_to on the non-trimmable hybrid rebuilds from the warm-prefix checkpoint on
     # a divergence; if the full one has been evicted, the head is the next best base.
-    store = {}
-    eng = _engine(tmp_path, monkeypatch, store)
+    eng = _engine(tmp_path)
     eng.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
     os.remove(eng._ckpt_path(HEAD + TAIL_A))
     eng._reset_cache()
     assert eng._reload_warm_prefix(HEAD + TAIL_A + [42]) == len(HEAD)
-    assert eng._cache[0]["ids"] == HEAD and eng._cached_ids == HEAD
+    assert _ids(eng._cache[0]) == HEAD and eng._cached_ids == HEAD
     # a target that no longer begins with the head gets nothing
     eng._reset_cache()
     assert eng._reload_warm_prefix([5] + HEAD) == 0
 
 
-def test_budget_protects_both_live_checkpoints(tmp_path, monkeypatch):
-    store, seen = {}, {}
-    eng = _engine(tmp_path, monkeypatch, store)
-    monkeypatch.setattr(E, "enforce_cache_budget",
-                        lambda d, mb, protect: seen.setdefault("protect", set()).update(protect))
+def test_budget_protects_both_live_checkpoints(tmp_path):
+    # A one-byte cap evicts every checkpoint the engine does not protect, so the stale
+    # file going proves the cap ran, and both live files surviving proves both were
+    # protected — the head too, which the full prefix's save does not write.
+    eng = _engine(tmp_path)
+    stale = tmp_path / "warm-stale.safetensors"
+    stale.write_bytes(b"x" * 64)
     eng.kv_cache_max_bytes = 1
     eng.warm_prefix(HEAD + TAIL_A, head_ids=HEAD)
-    assert {eng._ckpt_path(HEAD), eng._ckpt_path(HEAD + TAIL_A)} <= seen["protect"]
+    assert not stale.exists()
+    assert os.path.isfile(eng._ckpt_path(HEAD))
+    assert os.path.isfile(eng._ckpt_path(HEAD + TAIL_A))
 
 
 # --------------------------------------------------------------------------- agent

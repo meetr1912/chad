@@ -680,9 +680,15 @@ def install_tap(model: "nn.Module", layer_ids) -> bool:
 # -- loading ------------------------------------------------------------------
 
 def _target_key(model: "nn.Module"):
-    args = getattr(getattr(model, "language_model", None), "args", None)
-    if args is None:
+    """(hidden, layers, vocab) of a qwen3_5-family target, the only architecture the
+    tap can attach to; None for anything else."""
+    try:
+        from mlx_lm.models import qwen3_5 as q35
+    except ImportError:
         return None
+    if not isinstance(model, q35.Model):
+        return None
+    args = model.language_model.args
     return (int(args.hidden_size), int(args.num_hidden_layers), int(args.vocab_size))
 
 
@@ -805,7 +811,8 @@ def _complete(d: str) -> bool:
             and os.path.isfile(os.path.join(d, "model.safetensors")))
 
 
-def ensure_bundle(model_dir: str, repo_id: Optional[str]) -> None:
+def ensure_bundle(model_dir: str, repo_id: Optional[str],
+                  download: Optional[Callable[[str, str], str]] = None) -> None:
     """Fetch the bundle's weights when the weights dir has its config but not its
     `model.safetensors`. Best-effort and quiet on failure — a missing drafter costs
     speed, never correctness.
@@ -821,6 +828,9 @@ def ensure_bundle(model_dir: str, repo_id: Optional[str]) -> None:
     The same glob is why the file is named `model.safetensors` under a subdirectory in
     the first place: mlx-lm's LOADER globs `model*.safetensors` at the repo root, so the
     bundle is invisible to it. Downloader and loader read the same pattern differently.
+
+    `download(repo_id, filename)` fetches one file of the repo; None means
+    huggingface_hub's `hf_hub_download`.
     """
     if not repo_id or os.path.isdir(repo_id):
         return
@@ -829,9 +839,10 @@ def ensure_bundle(model_dir: str, repo_id: Optional[str]) -> None:
         return
     try:
         from huggingface_hub import hf_hub_download
+        fetch: Callable[[str, str], str] = download or hf_hub_download
         log.info("DFlash drafter: fetching the bundled weights from %s "
                  "(the base download's file filter skips them)", repo_id)
-        hf_hub_download(repo_id, f"{_BUNDLE}/model.safetensors")
+        fetch(repo_id, f"{_BUNDLE}/model.safetensors")
     except Exception as e:  # noqa: BLE001 — offline/gated: decode without the drafter
         log.warning("DFlash drafter: could not fetch %s/%s (%s); decoding without it",
                     repo_id, _BUNDLE, e)
@@ -864,7 +875,7 @@ def load_drafter(model: "nn.Module", model_dir: str, repo_id: Optional[str] = No
             return None
         lm = model.language_model
         embed = lm.model.embed_tokens
-        if getattr(lm.args, "tie_word_embeddings", False):
+        if lm.args.tie_word_embeddings:
             drafter.bind(embed, embed.as_linear)
         else:
             drafter.bind(embed, lm.lm_head)

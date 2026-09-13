@@ -44,6 +44,7 @@ import os
 import statistics
 import sys
 import time
+from dataclasses import dataclass
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
@@ -71,10 +72,21 @@ def render(tok, messages, tools: bool = True) -> list:
         add_generation_prompt=True, enable_thinking=True)
     return list(Agent._template_ids(rendered))
 
+@dataclass(frozen=True)
+class Preset:
+    """One sampling configuration, set on the engine before an arm runs."""
+    temp: float
+    top_p: float
+    top_k: int
+
+    def apply(self, eng) -> None:
+        eng.temp, eng.top_p, eng.top_k = self.temp, self.top_p, self.top_k
+
+
 # The shipped sampling presets, so an arm is measured in a regime someone actually runs.
 PRESETS = {
-    "greedy": dict(temp=0.0, top_p=0.0, top_k=0),
-    "thinking": dict(temp=1.0, top_p=0.95, top_k=20),
+    "greedy": Preset(temp=0.0, top_p=0.0, top_k=0),
+    "thinking": Preset(temp=1.0, top_p=0.95, top_k=20),
 }
 
 
@@ -323,8 +335,7 @@ def main(argv=None) -> int:
                key=lambda m: sum(len(str(x.get("content", ""))) for x in m))
     for arm in arms:
         set_arm(eng, arm, saved)
-        for k, v in PRESETS["greedy"].items():
-            setattr(eng, k, v)
+        PRESETS["greedy"].apply(eng)
         t0 = time.time()
         run_one(eng, tok, warm, 24)
         print(f"  warmed {arm} in {time.time() - t0:.1f}s", flush=True)
@@ -342,8 +353,7 @@ def main(argv=None) -> int:
             order += [(p, "serial") for p in presets if "serial" in arms]
             for preset, arm in order:
                 set_arm(eng, arm, saved)
-                for k, v in PRESETS[preset].items():
-                    setattr(eng, k, v)
+                PRESETS[preset].apply(eng)
                 t0 = time.time()
                 tps, stats, gen_ids, rounds = run_one(
                     eng, tok, messages, a.tokens,

@@ -276,28 +276,29 @@ def test_raising_callback_keeps_the_turn_cached():
     assert stats2.cached_tokens > len(PROMPT)
 
 
-def test_error_between_forward_and_ledger_drops_the_cache(monkeypatch):
+def test_error_between_forward_and_ledger_drops_the_cache():
     """MLX can raise after a verify forward has moved the cache but before the round's
     tokens are recorded (a Metal error at the accept eval, say). The loop's ledger then
     trails the cache, so publishing it would orphan tokens: the cache must be dropped.
     Raised here from the drafter reconcile, which runs at exactly that point."""
     from chad import engine as eng_mod
 
+    class _DiesAtThirdReconcile(eng_mod._DFlashDrafter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.rounds = 0
+
+        def reconcile(self, *args, **kwargs):
+            self.rounds += 1
+            if self.rounds == 3:
+                raise RuntimeError("metal died")
+            return super().reconcile(*args, **kwargs)
+
     model = _build_tiny()
     eng = _engine(model, _drafter_for(model))
-    real = eng_mod._DFlashDrafter.reconcile
-    rounds = []
-
-    def reconcile(self, *args, **kwargs):
-        rounds.append(1)
-        if len(rounds) == 3:
-            raise RuntimeError("metal died")
-        return real(self, *args, **kwargs)
-
-    monkeypatch.setattr(eng_mod._DFlashDrafter, "reconcile", reconcile)
     with pytest.raises(RuntimeError, match="metal died"):
-        eng._generate_spec(PROMPT, N_TOKENS, None, None)
-    monkeypatch.undo()
+        eng._generate_spec(PROMPT, N_TOKENS, None, None,
+                           drafter_cls=_DiesAtThirdReconcile)
     assert eng._cached_ids == []
     assert _ledger_matches_cache(eng)
     text, _ = eng._generate_spec(PROMPT, N_TOKENS, None, None)
@@ -408,52 +409,54 @@ def test_block_policy_dynamics():
 
 
 
-def test_ensure_bundle_completes_a_config_only_download(monkeypatch, tmp_path):
+def test_ensure_bundle_completes_a_config_only_download(tmp_path):
     """The measured half-state: mlx-lm's `model*.safetensors` download pattern is
     anchored at the start of the relative path, so `dflash/config.json` arrives (it
     matches `*.json`) and `dflash/model.safetensors` does not. That leaves a bundle
     that looks present and loads nothing, and the base weights look complete so no
     retry ever runs. ensure_bundle heals it; a complete bundle and a local model dir
     must not touch the network."""
-    import huggingface_hub
-
     calls = []
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
-                        lambda repo, fn, *a, **k: calls.append((repo, fn)))
+
+    def download(repo, filename):
+        calls.append((repo, filename))
+        return str(tmp_path / filename)
+
     mdir = tmp_path / "snapshot"
     bundle = mdir / "dflash"
     bundle.mkdir(parents=True)
     (bundle / "config.json").write_text("{}")
 
-    mlx_dflash.ensure_bundle(str(mdir), "org/model")
+    mlx_dflash.ensure_bundle(str(mdir), "org/model", download=download)
     assert calls == [("org/model", "dflash/model.safetensors")]
 
     # already complete -> no fetch
     calls.clear()
     (bundle / "model.safetensors").write_bytes(b"x")
-    mlx_dflash.ensure_bundle(str(mdir), "org/model")
+    mlx_dflash.ensure_bundle(str(mdir), "org/model", download=download)
     assert calls == []
 
     # a local model dir is not a repo id -> no fetch, and no bundle at all is not
     # this function's problem (that model simply ships no drafter)
     (bundle / "model.safetensors").unlink()
-    mlx_dflash.ensure_bundle(str(mdir), str(tmp_path))
-    mlx_dflash.ensure_bundle(str(tmp_path / "no-bundle"), "org/model")
+    mlx_dflash.ensure_bundle(str(mdir), str(tmp_path), download=download)
+    mlx_dflash.ensure_bundle(str(tmp_path / "no-bundle"), "org/model", download=download)
     assert calls == []
 
 
-def test_ensure_bundle_failure_is_soft(monkeypatch, tmp_path):
+def test_ensure_bundle_failure_is_soft(tmp_path):
     """Offline or gated: warn and decode without the drafter, never raise into load."""
-    import huggingface_hub
+    attempts = []
 
-    def boom(*a, **k):
+    def offline(repo, filename):
+        attempts.append((repo, filename))
         raise OSError("offline")
 
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", boom)
     bundle = tmp_path / "m" / "dflash"
     bundle.mkdir(parents=True)
     (bundle / "config.json").write_text("{}")
-    mlx_dflash.ensure_bundle(str(tmp_path / "m"), "org/model")   # no raise
+    mlx_dflash.ensure_bundle(str(tmp_path / "m"), "org/model", download=offline)  # no raise
+    assert attempts == [("org/model", "dflash/model.safetensors")]
 
 
 def test_sidecar_loads_at_the_width_it_was_built_at(monkeypatch, tmp_path):

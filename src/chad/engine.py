@@ -23,6 +23,7 @@ engine. PLD gets speculative decoding's accept/rollback benefit from the context
 
 import contextlib
 import hashlib
+import importlib.metadata
 import os
 import time
 from dataclasses import dataclass, field
@@ -86,10 +87,10 @@ def _log_mlx_provenance() -> None:
     it, instead of silently describing a configuration we do not ship.
     """
     try:
-        import mlx.core as mx
-        # getattr: the mlx stubs omit __version__; the attribute exists at runtime
-        ver = str(getattr(mx, "__version__", "?"))
-    except Exception:  # noqa: BLE001 — diagnostics must never break loading
+        # The installed distribution's version, which a local build stamps with its
+        # '+<sha>' segment just as mlx.core.__version__ does.
+        ver = importlib.metadata.version("mlx")
+    except Exception:  # noqa: BLE001 — no mlx installed; diagnostics must never break loading
         return
     if "+" in ver:
         log.warning("mlx %s is a LOCAL build, not the PyPI wheel users get — "
@@ -581,7 +582,7 @@ class Engine:
             or cfg.get("text_config", {}).get("max_position_embeddings") \
             or 32768
         # documented extended ceiling (Qwen ships this as the tokenizer max)
-        ceiling = getattr(self.tok, "model_max_length", native) if self.tok else native
+        ceiling = self.tok.model_max_length if self.tok else native
         if not ceiling or ceiling > 10_000_000:
             ceiling = native
         want = self.max_context or native
@@ -711,11 +712,12 @@ class Engine:
             log.warning("KV cache: kv_bits=%s forced on a shape the fused "
                         "kernel does not cover (head_dim=%s gqa=%s) — decode "
                         "will use the slow unfused path", self.kv_bits,
-                        getattr(self, "_head_dim", "?"), gqa or "?")
+                        self._head_dim, gqa or "?")
 
-    def _warm_verify_widths(self) -> None:
+    def _warm_verify_widths(self, warm: Optional[Callable[..., int]] = None) -> None:
         """Build the fused verify kernel's per-width variants at load instead of
-        inside the first span that needs one.
+        inside the first span that needs one. `warm(widths, hq, hkv, dtype)` does the
+        building and returns how many it built; None means mlx_qsdpa.warm_widths.
 
         The kernel is templated on the verify width, so a width that has never
         run is a Metal compile on the critical path of a real step. Warming only
@@ -730,7 +732,7 @@ class Engine:
         if not self.kv_bits or config.flag("CHAD_NO_KERNEL_WARM"):
             return          # fp16 cache: no fused kernel, so no variants exist
         widths: set[int] = set()
-        if getattr(self, "_dflash", None) is not None:
+        if self._dflash is not None:
             if self.dflash_adaptive:
                 widths.update(range(2, self.dflash_num_draft + 2))
             else:
@@ -767,8 +769,8 @@ class Engine:
             if dt is None:
                 return
             t0 = time.time()
-            done = mlx_qsdpa.warm_widths(widths, self._n_attn_heads,
-                                         self._n_kv_heads, dt)
+            done = (warm or mlx_qsdpa.warm_widths)(widths, self._n_attn_heads,
+                                                   self._n_kv_heads, dt)
             if done:
                 log.info("QSDPA warm-up: %d verify width(s) compiled in %.2fs "
                          "(%s)", done, time.time() - t0,
@@ -814,7 +816,7 @@ class Engine:
             bpt = 0.0
             for c in self._cache:
                 if isinstance(c, (cache_utils.KVCache, cache_utils.QuantizedKVCache)):
-                    for entry in (getattr(c, "keys", None), getattr(c, "values", None)):
+                    for entry in (c.keys, c.values):
                         arrs = entry if isinstance(entry, (tuple, list)) else (entry,)
                         for arr in arrs:
                             if arr is not None and len(arr.shape) >= 3 and arr.shape[2]:
@@ -1148,7 +1150,7 @@ class Engine:
     def _reload_warm_head(self, target_ids: list) -> int:
         """Second tier of `_reload_warm_prefix`: the project-independent head (tool
         schemas + behavioral prompt), when target_ids still begins with it."""
-        hd = getattr(self, "_warm_head_ids", None)
+        hd = self._warm_head_ids
         if not (hd and self.cache_dir and len(target_ids) >= len(hd)
                 and target_ids[: len(hd)] == hd):
             return 0
@@ -1169,7 +1171,7 @@ class Engine:
         protect = {just_written}
         if self._warm_prefix_ids:
             protect.add(self._ckpt_path(self._warm_prefix_ids))
-        hd = getattr(self, "_warm_head_ids", None)
+        hd = self._warm_head_ids
         if hd:
             protect.add(self._ckpt_path(hd))
         enforce_cache_budget(self.cache_dir, self.kv_cache_max_bytes, protect)
@@ -1193,12 +1195,12 @@ class Engine:
         So: start from a model-shaped base (MoE 2048, dense 512) and cap the chunk
         so the score-tensor transient stays inside half the free band under the
         Metal budget, floored at 256 so progress never stalls."""
-        base = 2048 if getattr(self, "_is_moe", False) else 512
+        base = 2048 if self._is_moe else 512
         try:
             budget = int(mx.device_info()["max_recommended_working_set_size"])
             free = budget * 0.90 - mx.get_active_memory()
             allow = max(free * 0.5, 256e6)
-            per_tok = 4.0 * getattr(self, "_n_attn_heads", 16) * max(kv_len, 1)
+            per_tok = 4.0 * self._n_attn_heads * max(kv_len, 1)
             return max(256, min(base, int(allow / per_tok)))
         except Exception:  # noqa: BLE001 — memory probe unavailable -> static base
             return base
@@ -1253,7 +1255,7 @@ class Engine:
         n = len(ids)
         if chunk is None:
             chunk = config.env_int("CHAD_PREFILL_CHUNK", 0) or None
-        kv_base = len(getattr(self, "_cached_ids", None) or [])
+        kv_base = len(self._cached_ids)
         oom_cap: Optional[int] = None  # halved on each caught Metal OOM
         i = 0
         while i < n:
@@ -1355,7 +1357,7 @@ class Engine:
         # rollback is offset-trim + rewrite, the same mechanism
         # _take_rewind_snapshot documents as safe on a quantized-from-the-start
         # cache.
-        if (getattr(self, "_dflash", None) is not None
+        if (self._dflash is not None
                 and (self._trimmable or self._pld_hybrid)):
             return self._generate_spec(prompt_ids, max_tokens,
                                        on_token, stop_texts, should_stop,
@@ -1544,10 +1546,10 @@ class Engine:
 
     def _eos_ids(self) -> set:
         ids = set()
-        eid = getattr(self.tok, "eos_token_id", None)
+        eid = self.tok.eos_token_id
         if eid is not None:
             ids.add(int(eid))
-        for extra in getattr(self.tok, "eos_token_ids", None) or []:
+        for extra in self.tok.eos_token_ids or []:
             ids.add(int(extra))
         return ids
 
@@ -1771,7 +1773,7 @@ class Engine:
     def _generate_pld_wide(self, prompt_ids, max_tokens, on_token, stop_texts,
                            should_stop=None, on_prefill=None,
                            on_prefill_progress=None, stop_condition=None,
-                           think_ceiling=None):
+                           think_ceiling=None, lookup=None):
         """Wide prompt-lookup decoding on the recurrent hybrid, exact at any
         temp.
 
@@ -1788,8 +1790,13 @@ class Engine:
         Rollback on partial rejection is the capture-replay mechanism:
         the verify forward records each GDN layer's recurrence inputs, and a
         rejection replays the accepted prefix from the captured state — no
-        re-feed forward, which is what made enable_pld_hybrid a loss."""
+        re-feed forward, which is what made enable_pld_hybrid a loss.
+
+        `lookup(arr, n, num_draft, ngram_max, ngram_min)` finds each step's draft;
+        None means prompt_lookup_draft_arr."""
         from . import mlx_fastpath
+
+        lookup = lookup or prompt_lookup_draft_arr
 
         # `fed_ids` (set once decoding starts) is this loop's ledger; if anything below
         # raises, _settle_after_error decides whether the cache still matches it.
@@ -2011,7 +2018,7 @@ class Engine:
                 # LAZY state the pending token is still in flight, so d[0] is the
                 # lookup's PREDICTION of it — the evidence gate below only enters
                 # a span when that prediction matches the materialized sample.
-                d, ng = prompt_lookup_draft_arr(
+                d, ng = lookup(
                     ctx, ctx_n, self.pld_wide_draft + 1,
                     self.pld_wide_ngram, self.pld_wide_min_ngram)
                 candidate = (ng >= self.pld_wide_min_ngram
@@ -2180,7 +2187,7 @@ class Engine:
     def _generate_spec(self, prompt_ids, max_tokens, on_token, stop_texts,
                        should_stop=None, on_prefill=None,
                        on_prefill_progress=None, stop_condition=None,
-                       think_ceiling=None):
+                       think_ceiling=None, drafter_cls=None):
         """Speculative decoding: draft k tokens, verify them in ONE batched main
         forward, accept via exact speculative (rejection) sampling, so the
         output distribution is identical to plain decoding at the same
@@ -2188,7 +2195,8 @@ class Engine:
 
         The k proposals come from one forward of the DFlash2 block drafter
         (mlx_dflash, see _DFlashDrafter), conditioned on the target's tapped
-        residual stream.
+        residual stream. `drafter_cls(engine, embed, logits_fn)` builds that
+        drafter; None means _DFlashDrafter.
 
         Cache contracts:
         - Main cache rollback on rejection is the PLD-hybrid primitive
@@ -2227,7 +2235,7 @@ class Engine:
             hybrid = self._pld_hybrid and not self._trimmable
             t0 = time.time()
 
-            drafter = _DFlashDrafter(self, embed, _logits)
+            drafter = (drafter_cls or _DFlashDrafter)(self, embed, _logits)
             drafter.start_turn()
 
             def _prefill_head():
@@ -2585,12 +2593,12 @@ class _DFlashDrafter:
         self.eng = eng
         self.m = eng._dflash
         cfg = self.m.config
-        self.cap = max(1, min(int(getattr(eng, "dflash_num_draft", 7)),
+        self.cap = max(1, min(int(eng.dflash_num_draft),
                               cfg.block_size - 1))
         # Fresh per-turn schedule state: acceptance statistics are a property
         # of the current prompt/content, not of the session.
         self.policy = (mlx_dflash.block_policy(self.cap)
-                       if getattr(eng, "dflash_adaptive", True) else None)
+                       if eng.dflash_adaptive else None)
         self._ids = list(cfg.target_layer_ids)
         self._mask = int(cfg.mask_token_id)
         self._vocab = int(eng.model.language_model.args.vocab_size)

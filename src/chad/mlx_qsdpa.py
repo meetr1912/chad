@@ -63,7 +63,7 @@ that still requires an fp16 cache is opt-in wide prompt-lookup decoding
 (CHAD_USE_PLD).
 """
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 from . import config
 from .diag import log
@@ -1310,107 +1310,113 @@ def _eligible(q: "mx.array", cache: "QuantizedKVCache",
     return True
 
 
-_KERNEL_HEALTHY: bool | None = None   # one-time numeric self-check result (see below)
-
-
-def kernel_healthy() -> bool:
+class KernelSelfCheck:
     """One-time numeric self-check: run the fused kernel on the small synthetic shapes
     that exposed SILENT nan output on M1-class GPUs (GitHub's macos-14 arm64 runners:
     n=3 at gqa 8/4 and n=100 at gqa 8 returned nan while n>=300 was fine — a partial-
     chunk edge this module's runtime try/except can NEVER catch, because the kernel
     doesn't raise, it just poisons the logits) and compare against the dequantize->fp32
     reference. install() refuses the kernel when this fails, so decode falls back to the
-    stock quantized path instead of silently generating garbage. Cached per process;
-    healthy hardware pays four tiny dispatches at first install(). The kernel itself is
-    untouched — the bit-determinism evidence still holds where this passes."""
-    global _KERNEL_HEALTHY
-    if _KERNEL_HEALTHY is not None:
-        return _KERNEL_HEALTHY
-    try:
-        import mlx.core as mx
-        from mlx_lm.models.cache import QuantizedKVCache
-    except ImportError:
-        _KERNEL_HEALTHY = False
-        return False
-    scale = _D ** -0.5
-    try:
-        # The two n=2570 gqa-8 probes are >= _SGM_MIN_N, so they exercise the
-        # simdgroup_matrix retile rather than the per-head kernel; without them a
-        # GPU could pass this check and still poison every real decode step,
-        # since real contexts are never as short as the n=3/n=100 probes.
-        # The hq=24/hkv=4 probes are gqa 6 (Qwen3.8-27B): a partial-GQA chunk
-        # (CH=6) with its own staging arithmetic, checked at the same edges.
-        for hq, hkv, n, dtype, tol in ((16, 2, 3, mx.float16, 4e-3),
-                                       (16, 2, 3, mx.bfloat16, 1.6e-2),
-                                       (16, 4, 3, mx.float16, 4e-3),
-                                       (16, 2, 100, mx.float16, 4e-3),
-                                       (16, 2, 2570, mx.float16, 4e-3),
-                                       (16, 2, 2570, mx.bfloat16, 1.6e-2),
-                                       (24, 4, 3, mx.float16, 4e-3),
-                                       (24, 4, 100, mx.bfloat16, 1.6e-2),
-                                       (24, 4, 2570, mx.float16, 4e-3)):
-            mx.random.seed(7)
-            q = mx.random.normal((1, hq, 1, _D)).astype(dtype)
-            k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
-            v = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
-            c = QuantizedKVCache(group_size=64, bits=8)
-            c.update_and_fetch(k, v)
-            assert c.keys is not None and c.values is not None  # set by update_and_fetch
-            out = qsdpa(q, c.keys, c.values, scale, n)
-            kd = mx.dequantize(*c.keys, group_size=64, bits=8)[..., :n, :]
-            vd = mx.dequantize(*c.values, group_size=64, bits=8)[..., :n, :]
-            qf = (q.astype(mx.float32) * scale).reshape(1, hkv, hq // hkv, 1, _D)
-            scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
-            p = mx.softmax(scores, axis=-1, precise=True)
-            ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, hq, 1, _D)
-            err = mx.abs(out.astype(mx.float32) - ref).max().item()
-            if not err < tol:   # NOT '>=': nan compares False both ways — this catches it
-                log.warning("QSDPA self-check FAILED (hkv=%d n=%d %s: err=%s, tol=%s) — "
-                            "fused quantized-KV kernel is numerically broken on this "
-                            "GPU/toolchain; refusing to install it", hkv, n, dtype, err, tol)
-                _KERNEL_HEALTHY = False
-                return False
-        # Wide-S probes (the speculative verify shape): per-row causal reference —
-        # row s of the S tail positions attends to the first n-S+1+s. Probes
-        # cover the partial-chunk edges (n near CH), both GQA tiers the wide
-        # kernel serves, and both dtypes. A wide kernel that silently NaNs
-        # would poison every verify forward, so it gets the same refusal.
-        for hq, hkv, n, S, dtype, tol in ((24, 4, 9, 3, mx.float16, 4e-3),
-                                          (24, 4, 100, 3, mx.bfloat16, 1.6e-2),
-                                          (24, 4, 2570, 3, mx.float16, 4e-3),
-                                          (24, 4, 2570, 4, mx.float16, 4e-3),
-                                          (24, 4, 2570, 6, mx.bfloat16, 1.6e-2),
-                                          (16, 2, 2570, 3, mx.float16, 4e-3),
-                                          (16, 4, 2570, 3, mx.float16, 4e-3)):
-            mx.random.seed(11)
-            q = mx.random.normal((1, hq, S, _D)).astype(dtype)
-            k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
-            v = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
-            c = QuantizedKVCache(group_size=64, bits=8)
-            c.update_and_fetch(k, v)
-            assert c.keys is not None and c.values is not None
-            out = qsdpa(q, c.keys, c.values, scale, n)
-            kd = mx.dequantize(*c.keys, group_size=64, bits=8)[..., :n, :]
-            vd = mx.dequantize(*c.values, group_size=64, bits=8)[..., :n, :]
-            qf = (q.astype(mx.float32) * scale).reshape(1, hkv, hq // hkv, S, _D)
-            scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
-            lim = mx.arange(n)[None, :] < (n - S + 1 + mx.arange(S))[:, None]
-            scores = mx.where(lim[None, None, None], scores, -mx.inf)
-            p = mx.softmax(scores, axis=-1, precise=True)
-            ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, hq, S, _D)
-            err = mx.abs(out.astype(mx.float32) - ref).max().item()
-            if not err < tol:
-                log.warning("QSDPA wide self-check FAILED (hkv=%d n=%d S=%d %s: "
-                            "err=%s, tol=%s) — refusing to install", hkv, n, S,
-                            dtype, err, tol)
-                _KERNEL_HEALTHY = False
-                return False
-    except Exception as e:  # noqa: BLE001 — a broken probe means an unusable kernel
-        log.warning("QSDPA self-check errored (%s); refusing to install", e)
-        _KERNEL_HEALTHY = False
-        return False
-    _KERNEL_HEALTHY = True
-    return True
+    stock quantized path instead of silently generating garbage. The verdict is computed
+    on the first call and kept; `kernel_healthy` below is the per-process check of
+    `qsdpa`, so healthy hardware pays its tiny dispatches once, at first install(). The
+    kernel itself is untouched — the bit-determinism evidence still holds where this
+    passes."""
+
+    def __init__(self, kernel: Callable[..., "mx.array"]) -> None:
+        self._kernel = kernel
+        self._verdict: Optional[bool] = None
+
+    def __call__(self) -> bool:
+        if self._verdict is None:
+            self._verdict = self._run()
+        return self._verdict
+
+    def _run(self) -> bool:
+        try:
+            import mlx.core as mx
+            from mlx_lm.models.cache import QuantizedKVCache
+        except ImportError:
+            return False
+        scale = _D ** -0.5
+        try:
+            # The two n=2570 gqa-8 probes are >= _SGM_MIN_N, so they exercise the
+            # simdgroup_matrix retile rather than the per-head kernel; without them a
+            # GPU could pass this check and still poison every real decode step,
+            # since real contexts are never as short as the n=3/n=100 probes.
+            # The hq=24/hkv=4 probes are gqa 6 (Qwen3.8-27B): a partial-GQA chunk
+            # (CH=6) with its own staging arithmetic, checked at the same edges.
+            for hq, hkv, n, dtype, tol in ((16, 2, 3, mx.float16, 4e-3),
+                                           (16, 2, 3, mx.bfloat16, 1.6e-2),
+                                           (16, 4, 3, mx.float16, 4e-3),
+                                           (16, 2, 100, mx.float16, 4e-3),
+                                           (16, 2, 2570, mx.float16, 4e-3),
+                                           (16, 2, 2570, mx.bfloat16, 1.6e-2),
+                                           (24, 4, 3, mx.float16, 4e-3),
+                                           (24, 4, 100, mx.bfloat16, 1.6e-2),
+                                           (24, 4, 2570, mx.float16, 4e-3)):
+                mx.random.seed(7)
+                q = mx.random.normal((1, hq, 1, _D)).astype(dtype)
+                k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
+                v = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
+                c = QuantizedKVCache(group_size=64, bits=8)
+                c.update_and_fetch(k, v)
+                assert c.keys is not None and c.values is not None  # set by update_and_fetch
+                out = self._kernel(q, c.keys, c.values, scale, n)
+                kd = mx.dequantize(*c.keys, group_size=64, bits=8)[..., :n, :]
+                vd = mx.dequantize(*c.values, group_size=64, bits=8)[..., :n, :]
+                qf = (q.astype(mx.float32) * scale).reshape(1, hkv, hq // hkv, 1, _D)
+                scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
+                p = mx.softmax(scores, axis=-1, precise=True)
+                ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, hq, 1, _D)
+                err = mx.abs(out.astype(mx.float32) - ref).max().item()
+                if not err < tol:   # NOT '>=': nan compares False both ways — this catches it
+                    log.warning("QSDPA self-check FAILED (hkv=%d n=%d %s: err=%s, tol=%s) — "
+                                "fused quantized-KV kernel is numerically broken on this "
+                                "GPU/toolchain; refusing to install it", hkv, n, dtype, err,
+                                tol)
+                    return False
+            # Wide-S probes (the speculative verify shape): per-row causal reference —
+            # row s of the S tail positions attends to the first n-S+1+s. Probes
+            # cover the partial-chunk edges (n near CH), both GQA tiers the wide
+            # kernel serves, and both dtypes. A wide kernel that silently NaNs
+            # would poison every verify forward, so it gets the same refusal.
+            for hq, hkv, n, S, dtype, tol in ((24, 4, 9, 3, mx.float16, 4e-3),
+                                              (24, 4, 100, 3, mx.bfloat16, 1.6e-2),
+                                              (24, 4, 2570, 3, mx.float16, 4e-3),
+                                              (24, 4, 2570, 4, mx.float16, 4e-3),
+                                              (24, 4, 2570, 6, mx.bfloat16, 1.6e-2),
+                                              (16, 2, 2570, 3, mx.float16, 4e-3),
+                                              (16, 4, 2570, 3, mx.float16, 4e-3)):
+                mx.random.seed(11)
+                q = mx.random.normal((1, hq, S, _D)).astype(dtype)
+                k = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
+                v = (0.7 * mx.random.normal((1, hkv, n, _D))).astype(dtype)
+                c = QuantizedKVCache(group_size=64, bits=8)
+                c.update_and_fetch(k, v)
+                assert c.keys is not None and c.values is not None
+                out = self._kernel(q, c.keys, c.values, scale, n)
+                kd = mx.dequantize(*c.keys, group_size=64, bits=8)[..., :n, :]
+                vd = mx.dequantize(*c.values, group_size=64, bits=8)[..., :n, :]
+                qf = (q.astype(mx.float32) * scale).reshape(1, hkv, hq // hkv, S, _D)
+                scores = qf @ mx.expand_dims(kd.astype(mx.float32), 2).swapaxes(-1, -2)
+                lim = mx.arange(n)[None, :] < (n - S + 1 + mx.arange(S))[:, None]
+                scores = mx.where(lim[None, None, None], scores, -mx.inf)
+                p = mx.softmax(scores, axis=-1, precise=True)
+                ref = (p @ mx.expand_dims(vd.astype(mx.float32), 2)).reshape(1, hq, S, _D)
+                err = mx.abs(out.astype(mx.float32) - ref).max().item()
+                if not err < tol:
+                    log.warning("QSDPA wide self-check FAILED (hkv=%d n=%d S=%d %s: "
+                                "err=%s, tol=%s) — refusing to install", hkv, n, S,
+                                dtype, err, tol)
+                    return False
+        except Exception as e:  # noqa: BLE001 — a broken probe means an unusable kernel
+            log.warning("QSDPA self-check errored (%s); refusing to install", e)
+            return False
+        return True
+
+
+kernel_healthy = KernelSelfCheck(qsdpa)
 
 
 def warm_widths(widths, hq: int, hkv: int, dtype, n: int = _SGM_MIN_N + 8) -> int:
@@ -1462,10 +1468,27 @@ def warm_widths(widths, hq: int, hkv: int, dtype, n: int = _SGM_MIN_N + 8) -> in
     return done
 
 
-def install() -> bool:
+# The attention helper install() put in place of mlx_lm's, so a repeat install
+# recognizes its own patch.
+_patched_sdpa: Optional[Callable[..., "mx.array"]] = None
+
+
+def installed() -> bool:
+    """True when mlx_lm's attention helper is this module's fused-kernel patch."""
+    try:
+        from mlx_lm.models import base as lm_base
+    except ImportError:
+        return False
+    return lm_base.scaled_dot_product_attention is _patched_sdpa
+
+
+def install(kernel_ok: Callable[[], bool] = kernel_healthy) -> bool:
     """Patch the QuantizedKVCache branch of mlx_lm's attention helper to use
     the fused kernels on eligible decode steps. Safe no-op on failure (import
-    trouble, CHAD_NO_QSDPA, or a failed numeric self-check — see kernel_healthy)."""
+    trouble, CHAD_NO_QSDPA, or a failed numeric self-check — `kernel_ok`, which is
+    kernel_healthy). A kernel that fails the check is refused even where an earlier
+    install already patched the helper, and the helper is left as it was."""
+    global _patched_sdpa
     if config.flag("CHAD_NO_QSDPA"):
         return False
     try:
@@ -1474,12 +1497,12 @@ def install() -> bool:
         from mlx_lm.models.cache import QuantizedKVCache
     except ImportError:
         return False
-    if getattr(lm_base.scaled_dot_product_attention, "_chad_qsdpa", False):
-        return True  # already installed
-    if not kernel_healthy():
+    if not kernel_ok():
         log.warning("QSDPA disabled: numeric self-check failed; stock quantized "
                     "attention stays in place")
         return False
+    if lm_base.scaled_dot_product_attention is _patched_sdpa:
+        return True  # already installed
 
     stock = lm_base.scaled_dot_product_attention
 
@@ -1514,10 +1537,8 @@ def install() -> bool:
         return stock(queries, keys, values, cache=cache, scale=scale,
                      mask=mask, sinks=sinks)
 
-    # SAFETY: a function object takes arbitrary attributes at runtime; the stub just
-    # does not declare them.
-    patched._chad_qsdpa = True  # type: ignore[attr-defined]
     lm_base.scaled_dot_product_attention = patched
+    _patched_sdpa = patched
     # models import the helper by name at module load; rebind any that did.
     import sys
     for mod_name, mod in list(sys.modules.items()):

@@ -377,8 +377,10 @@ def test_install_patches_seam_and_matches():
     from mlx_lm.models import base as lm_base
 
     assert mlx_qsdpa.install()
-    assert getattr(lm_base.scaled_dot_product_attention, "_chad_qsdpa", False)
-    assert mlx_qsdpa.install()  # idempotent
+    assert mlx_qsdpa.installed()
+    patched = lm_base.scaled_dot_product_attention
+    assert mlx_qsdpa.install()  # idempotent: the same patch, not a second wrapper
+    assert lm_base.scaled_dot_product_attention is patched
 
     n = 700
     q, k, v = _make(n, mx.float16)
@@ -393,7 +395,7 @@ def test_install_patches_seam_and_matches():
 
     # the qwen3_next module-level import must have been rebound too
     from mlx_lm.models import qwen3_next
-    assert getattr(qwen3_next.scaled_dot_product_attention, "_chad_qsdpa", False)
+    assert qwen3_next.scaled_dot_product_attention is lm_base.scaled_dot_product_attention
 
 
 def test_covers():
@@ -442,47 +444,37 @@ def test_no_qsdpa_flag_blocks_install(monkeypatch):
     assert mlx_qsdpa.install() is False
 
 
-def test_self_check_gate_catches_poisoned_kernel(monkeypatch):
-    """A kernel that silently returns nan (the M1-runner failure mode) must fail
-    kernel_healthy() and make install() refuse — the runtime try/except cannot see
-    it (nothing raises), so this gate is the only line of defense."""
+def test_self_check_gate_catches_poisoned_kernel():
+    """A kernel that silently returns nan (the M1-runner failure mode) must fail the
+    self-check and make install() refuse — the runtime try/except cannot see it
+    (nothing raises), so this gate is the only line of defense."""
     def nan_kernel(q, keys, values, scale, n):
         return mx.full(q.shape, float("nan"), dtype=q.dtype)
 
-    monkeypatch.setattr(mlx_qsdpa, "qsdpa", nan_kernel)
-    monkeypatch.setattr(mlx_qsdpa, "_KERNEL_HEALTHY", None)  # drop the cached verdict
-    assert mlx_qsdpa.kernel_healthy() is False
+    assert mlx_qsdpa.KernelSelfCheck(nan_kernel)() is False
 
-    # A fresh (unpatched) seam + broken kernel -> install refuses. install() returns
-    # True early when the seam already carries _chad_qsdpa, and an earlier test in
-    # this process may have installed it for real — so restore a clean seam rather
-    # than skipping. Skipping made the assertion below silently not run in a
-    # whole-suite pass, which is where it matters most.
+    # A failed check -> install refuses. It must do so whether or not an earlier test
+    # in this process already installed the patch for real, and before touching the
+    # seam, so nothing is left half-patched or wrapped a second time.
     from mlx_lm.models import base as lm_base
 
-    def unpatched(queries, keys, values, cache, scale, mask=None, sinks=None):
-        raise AssertionError("stand-in seam should never be called")
-
-    monkeypatch.setattr(lm_base, "scaled_dot_product_attention", unpatched)
-    assert not getattr(lm_base.scaled_dot_product_attention, "_chad_qsdpa", False)
-    assert mlx_qsdpa.install() is False
-    # ...and it refused BEFORE touching the seam, so nothing is left half-patched.
-    assert lm_base.scaled_dot_product_attention is unpatched
+    before = lm_base.scaled_dot_product_attention
+    assert mlx_qsdpa.install(kernel_ok=lambda: False) is False
+    assert lm_base.scaled_dot_product_attention is before
 
 
-def test_self_check_result_is_cached(monkeypatch):
+def test_self_check_result_is_cached():
     calls = []
-    real = mlx_qsdpa.qsdpa
 
     def counting(*a, **kw):
         calls.append(1)
-        return real(*a, **kw)
+        return mlx_qsdpa.qsdpa(*a, **kw)
 
-    monkeypatch.setattr(mlx_qsdpa, "qsdpa", counting)
-    monkeypatch.setattr(mlx_qsdpa, "_KERNEL_HEALTHY", None)
-    first = mlx_qsdpa.kernel_healthy()
+    check = mlx_qsdpa.KernelSelfCheck(counting)
+    first = check()
     n_after_first = len(calls)
-    assert mlx_qsdpa.kernel_healthy() is first
+    assert n_after_first > 0            # the first call really ran the kernel
+    assert check() is first
     assert len(calls) == n_after_first  # second call answered from the cache
 
 
