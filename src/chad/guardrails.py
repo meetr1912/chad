@@ -128,9 +128,11 @@ def _is_trivial_check(command: str) -> bool:
 # `coverage run` — refusing those would send a model that DID run its tests back to run
 # them again, and hard-stop its `done` once the nudges ran out.
 _EXECUTES_RE = re.compile(
-    r"(?:^|[;&|(]\s*|\bsudo\s+|\benv\s+(?:\w+=\S+\s+)*)"
+    r"(?:^|[;&|(]\s*|\bsudo\s+|\benv\s+)"
     r"(?:\w+=\S*\s+)*"
-    r"(?:timeout\s+(?:--?[\w-]+(?:[=\s]+\w+)?\s+)*\d[\w.]*\s+)?"
+    # An option is one token starting with `-` and its value one token that doesn't, so
+    # every token matches exactly one way and the repetition cannot backtrack exponentially.
+    r"(?:timeout\s+(?:-\S*\s+(?:[^\s-]\S*\s+)?)*\d[\w.]*\s+)?"
     r"(?:[\w.~-]*/)*"
     r"(?:python[0-9.]*|pytest|py\.test|tox|nox|unittest|make|cmake|ctest|cargo|go"
     r"|node|npm|npx|yarn|pnpm|deno|bun|mvn|gradlew?|ant|rake|rspec|ruby|phpunit|php"
