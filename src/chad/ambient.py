@@ -49,6 +49,7 @@ import shutil
 import subprocess
 
 from . import levers
+from .guardrails import _RUNNER_WRAPPER_RE
 
 # Appended ambient text is bounded so it can never bloat a result the clip cap
 # already sized (annotation happens after _clip_tool_result on purpose — a
@@ -99,14 +100,6 @@ def _rel(path: str) -> str:
     except ValueError:
         return path
     return path if rel.startswith("..") else rel
-
-
-# Project-runner wrappers that carry the real program as their argument. Stripped
-# before the executing/trivial checks so `uv run pytest` records a pytest run —
-# ambient-only normalization; the verify gate's own regex is deliberately untouched
-# (changing what disarms the unverified-edit flag is a different, riskier change).
-_RUNNER_WRAPPER_RE = re.compile(
-    r"\b(?:uv|poetry|pipenv|pdm|hatch)\s+run\s+(?:python[0-9.]*\s+-m\s+)?")
 
 
 def _cmd_head(command: str) -> str:
@@ -182,6 +175,9 @@ def note_call(name: str, args: dict, result: str) -> None:
             return
         if result.startswith(("[timed out", "[interrupted", "[failed to launch")):
             return
+        # The verify gate's own normalization and predicates (`bash_result_verifies`), so
+        # `uv run pytest` records a pytest run and the ledger records exactly the
+        # commands that gate counts as runs — including ones that exited non-zero.
         bare = _RUNNER_WRAPPER_RE.sub("", cmd)
         if guardrails._is_trivial_check(bare) or not guardrails._is_executing_command(bare):
             return

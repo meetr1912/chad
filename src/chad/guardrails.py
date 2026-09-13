@@ -122,12 +122,20 @@ def _is_trivial_check(command: str) -> bool:
 # exited 0 with output and "verified" the edit — disarming the verify nudge, the done
 # rejection AND the landing nudge at once; the patch shipped with an IndentationError.
 # Display/plumbing commands (sed/cat/ls/grep/echo/find/git…) prove nothing about
-# runtime behavior no matter how cleanly they exit.
+# runtime behavior no matter how cleanly they exit. The program may be launched the
+# everyday ways a real test run is: after `VAR=value` assignments or `timeout [opts]
+# DURATION`, path-qualified (`.venv/bin/python`, `/usr/bin/python3`), or under
+# `coverage run` — refusing those would send a model that DID run its tests back to run
+# them again, and hard-stop its `done` once the nudges ran out.
 _EXECUTES_RE = re.compile(
     r"(?:^|[;&|(]\s*|\bsudo\s+|\benv\s+(?:\w+=\S+\s+)*)"
+    r"(?:\w+=\S*\s+)*"
+    r"(?:timeout\s+(?:--?[\w-]+(?:[=\s]+\w+)?\s+)*\d[\w.]*\s+)?"
+    r"(?:[\w.~-]*/)*"
     r"(?:python[0-9.]*|pytest|py\.test|tox|nox|unittest|make|cmake|ctest|cargo|go"
     r"|node|npm|npx|yarn|pnpm|deno|bun|mvn|gradlew?|ant|rake|rspec|ruby|phpunit|php"
-    r"|dotnet|swift|julia|Rscript|perl|lua|java|sbt|stack|sh|bash|zsh|\./\S+)\b")
+    r"|dotnet|swift|julia|Rscript|perl|lua|java|sbt|stack|sh|bash|zsh|coverage\s+run"
+    r"|\./\S+)\b")
 
 
 def _is_executing_command(command: str) -> bool:
@@ -138,16 +146,29 @@ def _is_executing_command(command: str) -> bool:
     return bool(_EXECUTES_RE.search(command))
 
 
+# Project-runner wrappers that carry the real program as their argument (`uv run
+# pytest`, `poetry run python -m pytest`). Stripped before the trivial/executing checks so
+# the wrapped program is what gets judged; ambient's run ledger strips with this regex too.
+_RUNNER_WRAPPER_RE = re.compile(
+    r"\b(?:uv|poetry|pipenv|pdm|hatch)\s+run\s+(?:python[0-9.]*\s+-m\s+)?")
+
+_BASH_ERROR_PREFIXES = ("[exit", "[timed out", "[interrupted", "[failed to launch")
+
+
 def bash_result_verifies(result: str, command: str = "") -> bool:
     """A bash tool result clears the unverified-edit flag only on a clean run that
     actually exercised the code.
 
-    The result must not be an error sentinel — the four `[`-prefixed prefixes
-    below mean the check did NOT pass (non-zero exit, timeout, ctrl-c, launch
-    failure)."""
-    if result.startswith(("[exit", "[timed out", "[interrupted", "[failed to launch")):
+    Both are required: the result is not an error sentinel — the four `[`-prefixed
+    prefixes mean the check did NOT pass (non-zero exit, timeout, ctrl-c, launch
+    failure) — and the command, runner wrapper stripped, executes something
+    (`_is_executing_command`) rather than only parsing or probing it
+    (`_is_trivial_check`). An empty command (legacy callers such as `update_thrash`) is
+    judged on the result alone."""
+    if result.startswith(_BASH_ERROR_PREFIXES):
         return False
-    return True
+    bare = _RUNNER_WRAPPER_RE.sub("", command)
+    return not _is_trivial_check(bare) and _is_executing_command(bare)
 
 
 # Tools that count as real work (did_work) — NOT planning/done. Kept as a named
@@ -264,7 +285,10 @@ def update_work_flags(name, args, result, did_work, made_edit, unverified_edit):
         if not is_doc:
             unverified_edit = True
     elif name == "bash":
-        if bash_result_verifies(result, str(args.get("command", ""))):
+        command = str(args.get("command", ""))
+        if reverts_working_tree(command) and not result.startswith(_BASH_ERROR_PREFIXES):
+            return did_work, False, False
+        if bash_result_verifies(result, command):
             unverified_edit = False
     return did_work, made_edit, unverified_edit
 

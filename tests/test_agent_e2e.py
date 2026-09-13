@@ -672,6 +672,32 @@ def test_final_plan_update_paired_with_done_is_not_dropped(tmp_path, monkeypatch
     assert "[x] Read it back" in plan_results[-1]["content"]
 
 
+def test_edit_paired_with_done_is_applied(tmp_path, monkeypatch):
+    """`edit` + `done` in ONE step: the edit runs before the done-gates judge the turn.
+    The terminal short-circuit used to drop every call but a plan update, so the edit
+    never landed and the model was told it had not done anything."""
+    monkeypatch.chdir(tmp_path)
+    f = tmp_path / "m.py"
+    f.write_text("x = 1\n")
+    script = [
+        _tool_call("edit", path=str(f), old="x = 1", new="x = 2")
+        + "\n" + _tool_call("done", summary="changed it"),       # -> verify question
+        _tool_call("bash", command=f"{PY} {f}"),
+        _tool_call("done", summary="changed x to 2 and ran it"),
+    ]
+    agent = _agent(script, max_steps=10)
+
+    result = agent.run_turn("change x to 2 in m.py")
+
+    assert f.read_text() == "x = 2\n"
+    tool_turns = [m for m in agent.messages if m.get("role") == "tool"]
+    assert [m["name"] for m in tool_turns[:2]] == ["edit", "done"]
+    assert tool_turns[0]["content"].startswith("[edited")
+    assert "have not run anything" in tool_turns[1]["content"]   # judged the landed edit
+    assert result == "changed x to 2 and ran it"
+    assert agent.engine._i == len(script)
+
+
 def test_done_with_an_open_todo_is_questioned_once_then_accepted(tmp_path, monkeypatch):
     """The plan the model wrote this turn holds up `done` for exactly one question.
 
