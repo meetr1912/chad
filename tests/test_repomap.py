@@ -20,6 +20,13 @@ This file pins three properties:
 No model is loaded; this runs in the fast gate.
 """
 
+import json
+import os
+import pickle
+import time
+
+import pytest
+
 from chad import repomap
 from chad.repomap import RepoMap
 
@@ -196,3 +203,88 @@ def test_repomap_and_tools_import_without_the_tree_sitter_wheel(monkeypatch):
         monkeypatch.setattr(builtins, "__import__", real_import)
         importlib.reload(chad.repomap)    # restore for the rest of the session
         importlib.reload(chad.tools)
+
+
+# --- bounded lookups and the on-disk cache ----------------------------------------
+
+def test_find_defs_without_refresh_never_rewalks(tmp_path, monkeypatch):
+    rm = RepoMap(_make_repo(tmp_path))
+    rm._disk_checked = True
+    monkeypatch.setattr(rm, "_refresh_files", lambda: pytest.fail("re-walked the tree"))
+    assert rm._find_defs("alpha_func", refresh=False)
+    assert rm._find_defs("no_such_symbol", refresh=False) == []
+
+
+def _cacheable_repo(tmp_path, monkeypatch):
+    """A repo big enough to persist its tags, a private cache dir, and no sweep."""
+    monkeypatch.setattr(repomap, "_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(repomap, "_SWEPT", True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for i in range(repomap._CACHE_SAVE_MIN + 2):
+        (repo / f"mod{i:02d}.py").write_text(f"def func_{i:02d}():\n    pass\n")
+    return str(repo)
+
+
+def test_cache_file_is_a_header_line_then_the_entries(tmp_path, monkeypatch):
+    repo = _cacheable_repo(tmp_path, monkeypatch)
+    rm1 = RepoMap(repo)
+    rm1._extract_all(rm1._code_files())
+    with open(rm1._cache_file(), "rb") as f:
+        assert json.loads(f.readline()) == {
+            "v": repomap._CACHE_VERSION, "tag_fields": list(repomap.Tag._fields),
+            "root": rm1.root}
+    rm2 = RepoMap(repo)
+    rm2._load_disk_cache()
+    assert rm2._cache and rm2._cache == rm1._cache
+
+
+@pytest.mark.parametrize("stale", ["old_version", "pre_header_layout"])
+def test_stale_cache_file_is_deleted_without_unpickling(tmp_path, monkeypatch, stale):
+    rm = RepoMap(_cacheable_repo(tmp_path, monkeypatch))
+    fields = {"v": repomap._CACHE_VERSION, "tag_fields": list(repomap.Tag._fields),
+              "root": rm.root}
+    if stale == "old_version":
+        blob = (json.dumps({**fields, "v": repomap._CACHE_VERSION - 1}) + "\n").encode()
+        blob += pickle.dumps({})
+    else:  # one pickled dict carrying its own version, as written before the header
+        blob = pickle.dumps({**fields, "v": 3, "files": {}})
+    os.makedirs(repomap._CACHE_DIR)
+    with open(rm._cache_file(), "wb") as f:
+        f.write(blob)
+    unpickled = []
+    monkeypatch.setattr(repomap.pickle, "load", unpickled.append)
+    rm._load_disk_cache()
+    assert not unpickled
+    assert not os.path.exists(rm._cache_file())
+    assert rm._cache == {}
+
+
+def test_sweep_bounds_the_cache_dir_and_spares_the_current_repo(tmp_path, monkeypatch):
+    monkeypatch.setattr(repomap, "_CACHE_DIR", str(tmp_path))
+    now = time.time()
+
+    def aged(name, size, days):
+        p = tmp_path / name
+        p.write_bytes(b"x" * size)
+        os.utime(p, (now - days * 86400,) * 2)
+        return str(p)
+
+    mine = aged("mine.pkl", 600, 90)   # past max age and the oldest: still kept
+    aged("expired.pkl", 10, 40)        # past max age
+    aged("older.pkl", 500, 5)          # oldest live file, evicted to fit the cap
+    aged("newer.pkl", 300, 1)
+    aged("notes.txt", 5000, 90)        # not a cache file
+    repomap._sweep_cache_dir(mine, max_bytes=1000, max_age_s=30 * 86400)
+    survivors = sorted(p.name for p in tmp_path.iterdir())
+    assert survivors == ["mine.pkl", "newer.pkl", "notes.txt"]
+
+
+def test_first_save_in_a_process_sweeps_once(tmp_path, monkeypatch):
+    rm = RepoMap(_cacheable_repo(tmp_path, monkeypatch))
+    monkeypatch.setattr(repomap, "_SWEPT", False)
+    swept = []
+    monkeypatch.setattr(repomap, "_sweep_cache_dir", swept.append)
+    for _ in range(2):
+        rm._save_disk_cache(rm._code_files())
+    assert swept == [rm._cache_file()]

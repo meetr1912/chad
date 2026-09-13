@@ -122,6 +122,46 @@ def test_zero_hit_grep_gets_definition_pointer(on, srcfile):
     assert "[file]" not in ok
 
 
+def test_def_pointer_is_memoized_per_identifier(on, srcfile, monkeypatch):
+    """A repeated zero-hit grep reuses the session's answer instead of asking the
+    tags service again; a fresh session asks again."""
+    from chad import repomap
+    calls = []
+    real = repomap.RepoMap._find_defs
+
+    def counting(self, *a, **kw):
+        calls.append(a)
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(repomap.RepoMap, "_find_defs", counting)
+    grep = {"command": "grep -rn beta src/"}
+    for _ in range(2):
+        out = ambient.annotate("bash", grep, "[exit 1]")
+        assert "`beta` is defined at mod.py:5" in out
+    assert len(calls) == 1
+    ambient.reset()
+    ambient.annotate("bash", grep, "[exit 1]")
+    assert len(calls) == 2
+
+
+def test_def_pointer_past_its_budget_says_nothing(on, srcfile, monkeypatch):
+    """A lookup that outlasts its budget hands the result back without a pointer
+    instead of stalling it, and never raises."""
+    import time
+
+    from chad import repomap
+    monkeypatch.setattr(ambient, "_DEF_POINTER_BUDGET_S", 0.05)
+    real = repomap.RepoMap._code_files
+
+    def slow_walk(self, should_stop=None):
+        time.sleep(0.1)
+        return real(self)
+
+    monkeypatch.setattr(repomap.RepoMap, "_code_files", slow_walk)
+    out = ambient.annotate("bash", {"command": "grep -rn beta src/"}, "[exit 1]")
+    assert "is defined at" not in out
+
+
 # ---------------------------------------------------------------------------
 # empty-result diagnosis (E5)
 # ---------------------------------------------------------------------------

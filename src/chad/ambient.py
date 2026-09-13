@@ -47,6 +47,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 
 from . import levers
 from .guardrails import _RUNNER_WRAPPER_RE
@@ -57,6 +58,10 @@ from .guardrails import _RUNNER_WRAPPER_RE
 _LEDGER_MAX = 300
 _SKELETON_MAX = 220
 _SKELETON_MIN_DEFS = 3     # a 2-symbol file's structure is visible at a glance
+# The definition pointer's lookup runs between the model's tool call and its result, and
+# a cold whole-repo parse measured 17.5 s on an 11k-file repo. A decoration line gets a
+# second; past that the result goes back without it.
+_DEF_POINTER_BUDGET_S = 1.0
 _MANIFEST_PROBE_TIMEOUT = 1.5
 _MANIFEST_MAX_VERSIONS = 16
 
@@ -70,6 +75,7 @@ _wrote: list = []                # rel paths written whole (order kept, deduped)
 _last_run: dict | None = None    # {"call": int, "head": str, "exit": int}
 _baselines: dict = {}            # run key -> the run's outcome BEFORE any edit landed
 _skeleton_shown: set = set()     # abs paths whose skeleton line already rode a result
+_def_pointer_seen: dict[str, str] = {}  # identifier -> its pointer line, "" = none
 _manifest_cache: str | None = None
 
 
@@ -82,6 +88,7 @@ def reset() -> None:
     _wrote.clear()
     _last_run = None
     _skeleton_shown.clear()
+    _def_pointer_seen.clear()
     _manifest_cache = None
 
 
@@ -276,16 +283,28 @@ def _def_pointer(ident: str) -> str:
     """`[file] this came back empty; 'x' is defined at rel:line` when a bash search that
     returned nothing named a symbol the tags cache knows — the definition answer
     delivered on the bash route. The wording is about the RESULT, not the grep: in
-    `rg X src/ | grep -v y` the grep matched fine and a later stage emptied it."""
+    `rg X src/ | grep -v y` the grep matched fine and a later stage emptied it.
+
+    Memoized per identifier for the session, and bounded by _DEF_POINTER_BUDGET_S: a
+    lookup cut short may have missed same-named defs, so it answers nothing rather
+    than a partial list. A miss never re-walks the tree for newly created files."""
+    if ident in _def_pointer_seen:
+        return _def_pointer_seen[ident]
     from . import repomap
+    deadline = time.monotonic() + _DEF_POINTER_BUDGET_S
     try:
-        hits = repomap.service()._find_defs(ident)
+        hits = repomap.service()._find_defs(
+            ident, should_stop=lambda: time.monotonic() > deadline, refresh=False)
     except Exception:  # noqa: BLE001
-        return ""
-    if not hits or len(hits) > 3:  # a pile of same-named defs is not an answer
-        return ""
-    where = " · ".join(f"{d.rel}:{d.line}" for d in hits)
-    return f"[file] this came back empty; `{ident}` is defined at {where}"
+        hits = []
+    if time.monotonic() > deadline:
+        hits = []
+    line = ""
+    if hits and len(hits) <= 3:  # a pile of same-named defs is not an answer
+        where = " · ".join(f"{d.rel}:{d.line}" for d in hits)
+        line = f"[file] this came back empty; `{ident}` is defined at {where}"
+    _def_pointer_seen[ident] = line
+    return line
 
 
 def _skeleton_suffix(name: str, args: dict, result: str, step=None) -> str:
