@@ -73,10 +73,13 @@ import json
 import os
 import platform
 import time
-from typing import Any, Optional, cast
+from typing import TYPE_CHECKING, Optional, cast
 
 from . import config
 from .diag import log
+
+if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
+    import mlx.core as mx
 
 M_MAX = 8            # one MMA tile
 N_MIN = 4096         # fewer output columns = too few threadgroups to fill the GPU
@@ -480,7 +483,7 @@ def set_wins(wins: Optional[dict]) -> None:
         _install_patch()
 
 
-def stock(x, wq, sc, bi, group_size: int, bits: int) -> Any:
+def stock(x, wq, sc, bi, group_size: int, bits: int) -> "mx.array":
     import mlx.core as mx
     return mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
                                group_size=group_size, bits=bits)

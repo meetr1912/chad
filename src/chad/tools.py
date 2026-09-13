@@ -22,10 +22,13 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Mapping, Sequence, TypedDict, Union
 
 from . import config, levers, seatbelt, spill, syntaxgate
 from .ignore import IGNORE_DIRS  # noqa: F401 — re-exported for agent.expand_mentions
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeIs
 
 
 def _rel(path: str) -> str:
@@ -910,7 +913,31 @@ MUTATING = {"bash", "write", "edit"}
 # unknown-tool churn at the end of a task.
 TERMINAL = {"done", "finish", "stop"}
 
-SCHEMAS: list[dict[str, Any]] = [
+# What a tool call's arguments are before validation, and what the trajectory record
+# carries after: whatever json.loads (or the XML/hybrid parsers) produced, nested.
+# Read-only containers on purpose — Mapping/Sequence are covariant, so a dict[str, int]
+# literal already IS a JsonValue and nothing needs a cast; validate.py narrows it field
+# by field with isinstance, which is where the JSON boundary is decided.
+JsonValue = Union[None, bool, int, float, str, Sequence["JsonValue"], Mapping[str, "JsonValue"]]
+
+
+def is_json_object(value: JsonValue) -> "TypeIs[dict[str, JsonValue]]":
+    """A JSON object: the only shape a tool call's arguments can dispatch as."""
+    return isinstance(value, dict)
+
+
+class FunctionSchema(TypedDict):
+    name: str
+    description: str
+    parameters: dict[str, JsonValue]      # JSON Schema, as sent to the model
+
+
+class ToolSchema(TypedDict):
+    type: str                             # always "function"
+    function: FunctionSchema
+
+
+SCHEMAS: list[ToolSchema] = [
     {
         "type": "function",
         "function": {

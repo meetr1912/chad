@@ -63,10 +63,14 @@ that still requires an fp16 cache is opt-in wide prompt-lookup decoding
 (CHAD_USE_PLD).
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Optional, Union
 
 from . import config
 from .diag import log
+
+if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
+    import mlx.core as mx
+    from mlx_lm.models.cache import QuantizedKVCache
 
 _HEADER = """
 #include <metal_simdgroup>
@@ -1132,7 +1136,7 @@ def _pick_blocks(n: int, gqa: int = 8, S: int = 1) -> int:
     return 32
 
 
-def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
+def qsdpa(q: "mx.array", k_quant: tuple, v_quant: tuple, scale: float, n: int) -> "mx.array":
     """Fused decode attention over full padded QuantizedKVCache buffers.
 
     q: (B, HQ, 1, 256); k_quant/v_quant: (weights, scales, biases) with seq
@@ -1256,7 +1260,8 @@ def qsdpa(q: Any, k_quant: tuple, v_quant: tuple, scale: float, n: int) -> Any:
     return out
 
 
-def _eligible(q: Any, cache: Any, mask: Any) -> bool:
+def _eligible(q: "mx.array", cache: "QuantizedKVCache",
+              mask: Optional[Union[str, "mx.array"]]) -> bool:
     """True iff this call is a validated decode shape: S==1 (plain decode) or
     S in 2.._wide_s_max(gqa, offset) (the block/PLD verify forward), D==256,
     GQA in _GQAS, 8-bit group-64 quantized cache, no restricting mask.

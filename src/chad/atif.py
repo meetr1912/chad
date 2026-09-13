@@ -36,10 +36,11 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from . import config
 from .toolcall_parse import parse_tool_calls, strip_think
+from .tools import JsonValue
 
 log = logging.getLogger("chad")
 
@@ -136,8 +137,8 @@ def steps_from_messages(messages: list, model_name: Optional[str],
                 results.append(messages[j])
                 j += 1
 
-            step: dict[str, Any] = {"source": "agent", "message": visible,
-                                    "timestamp": _stamp(m)}
+            step: dict[str, JsonValue] = {"source": "agent", "message": visible,
+                                          "timestamp": _stamp(m)}
             if model_name:
                 step["model_name"] = model_name
             if reasoning.strip():
@@ -212,14 +213,14 @@ class TrajectoryRecorder:
             steps = [s for seg in self._segments for s in seg]
         for n, s in enumerate(steps, 1):     # ATIF: sequential from 1, document-wide
             s["step_id"] = n
-        agent: dict[str, Any] = {"name": self.agent_name, "version": self.agent_version}
+        agent: dict[str, JsonValue] = {"name": self.agent_name, "version": self.agent_version}
         if self.model_name:
             agent["model_name"] = self.model_name
         if self.extra:
             agent["extra"] = self.extra
-        doc: dict[str, Any] = {"schema_version": SCHEMA_VERSION,
-                               "session_id": self.session_id,
-                               "agent": agent, "steps": steps}
+        doc: dict[str, JsonValue] = {"schema_version": SCHEMA_VERSION,
+                                     "session_id": self.session_id,
+                                     "agent": agent, "steps": steps}
         mets = [s["metrics"] for s in steps if "metrics" in s]
         if mets:
             doc["final_metrics"] = {

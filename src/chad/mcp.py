@@ -42,11 +42,10 @@ import atexit
 import json
 import os
 import threading
-from functools import partial
-from typing import Any, Optional
+from typing import Optional
 
 import anyio
-from anyio.from_thread import start_blocking_portal
+from anyio.from_thread import BlockingPortal, start_blocking_portal
 
 # The SDK import is GUARDED. Everything else in this module degrades when a server is
 # missing or broken; the one thing that used to take the whole process down was the SDK
@@ -376,15 +375,15 @@ class _Conn:
     loop inside `_run_conn`; this object is the synchronous handle the agent thread
     uses to call tools and to tear the connection down."""
 
-    def __init__(self, name: str, spec: dict, transport: str):
+    def __init__(self, name: str, spec: dict, transport: str, portal: BlockingPortal):
         self.name = name
         self.spec = spec
         self.transport = transport       # "stdio" | "http"
         self.tools = []                  # SDK Tool objects (empty if connect failed)
         self.error: Optional[str] = None         # human string if the server is unusable
-        self.session: Any = None         # live ClientSession (loop thread); set on connect
-        self.portal: Any = None          # the registry's BlockingPortal
-        self._stop: Any = None           # anyio.Event on the loop; set to unwind scopes
+        self.session: Optional["ClientSession"] = None  # live (loop thread); set on connect
+        self.portal = portal             # the registry's, shared by every server
+        self._stop = portal.call(anyio.Event)  # on the loop; set to unwind the scopes
         self._ready = threading.Event()  # connect attempt finished (ok or error)
         self._done = threading.Event()   # connect task fully unwound
 
@@ -393,17 +392,18 @@ class _Conn:
         error; a tool-reported error (is_error) is returned as text via _render_result."""
         timeout = self.spec.get("timeout")
         timeout = timeout if isinstance(timeout, (int, float)) else _CALL_TIMEOUT
-        res = self.portal.call(partial(_invoke, self.session, raw, arguments, timeout))
+        if self.session is None:
+            raise RuntimeError(f"MCP server {self.name!r} is not connected")
+        res = self.portal.call(_invoke, self.session, raw, arguments, timeout)
         return _render_result(res)
 
     def close(self):
         """Signal the connect task to unwind its session + transport on the loop
         thread, then wait briefly for it so no subprocess / socket leaks."""
-        if self.portal is not None and self._stop is not None:
-            try:
-                self.portal.call(self._stop.set)
-            except Exception:  # noqa: BLE001 — portal may already be shutting down
-                pass
+        try:
+            self.portal.call(self._stop.set)
+        except Exception:  # noqa: BLE001 — portal may already be shutting down
+            pass
         self._done.wait(timeout=5)
 
 
@@ -505,9 +505,7 @@ class _Registry:
         self.portal = self._portal_cm.__enter__()
         pending = []
         for name, spec, kind, build in to_connect:
-            conn = _Conn(name, spec, kind)
-            conn.portal = self.portal
-            conn._stop = self.portal.call(anyio.Event)
+            conn = _Conn(name, spec, kind, self.portal)
             self.clients.append(conn)
             ct = spec.get("connect_timeout")
             ct = ct if isinstance(ct, (int, float)) else _CONNECT_TIMEOUT

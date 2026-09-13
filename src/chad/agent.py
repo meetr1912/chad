@@ -51,6 +51,7 @@ from .tools import (
     alias_to_bash,
     clear_todos,
     dispatch_for,
+    is_json_object,
     is_mutating,
     outside_workspace,
     unfinished_todos,
@@ -1538,10 +1539,11 @@ class Agent:
                     render_tool_result(self._emit, name, args, result)
                     self.messages.append({"role": "tool", "name": name, "content": result})
                     continue
-                if coerced != args:
-                    log.info("VALIDATE %s coerced: %s -> %s", name,
-                             args_preview(args), args_preview(coerced))
-                args = coerced
+                if is_json_object(coerced):
+                    if coerced != args:
+                        log.info("VALIDATE %s coerced: %s -> %s", name,
+                                 args_preview(args), args_preview(coerced))
+                    args = coerced
                 if name == "write_todos":
                     # Arms the open-todo question on this turn's `done` — whether the plan
                     # was written in an earlier step or batched with `done` itself.

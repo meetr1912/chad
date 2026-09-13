@@ -26,10 +26,10 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from . import config
-from .tools import active_schemas
+from .tools import JsonValue, active_schemas
 
 # A/B knob, the single source of truth for both the
 # typed-validate path here and the lenient tool-call parse in toolcall_parse.py.
@@ -162,7 +162,7 @@ def _balance(s: str) -> str:
     return s + "".join(reversed(stack))
 
 
-def repair_json(raw: Any) -> Optional[dict]:
+def repair_json(raw: JsonValue) -> Optional[dict]:
     """Best-effort parse of a possibly-malformed JSON object. Returns the dict,
     or None if even the repaired text won't parse. String values come back
     exactly as written; only the JSON structure around them is repaired."""
@@ -209,7 +209,7 @@ class Err:
         return f"{self.path}: expected {self.expected}, got {self.got}"
 
 
-def _tname(v: Any) -> str:
+def _tname(v: JsonValue) -> str:
     if isinstance(v, bool):
         return "boolean"
     if isinstance(v, int):
@@ -245,7 +245,7 @@ _TRUE = {"true", "yes", "1"}
 _FALSE = {"false", "no", "0"}
 
 
-def _coerce_scalar(value: Any, typ: Optional[str]) -> Tuple[Any, bool]:
+def _coerce_scalar(value: JsonValue, typ: Optional[str]) -> Tuple[JsonValue, bool]:
     """Return (coerced_value, ok). ok=False means it cannot be made to fit."""
     if typ == "integer":
         if isinstance(value, bool):
@@ -290,7 +290,7 @@ def _coerce_scalar(value: Any, typ: Optional[str]) -> Tuple[Any, bool]:
     return value, True
 
 
-def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
+def _walk(value: JsonValue, schema: dict, path: str) -> Tuple[JsonValue, List[Err]]:
     # `anyOf` — a field with two equally legitimate shapes (write_todos' checklist
     # string vs the structured list). Take the first branch that validates cleanly, so
     # the model never has to guess which one the schema wanted. Branch order is
@@ -365,14 +365,14 @@ def _walk(value: Any, schema: dict, path: str) -> Tuple[Any, List[Err]]:
     return coerced, []
 
 
-def _load_json(s: str) -> Optional[Any]:
+def _load_json(s: str) -> Optional[JsonValue]:
     try:
         return json.loads(s)
     except (json.JSONDecodeError, TypeError):
         return None
 
 
-def coerce_and_validate(name: str, args: Any) -> Tuple[Any, List[Err]]:
+def coerce_and_validate(name: str, args: JsonValue) -> Tuple[JsonValue, List[Err]]:
     """Coerce loosely-typed args toward the schema and return (coerced, errors).
     An empty error list means `coerced` is safe to dispatch."""
     schema = _param_schema(name)
@@ -395,7 +395,7 @@ def coerce_and_validate(name: str, args: Any) -> Tuple[Any, List[Err]]:
 # ---------------------------------------------------------------------------
 
 
-def render_repair(name: str, args: Any, errors: List[Err]) -> str:
+def render_repair(name: str, args: JsonValue, errors: List[Err]) -> str:
     if _param_schema(name) is None:
         # A name with non-identifier characters ('grep</argstr') is not a naming
         # mistake — the model's call SYNTAX was garbled. Saying "unknown tool, pick
@@ -424,7 +424,7 @@ def render_repair(name: str, args: Any, errors: List[Err]) -> str:
     return "\n".join(lines)
 
 
-def _echo_call(name: str, args: Any) -> str:
+def _echo_call(name: str, args: JsonValue) -> str:
     """The model's own call, re-rendered in the dialect the chat template mandates.
     This echo sits directly above the model's retry, so it is a few-shot example of the
     call shape whether or not it is meant as one; rendering it as a JSON object showed

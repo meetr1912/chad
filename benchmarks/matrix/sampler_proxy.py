@@ -243,8 +243,9 @@ def _force(body: dict, path: str) -> tuple:
     body["timings_per_token"] = True
     if body.get("stream") and path.endswith("chat/completions"):
         opts = body.get("stream_options")
-        body["stream_options"] = {**(opts if isinstance(opts, dict) else {}),
-                                  "include_usage": True}
+        stream_options = dict(opts) if isinstance(opts, dict) else {}
+        stream_options["include_usage"] = True
+        body["stream_options"] = stream_options
     forced = {k: body[k] for k in sorted(keys)}
     return asked, forced
 

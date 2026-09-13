@@ -33,13 +33,16 @@ attention + quantized swiglu MLP). Anything unexpected → install() is a silent
 no-op (stock behavior). Opt out with CHAD_NO_FASTPATH=1.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Optional
 
 from . import config, mlx_qmm_mma
 from .diag import log
 
+if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
+    import mlx.nn as nn
 
-def install(model: Any, model_path: Any = None) -> bool:
+
+def install(model: "nn.Module", model_path: Optional[str] = None) -> bool:
     """Apply the decode fast-path to a loaded mlx_lm model, in place.
 
     Returns True if installed, False if skipped (wrong architecture, flag off,

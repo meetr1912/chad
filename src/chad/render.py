@@ -141,11 +141,10 @@ def _split_view(raw: str, final: bool, started_in_think: bool = False):
             return "", (s if final else _safe_cut(s))
         think_parts.append(s[:close])
         s = s[close + len("</think>"):]
-    # SAFETY: `.append(...) or ""` is intentional: append returns None, so the
-    # replacement is always "" while capturing the matched group as a side effect.
-    s = re.sub(r"<think>(.*?)</think>",
-               lambda m: think_parts.append(m.group(1)) or "",  # type: ignore[func-returns-value]
-               s, flags=re.DOTALL)
+    def take_think(m: "re.Match[str]") -> str:
+        think_parts.append(m.group(1))
+        return ""
+    s = re.sub(r"<think>(.*?)</think>", take_think, s, flags=re.DOTALL)
     if "<think>" in s:  # reasoning still open: everything after the tag is current thought
         pre, _, post = s.partition("<think>")
         think_parts.append(post)
