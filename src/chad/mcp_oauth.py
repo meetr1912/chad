@@ -70,9 +70,11 @@ try:
     )
     _SDK_ERROR: "str | None" = None
 except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
+    # SAFETY: the None sentinels are never dereferenced: `_SDK_ERROR` is set on this
+    # same path and `oauth_enabled()` reports False while it is set.
     OAuthClientProvider = AuthorizationCodeResult = None          # type: ignore[assignment,misc]
-    OAuthClientInformationFull = OAuthClientMetadata = None       # type: ignore[assignment,misc]
-    OAuthToken = None                                             # type: ignore[assignment,misc]
+    OAuthClientInformationFull = OAuthClientMetadata = None       # type: ignore[assignment,misc]  # SAFETY: behind _SDK_ERROR
+    OAuthToken = None                                             # type: ignore[assignment,misc]  # SAFETY: behind _SDK_ERROR
     _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from . import config
@@ -282,7 +284,8 @@ class LoopbackServer:
 
 def _client_metadata(redirect_uri: str, scope: str | None) -> "OAuthClientMetadata":
     return OAuthClientMetadata(
-        # pydantic coerces the str to AnyUrl at construction; the annotation is stricter.
+        # SAFETY: pydantic coerces the str to AnyUrl at construction; the annotation is
+        # stricter than the accepted input.
         redirect_uris=[redirect_uri],  # type: ignore[list-item]
         client_name="chad",
         grant_types=["authorization_code", "refresh_token"],

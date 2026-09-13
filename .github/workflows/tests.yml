@@ -34,6 +34,8 @@ jobs:
       - run: uv sync
       - name: ruff (lint + import order)
         run: make lint
+      - name: anti-slop (evidence policy; stdlib-only, runs on 3.12)
+        run: make slop
 
   typecheck:
     # mypy runs on macOS because the mlx stubs DO matter: on Linux mlx is not installed,

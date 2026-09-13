@@ -7,7 +7,7 @@ environment approval — publishes `chad-code` to PyPI.
 ## Checklist
 
 1. **Gate green, locally and in CI** (it loads no model weights). It runs lint,
-   typecheck and tests, the same targets CI runs:
+   typecheck, anti-slop and tests, the same targets CI runs:
    ```bash
    make gate
    ```

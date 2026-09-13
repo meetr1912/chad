@@ -70,9 +70,11 @@ try:
     from mcp.types import PaginatedRequestParams
     _SDK_ERROR: Optional[str] = None
 except Exception as _e:  # noqa: BLE001 — any import-time failure, not just ImportError
+    # SAFETY: the None sentinels are never dereferenced: `_SDK_ERROR` is set on this
+    # same path and `_Registry._connect` refuses every server while it is set.
     ClientSession = StdioServerParameters = None    # type: ignore[assignment,misc]
-    stdio_client = streamable_http_client = None    # type: ignore[assignment]
-    create_mcp_http_client = PaginatedRequestParams = None  # type: ignore[assignment,misc]
+    stdio_client = streamable_http_client = None    # type: ignore[assignment]  # SAFETY: behind _SDK_ERROR
+    create_mcp_http_client = PaginatedRequestParams = None  # type: ignore[assignment,misc]  # SAFETY: behind _SDK_ERROR
     _SDK_ERROR = f"{type(_e).__name__}: {_e}"
 
 from . import mcp_oauth

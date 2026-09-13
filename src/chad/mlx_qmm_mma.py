@@ -281,8 +281,11 @@ def _install_patch() -> None:
             y = y + self["bias"]
         return y
 
+    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
+    # does not declare them), and nn.QuantizedLinear is a plain Python class, so the
+    # method is reassignable in place; only the stubs say otherwise.
     call._chad_qmm_mma = True  # type: ignore[attr-defined]
-    nn.QuantizedLinear.__call__ = call  # type: ignore[method-assign]
+    nn.QuantizedLinear.__call__ = call  # type: ignore[method-assign]  # SAFETY: plain class
 
 
 # ------------------------------------------------------------------ calibration
@@ -367,9 +370,8 @@ def measure(groups: dict, verbose: bool = False) -> dict:
             diff = mx.max(mx.abs(ref - got))
             scale = mx.max(mx.abs(ref))
             mx.eval(diff, scale)
-            # cast: the mlx stub types .item() as int|float|complex; these scalars are real
-            d = cast(float, diff.item())
-            s = cast(float, scale.item())
+            # SAFETY: the mlx stub types .item() as int|float|complex; these scalars are real
+            d, s = cast(float, diff.item()), cast(float, scale.item())
             if d > _REL_TOL * max(s, 1.0):
                 ok = False
                 break

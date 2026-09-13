@@ -16,14 +16,22 @@ tooling improvements. The gate is fast and needs **no model weights**:
 make gate
 ```
 
-That runs three targets in order, and CI (`.github/workflows/tests.yml`) runs the same ones:
+That runs four targets in order, and CI (`.github/workflows/tests.yml`) runs the same ones:
 
 - `make lint` runs `ruff check` over `src`, `tests` and `benchmarks`.
 - `make typecheck` runs `mypy` over `src/chad`.
+- `make slop` runs the vendored [anti-slop](https://github.com/TinyFrontier/anti-slop-py)
+  linter (`tools/anti_slop`, stdlib-only, needs Python 3.12 — `uv` fetches one) over the
+  same three trees. It rejects the escape hatches ruff and mypy permit by construction:
+  `Any`/`object` contracts, `dict[str, Any]`, string-name `getattr`, `mock.patch`, and any
+  `cast` or `# type: ignore[code]` without a `# SAFETY: <invariant>` comment. Findings
+  that predate the linter are recorded in `.anti-slop-baseline.json` and resurface when
+  their line is edited; `make slop-review` shows only what your branch added, with the
+  recipe for each.
 - `make test` runs `pytest -q`, which loads no model and finishes in seconds.
 
-A green `make test` alone still fails the build if `ruff` or `mypy` is unhappy, so run the
-whole gate before opening a PR.
+A green `make test` alone still fails the build if `ruff`, `mypy` or anti-slop is unhappy,
+so run the whole gate before opening a PR.
 
 ### Running the model-backed tests
 

@@ -723,7 +723,7 @@ def _load_sidecar(sdir: str, bits: int, gs: int):
         cfg = DFlashConfig.from_dict(json.load(f))
     drafter = build(cfg)
     _quantize(drafter, bits, gs)
-    # cast: mx.load returns a dict for a .safetensors path; the stub types a 3-way union
+    # SAFETY: mx.load returns a dict for a .safetensors path; the stub types a 3-way union
     loaded = cast(dict, mx.load(os.path.join(sdir, "model.safetensors")))
     drafter.load_weights(list(loaded.items()))
     drafter.eval()
@@ -746,7 +746,7 @@ def build_sidecar(src_dir: str, out_dir: str, bits: int = 4, gs: int = 64) -> st
     drafter = build(cfg)
     weights: dict = {}
     for st in sorted(glob.glob(os.path.join(src_dir, "*.safetensors"))):
-        weights.update(cast(dict, mx.load(st)))  # a dict for .safetensors, see _load_sidecar
+        weights.update(cast(dict, mx.load(st)))  # SAFETY: a dict for .safetensors, see _load_sidecar
     weights = _remap(weights)
     drafter.load_weights(list(weights.items()))
     del weights

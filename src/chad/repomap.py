@@ -40,8 +40,11 @@ try:
     import tree_sitter_language_pack as tlp
     from tree_sitter import Parser, Query, QueryCursor
 except ImportError:  # pragma: no cover — exercised only on wheel-less platforms
+    # SAFETY: every dereference sits inside `lang_for`/`_lang_tools`, whose
+    # `except Exception` turns the error on a None sentinel into the same None the
+    # callers already handle for a language without a grammar.
     tlp = None                              # type: ignore[assignment]
-    Parser = Query = QueryCursor = None     # type: ignore[assignment,misc]
+    Parser = Query = QueryCursor = None     # type: ignore[assignment,misc]  # SAFETY: as tlp
 
 from . import config
 from .ignore import IGNORE_DIRS, REPOMAP_EXTRA

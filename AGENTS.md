@@ -8,15 +8,17 @@ proposing a redesign — this file does not repeat them.
 
 ## Gate
 
-Run `make gate` before you call anything done. It runs three targets in order, and CI runs
-the same three:
+Run `make gate` before you call anything done. It runs four targets in order, and CI runs
+the same four:
 
 - `make lint` — `uv run ruff check src tests benchmarks`
 - `make typecheck` — `uv run mypy src/chad`
+- `make slop` — the vendored anti-slop linter (`tools/anti_slop`) over `src`, `tests`
+  and `benchmarks`; stdlib-only, runs on its own 3.12 interpreter
 - `make test` — `uv run pytest -q`, which loads no model and finishes in seconds
 
-A green `make test` alone still fails the build if ruff or mypy is unhappy, so run the
-whole gate. Run `make typecheck` **on macOS**: on Linux mlx is not installed,
+A green `make test` alone still fails the build if ruff, mypy or anti-slop is unhappy, so
+run the whole gate. Run `make typecheck` **on macOS**: on Linux mlx is not installed,
 `ignore_missing_imports` types every mlx symbol as `Any`, and the check passes vacuously
 over exactly the engine and kernel modules it should guard.
 
@@ -54,8 +56,18 @@ comment above the bound you want to move, re-gate that release, then move it.
 
 ## Conventions
 
-- ruff and mypy are the law. Match the surrounding comment density and naming, and write
-  code that reads like the code already there.
+- ruff, mypy and anti-slop are the law. Match the surrounding comment density and naming,
+  and write code that reads like the code already there.
+- anti-slop bans the escape hatches a checker error tempts you into: no `Any`/`object`
+  parameters or returns, no `dict[str, Any]`, no `getattr`/`setattr` by string, no
+  `mock.patch`, and every `cast` or `# type: ignore[code]` carries a `# SAFETY: <why>`
+  comment on its line or directly above. Name the contract instead: parse at the I/O
+  boundary, declare the type, inject the seam. `make slop-review` reads back only the
+  findings on lines your change touched, each with the recipe that replaces it;
+  `uv run --python 3.12 --no-project python tools/anti_slop --explain <rule>` gives the
+  reasoning. Pre-existing findings sit in `.anti-slop-baseline.json` and come back the
+  moment their line is edited — fix them then. Never regenerate the baseline, add an
+  `# anti-slop: ignore[...]`, or set a rule to `off` to make a new finding go away.
 - Comments carry behavioural rationale only — no plan numbers, kata refs or benchmark
   references in code.
 - The version lives in **both** `pyproject.toml` and `src/chad/__init__.py` and the two

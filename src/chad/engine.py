@@ -46,13 +46,15 @@ try:
     _HAS_MLX = True
     _MLX_IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as _e:  # non-Apple host: remote backend only
-    # `unused-ignore` because the `assignment` ignore is only *needed* where mlx is
-    # installed (mac). On the Linux lint runner mlx is absent, `ignore_missing_imports`
+    # SAFETY: these None sentinels are only ever reached behind `_HAS_MLX`, which the
+    # in-process engine checks before it touches any of them (the remote backend never
+    # does). `unused-ignore` because the `assignment` ignore is only *needed* where mlx
+    # is installed (mac). On the Linux lint runner mlx is absent, `ignore_missing_imports`
     # types these as Any, and the bare ignore would trip `warn_unused_ignores`.
     mx = None  # type: ignore[assignment, unused-ignore]
-    stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment, unused-ignore]
-    apply_min_p = apply_top_p = None  # type: ignore[assignment, unused-ignore]
-    _download = load_config = load_model = load_tokenizer = None  # type: ignore[assignment, unused-ignore]
+    stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment, unused-ignore]  # SAFETY: behind _HAS_MLX
+    apply_min_p = apply_top_p = None  # type: ignore[assignment, unused-ignore]  # SAFETY: behind _HAS_MLX
+    _download = load_config = load_model = load_tokenizer = None  # type: ignore[assignment, unused-ignore]  # SAFETY: behind _HAS_MLX
     _HAS_MLX = False
     # Stash the real cause. A *missing* mlx is the benign Linux case; a mlx that
     # is present but fails to import (e.g. a half-installed mlx-metal wheel whose
@@ -757,8 +759,8 @@ class Engine:
                 return
             # Scales/norms carry the model's compute dtype; quantized weights
             # are uint32, so take the first float parameter rather than guess.
-            # tree_flatten yields (path, array) pairs; the stub types it loosely
-            # enough that mypy reads the element as a str.
+            # SAFETY: tree_flatten yields (path, array) pairs; the stub types it
+            # loosely enough that mypy reads the element as a str.
             dt = next((p.dtype for _, p in tree_flatten(  # type: ignore[misc]
                 self.model.parameters())
                 if p.dtype in (mx.float16, mx.bfloat16)), None)
@@ -912,8 +914,8 @@ class Engine:
         h.update(f"ctx{self.effective_ctx or 0}".encode())
         h.update(b"\x00")
         h.update(np.asarray(ids, dtype=np.uint32).tobytes())
-        # cache_dir is Optional on the dataclass but is always set when checkpointing
-        # is enabled, which is the only path that reaches _ckpt_path.
+        # SAFETY: cache_dir is Optional on the dataclass but is always set when
+        # checkpointing is enabled, which is the only path that reaches _ckpt_path.
         return os.path.join(self.cache_dir, f"{_CKPT_WARM}-{h.hexdigest()}.safetensors")  # type: ignore[arg-type]
 
     def warm_prefix(self, prefix_ids: list, should_stop=None, head_ids=None):

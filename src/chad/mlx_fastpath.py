@@ -148,8 +148,11 @@ def _patch_dense_mlp_call() -> None:
         g, u = mx.split(gu, 2, axis=-1)
         return self.down_proj(swiglu(g, u))
 
+    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
+    # does not declare them), and mlx_lm's classes are plain Python, so the method is
+    # reassignable in place; only the stubs say otherwise.
     fused_call._chad_fastpath = True  # type: ignore[attr-defined]
-    q35.MLP.__call__ = fused_call  # type: ignore[method-assign]
+    q35.MLP.__call__ = fused_call  # type: ignore[method-assign]  # SAFETY: plain class
 
 
 def _concat_gdn_in_projs(model) -> None:
@@ -266,8 +269,11 @@ def _patch_gdn_call() -> None:
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
 
+    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
+    # does not declare them), and mlx_lm's classes are plain Python, so the method is
+    # reassignable in place; only the stubs say otherwise.
     call._chad_fastpath = True  # type: ignore[attr-defined]
-    q35.GatedDeltaNet.__call__ = call  # type: ignore[method-assign]
+    q35.GatedDeltaNet.__call__ = call  # type: ignore[method-assign]  # SAFETY: plain class
 
 
 def _install_layer_fastpath(model) -> None:
@@ -315,8 +321,11 @@ def _install_layer_fastpath(model) -> None:
         # equal-speed options.
         return stock_layer_call(self, x, mask=mask, cache=cache)
 
+    # SAFETY: a function object takes arbitrary attributes at runtime (the stub just
+    # does not declare them), and mlx_lm's classes are plain Python, so the method is
+    # reassignable in place; only the stubs say otherwise.
     layer_call._chad_fastpath = True  # type: ignore[attr-defined]
-    q35.DecoderLayer.__call__ = layer_call  # type: ignore[method-assign]
+    q35.DecoderLayer.__call__ = layer_call  # type: ignore[method-assign]  # SAFETY: plain class
 
 
 def _compile_gdn_step(layer):

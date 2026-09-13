@@ -472,10 +472,10 @@ def _nearest_resolved(lines: list[str], resolved: list[str | None],
     unless some line resolved, so the final `("", ...)` is unreachable in practice."""
     for j in range(i - 1, -1, -1):
         if resolved[j] is not None:
-            return resolved[j], True, lines[j].strip()  # type: ignore[return-value]
+            return resolved[j], True, lines[j].strip()  # type: ignore[return-value]  # SAFETY: checked non-None
     for j in range(i + 1, len(lines)):
         if resolved[j] is not None:
-            return resolved[j], False, lines[j].strip()  # type: ignore[return-value]
+            return resolved[j], False, lines[j].strip()  # type: ignore[return-value]  # SAFETY: checked non-None
     return "", False, ""
 
 

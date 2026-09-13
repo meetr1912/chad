@@ -1509,6 +1509,8 @@ def install() -> bool:
         return stock(queries, keys, values, cache=cache, scale=scale,
                      mask=mask, sinks=sinks)
 
+    # SAFETY: a function object takes arbitrary attributes at runtime; the stub just
+    # does not declare them.
     patched._chad_qsdpa = True  # type: ignore[attr-defined]
     lm_base.scaled_dot_product_attention = patched
     # models import the helper by name at module load; rebind any that did.

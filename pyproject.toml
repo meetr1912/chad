@@ -144,7 +144,7 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 # Vendored Exercism exercises (benchmarks/matrix/tasks/) are upstream files, kept byte-identical.
-extend-exclude = ["benchmarks/matrix/tasks"]
+extend-exclude = ["benchmarks/matrix/tasks", "tools/anti_slop"]  # vendored linter: not chad's style
 src = ["src", "tests"]
 
 [tool.ruff.lint]
@@ -199,3 +199,51 @@ ignore_errors = true
 # that is likewise Any on Linux.
 module = ["chad.mlx_fastpath", "chad.mlx_qmm_mma", "chad.engine"]
 warn_unused_ignores = false
+
+# anti-slop: the third lane of the gate, next to ruff (style/correctness) and mypy
+# (types). It rejects the evidence-discarding patterns a coding agent reaches for when a
+# checker complains — `Any`/`object` contracts, unexplained `cast`/`# type: ignore`,
+# string-target mocking, `getattr` dispatch — which ruff and mypy both permit by
+# construction. Vendored (tools/anti_slop, MIT, TinyFrontier/anti-slop-py) so it needs
+# no dependency and runs on the stdlib alone; it does need Python 3.12+, so `make slop`
+# runs it under `uv run --python 3.12` regardless of the 3.11 project pin.
+# Run `uv run --python 3.12 --no-project python tools/anti_slop --explain <rule>` for
+# the reasoning behind any finding.
+[tool.anti-slop]
+include = ["src", "tests", "benchmarks"]
+exclude = [
+    ".agents/**",
+    ".claude/**",
+    "src/chad/parakeet/**",          # vendored upstream, not held to chad's gate (see ruff/mypy)
+    "benchmarks/matrix/tasks/**",    # vendored Exercism exercises, kept byte-identical
+    "tools/anti_slop/**",
+]
+# Pre-existing findings live in the baseline (regenerate: `make slop-baseline`). A run
+# fails only on what is NEW; edit a baselined line and its finding comes back, so the
+# debt retires as the code it sits on is touched. Never regenerate to hide a new finding.
+baseline = ".anti-slop-baseline.json"
+
+[tool.anti-slop.rules]
+# Escape-hatch tier: every one at error. These discard evidence the checker already had.
+no-any-parameters = "error"
+no-any-returns = "error"
+no-any-type-aliases = "error"
+no-chained-casts = "error"
+no-conditional-empty-dict-spread = "error"
+no-dynamic-dispatch = "error"
+no-known-value-widening = "error"
+no-unsafe-dict-values = "error"
+no-widen-then-cast = "error"
+require-safety-comment = "error"
+# Architectural tier: policy, also at error, with the two exceptions below.
+no-object-parameters = "error"
+no-string-attribute-access = "error"
+no-module-mocking = "error"
+# chad's domain objects ARE untyped model output: tool args arrive as JSON the model
+# wrote, and validate.py/mcp.py decode them at that boundary with isinstance — which is
+# the recipe this rule prescribes, not the pattern it bans (the linter's own repository
+# turns it off for the same reason over ast nodes). Kept at warn so a new inline
+# isinstance deep in agent code still reports, without failing the run.
+no-adhoc-isinstance = "warn"
+# Tensor shapes are domain vocabulary in the MLX kernel modules; `shape` names the thing.
+no-shape-in-symbol-names = { level = "error", terms = [] }
