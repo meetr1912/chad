@@ -65,7 +65,7 @@ def _sse(*chunks):
 
 def _adapter_with_stream(lines):
     ad = CompletionEngine(model_id="ornith", base_url="http://x:8081")
-    ad._stream_completion = lambda body: iter(lines)   # stub: no network
+    ad._stream_completion = lambda body: (line for line in lines)   # stub: no network
     return ad
 
 
@@ -208,25 +208,40 @@ def test_server_error_chunk_is_transient():
     assert ei.value.transient is True
 
 
-def test_http_5xx_is_transient_and_4xx_is_not(monkeypatch):
-    """Exercises the real `_stream_completion` HTTPError->BackendError conversion by
-    stubbing urlopen (stubbing _stream_completion itself would skip the code under test)."""
-    import io
-    import urllib.error
-    import urllib.request
+def test_http_5xx_is_transient_and_4xx_is_not():
+    """Exercises the real `_stream_completion` HTTPError->BackendError conversion against
+    a local server answering each status (stubbing _stream_completion itself would skip
+    the code under test)."""
+    import http.server
+    import threading
 
     import pytest
 
     from chad.base_engine import BackendError
 
     for code, transient in ((503, True), (422, False)):
-        def _urlopen(req, timeout=None, _code=code):
-            raise urllib.error.HTTPError("http://x", _code, "boom", {}, io.BytesIO(b"detail"))
-        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
-        ad = CompletionEngine(model_id="ornith", base_url="http://x:8081")
-        with pytest.raises(BackendError) as ei:
-            ad.generate([1])
-        assert ei.value.transient is transient, code
+        class _Status(http.server.BaseHTTPRequestHandler):
+            def do_POST(self, _code=code):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(_code)
+                self.end_headers()
+                self.wfile.write(b"detail")
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Status)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            ad = CompletionEngine(model_id="ornith",
+                                  base_url=f"http://127.0.0.1:{server.server_port}")
+            with pytest.raises(BackendError) as ei:
+                ad.generate([1])
+            assert ei.value.transient is transient, code
+            assert "detail" in str(ei.value)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 def test_reset_clears_the_cache_mirror():
@@ -278,7 +293,7 @@ def _salvage_adapter(first_lines, cont_lines):
     def stream(body):
         bodies.append(body)
         is_continuation = len(bodies) > 1
-        return iter(cont_lines if is_continuation else first_lines)
+        return (line for line in (cont_lines if is_continuation else first_lines))
 
     ad._stream_completion = stream
     return ad, bodies

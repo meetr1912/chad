@@ -37,8 +37,7 @@ def _clean_registry(tmp_path, monkeypatch):
     HOME so the developer's real ~/.claude/skills never leaks into discovery."""
     empty_home = tmp_path / "_empty_home"
     empty_home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(empty_home) if p == "~" or p.startswith("~/") else p)
+    monkeypatch.setenv("HOME", str(empty_home))
     skills.reset_session()
     yield
     skills.reset_session()
@@ -215,7 +214,7 @@ def test_registry_cached_and_rebuilt_on_cwd_change(tmp_path, monkeypatch):
     home = tmp_path / "home"
     _write_skill(str(proj_a / ".agents" / "skills"), "skill-a")
     _write_skill(str(proj_b / ".agents" / "skills"), "skill-b")
-    monkeypatch.setattr(os.path, "expanduser", lambda p: str(home) if p == "~" else p)
+    monkeypatch.setenv("HOME", str(home))
 
     monkeypatch.chdir(proj_a)
     assert skills.skill_names() == ["skill-a"]

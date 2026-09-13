@@ -94,7 +94,7 @@ def _entries(d: str):
     return out
 
 
-def _prune(d: str) -> None:
+def _prune(d: str, max_bytes: int = MAX_DIR_BYTES) -> None:
     """Enforce both budgets, oldest-first: the per-kind file count, then the
     dir-wide byte total. Never raises."""
     entries = _entries(d)
@@ -116,7 +116,7 @@ def _prune(d: str) -> None:
     # and a single oversized body must degrade the budget, not vanish from under its
     # own pointer.
     for e in live[:-1]:
-        if total <= MAX_DIR_BYTES:
+        if total <= max_bytes:
             break
         doomed.append(e)
         total -= sizes[e]
@@ -127,7 +127,7 @@ def _prune(d: str) -> None:
             pass
 
 
-def write(text: str, kind: str = "bash") -> str | None:
+def write(text: str, kind: str = "bash", max_dir_bytes: int = MAX_DIR_BYTES) -> str | None:
     """Write `text` to a fresh 0600 spill file and return its absolute path, or None
     if the write failed — spilling is best-effort, and a disk error must not turn a
     successful tool call into a broken result."""
@@ -142,7 +142,7 @@ def write(text: str, kind: str = "bash") -> str | None:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as f:
             f.write(text)
-        _prune(d)
+        _prune(d, max_dir_bytes)
         return os.path.abspath(path)
     except OSError:
         return None

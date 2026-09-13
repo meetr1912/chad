@@ -16,7 +16,7 @@ working unchanged.
 import json
 import re
 
-from .tools import JsonValue
+from .tools import JsonValue, is_json_object
 from .validate import (  # VALIDATE: single source of truth in validate.py
     VALIDATE,
     _known_tools,
@@ -212,7 +212,7 @@ def parse_tool_calls(text: str):
         args = obj.get("arguments", obj.get("parameters", {}))
         if isinstance(args, str):  # whole arguments value double-stringified
             args = repair_json(args) or args
-        if not isinstance(args, dict):
+        if not is_json_object(args):
             args = {}
         calls.append((salvage_tool_name(str(name)), args))
     return calls

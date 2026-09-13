@@ -14,7 +14,7 @@ can't silently re-open the hole:
    command (`rm -rf ~`, `curl|sh`) is screened even in --yolo mode, and headless
    with no confirm channel it BLOCKS rather than runs. The predicate
    (`guardrails.is_destructive_bash`) is tested elsewhere; this pins the run-vs-block
-   WIRING — the part a refactor that dropped `not sys.stdin.isatty()` would break.
+   WIRING — the part a refactor that dropped `not self._is_tty()` would break.
 
 These characterize behavior; if any comes out RED that is a real bug (a broken guard),
 not a test to rewrite green — STOP and report (STOP conditions).
@@ -147,11 +147,10 @@ def test_confirm_auto_destructive_headless_blocks(monkeypatch):
     """yolo mode + a destructive bash + no confirm channel (no callback, not a TTY) → the
     seatbelt BLOCKS (returns False) rather than executing on a possible injection, and says
     so on the transcript. This is the exact wiring a refactor dropping the
-    `not sys.stdin.isatty()` block would silently re-open."""
+    `not self._is_tty()` block would silently re-open."""
     monkeypatch.delenv("CHAD_NO_DESTRUCTIVE_GUARD", raising=False)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     seen = []
-    agent = _mk_agent(mode="yolo", emit=lambda k, t: seen.append((k, t)))
+    agent = _mk_agent(mode="yolo", emit=lambda k, t: seen.append((k, t)), is_tty=lambda: False)
     # _confirm_cb defaults to None (no callback), so the headless-block branch is reached.
     check("destructive bash is blocked headless",
           agent._confirm("bash", {"command": _RM_HOME}) is False)
@@ -181,8 +180,7 @@ def test_confirm_headless_block_sets_truthful_deny_reason(monkeypatch):
     same delete 30 times against it."""
     monkeypatch.delenv("CHAD_NO_DESTRUCTIVE_GUARD", raising=False)
     monkeypatch.delenv("CHAD_DISABLE", raising=False)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    agent = _mk_agent(mode="yolo")
+    agent = _mk_agent(mode="yolo", is_tty=lambda: False)
     check("block still blocks", agent._confirm("bash", {"command": _RM_HOME}) is False)
     check("deny reason names the guard, not the user",
           agent._deny_reason is not None and "destructive-command guard" in agent._deny_reason,
@@ -193,8 +191,7 @@ def test_confirm_guard_opt_out(monkeypatch):
     """CHAD_NO_DESTRUCTIVE_GUARD=1 disables the seatbelt: the same catastrophic command in
     yolo mode with no channel now runs (returns True) instead of blocking."""
     monkeypatch.setenv("CHAD_NO_DESTRUCTIVE_GUARD", "1")
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
-    agent = _mk_agent(mode="yolo")
+    agent = _mk_agent(mode="yolo", is_tty=lambda: False)
     check("opt-out lets the destructive command run",
           agent._confirm("bash", {"command": _RM_HOME}) is True)
 

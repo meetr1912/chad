@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from typing import Callable
 
 from . import (
     ambient,
@@ -450,6 +451,10 @@ INIT_PROMPT = (
 
 
 class Agent:
+    # Resolved lazily and cached per agent; the class-level value is the unresolved state.
+    _split_ok: bool | None = None
+    _dumped_render: bool = False
+
     def __init__(self, engine: BaseEngine, yolo: bool = False, max_steps: int = 40,
                  ctx_limit: int = 24000, mode: str = None, emit=None,
                  confirm=None, should_stop=None, drain_steering=None,
@@ -458,7 +463,7 @@ class Agent:
                  think_budget: int = None, think_ceiling: int = None,
                  turn_budget_tokens: int = None,
                  turn_budget_s: float = None, session_id: str = None,
-                 ctx_limit_fn=None):
+                 ctx_limit_fn=None, is_tty: Callable[[], bool] | None = None):
         self.engine = engine
         # A fresh session clears stale skill activation state and reaps prior MCP
         # processes (matches engine._reset_cache on /reset). The todo list is module
@@ -567,6 +572,9 @@ class Agent:
             self.messages += [m for m in resume if m.get("role") != "system"]
         self._emit = emit or _default_emit
         self._confirm_cb = confirm  # callable(name, args)->bool; None => input() prompt
+        # Whether a human at a terminal can answer that prompt. Asked per confirm, not
+        # once here: stdin can be swapped after the agent is built.
+        self._is_tty = is_tty if is_tty is not None else (lambda: sys.stdin.isatty())
         self._should_stop = should_stop or (lambda: False)
         # Mid-run steering (improve 01): callable() -> list[str] of user redirections
         # typed while the turn runs, drained between steps and injected into the live
@@ -578,7 +586,7 @@ class Agent:
         self._atif_seg = self._atif.new_segment() if self._atif else None
         self._atif_stats: list = []   # one entry per successful generate, in step order
         if self._atif and self._atif.model_name is None:
-            self._atif.model_name = getattr(engine, "model_id", None)
+            self._atif.model_name = engine.model_id
         self.interrupted = False
         # Absolute path of the plan file written during a plan-mode turn (consumed by
         # the TUI to offer the steer/accept handoff); reset each time it's read.
@@ -726,7 +734,7 @@ class Agent:
 
         Resolved once per agent and cached; a failed probe (an exotic template that
         raises) falls back to OFF, i.e. exactly the pre-existing behavior."""
-        cached = getattr(self, "_split_ok", None)
+        cached = self._split_ok
         if cached is not None:
             return cached
         try:
@@ -775,7 +783,7 @@ class Agent:
         # Debug hook (env-gated, off by default): dump the first decoded render so a
         # rendered-prompt difference across environments can be diffed. Best-effort.
         dump = config.env_str("CHAD_DUMP_RENDER")
-        if dump and not getattr(self, "_dumped_render", False):
+        if dump and not self._dumped_render:
             try:
                 with open(dump, "w") as f:
                     f.write(self.engine.tok.decode(list(ids)))
@@ -845,7 +853,7 @@ class Agent:
         # untrusted repo contents and yolo mode has no human in the loop. If a confirm
         # channel exists (TTY or callback) we force the prompt; headless with no channel
         # we BLOCK rather than execute on injection. CHAD_NO_DESTRUCTIVE_GUARD=1 opts out.
-        dangerous = (name == "bash" and isinstance(args, dict)
+        dangerous = (name == "bash" and is_json_object(args)
                      and not config.flag("CHAD_NO_DESTRUCTIVE_GUARD")
                      and guardrails.is_destructive_bash(str(args.get("command", ""))))
         # Workspace boundary: `write`/`edit` run in-process, outside the bash seatbelt,
@@ -856,10 +864,10 @@ class Agent:
         # radius is a diff in this repo. It escalates to the prompt, it never hard-denies:
         # writing to ~/.chad, a temp dir or a sibling repo is a legitimate request — just
         # not one to apply unseen. Headless there is nobody to ask, so it blocks.
-        escalate = (name in AUTO_EDIT_TOOLS and isinstance(args, dict)
+        escalate = (name in AUTO_EDIT_TOOLS and is_json_object(args)
                     and outside_workspace(str(args.get("path", "") or "")))
         if escalate:
-            if self._confirm_cb is None and not sys.stdin.isatty():
+            if self._confirm_cb is None and not self._is_tty():
                 target = os.path.realpath(str(args.get("path", "") or ""))
                 self._emit("info", f"  [blocked {name} outside the workspace — nobody to "
                                    f"approve it: {target}]")
@@ -870,7 +878,7 @@ class Agent:
         elif not is_mutating(name) or auto_approves(self.mode, name):
             if not dangerous:
                 return True
-            if self._confirm_cb is None and not sys.stdin.isatty():
+            if self._confirm_cb is None and not self._is_tty():
                 self._emit("info", f"  [blocked destructive command — nobody to approve it: "
                                    f"{args.get('command', '')!r}; set CHAD_NO_DESTRUCTIVE_GUARD=1 to allow]")
                 # Tell the MODEL the truth about who blocked it and why: "[denied by

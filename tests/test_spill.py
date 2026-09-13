@@ -76,15 +76,14 @@ def test_per_kind_file_budget():
           spill.path_in(f"saved to {spill.write('newest', 'bash')}") is not None)
 
 
-def test_byte_budget(monkeypatch):
+def test_byte_budget():
     """The dir-wide byte cap is the real backstop — the per-kind counts bound file
     COUNT, and one compaction of a 262k-token window could otherwise write 120 files
     of megabytes each."""
-    monkeypatch.setattr(spill, "MAX_DIR_BYTES", 50_000)
-    paths = [spill.write("z" * 20_000, "compact") for _ in range(6)]
+    paths = [spill.write("z" * 20_000, "compact", max_dir_bytes=50_000) for _ in range(6)]
     d = spill.session_dir()
     total = sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d))
-    check("dir stays inside the byte budget", total <= spill.MAX_DIR_BYTES, total)
+    check("dir stays inside the byte budget", total <= 50_000, total)
     check("the newest spill survives (its pointer is live)",
           os.path.exists(paths[-1]), paths[-1])
     check("the oldest were evicted first", not os.path.exists(paths[0]), paths[0])

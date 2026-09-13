@@ -857,7 +857,7 @@ def alias_to_bash(name: str, args):
     argument can be found — an alias with nothing to read is left alone so it takes the
     normal unknown-tool repair path instead of running a nonsense command.
     """
-    if name not in READ_ALIASES or not isinstance(args, dict):
+    if name not in READ_ALIASES or not is_json_object(args):
         return name, args
     # Fall back ONLY when nothing actually answers to the name. An MCP server is free to
     # expose a tool called `read`, and that server's tool must win over this shim —

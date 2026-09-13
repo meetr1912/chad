@@ -111,23 +111,21 @@ def _diff_events(**kw):
     return out
 
 
-def test_highlight_plain_path_byte_identical_without_pygments(monkeypatch):
-    # Monkeypatch the import away: the emitted diff must be byte-for-byte the pre-042
-    # output (no ANSI beyond what the +/- emit kinds add downstream).
-    monkeypatch.setattr(render, "_HAS_PYGMENTS", False)
-    assert _diff_events() == [
+def test_highlight_plain_path_byte_identical():
+    # The plain path (a bare install, or highlight=False): the emitted diff must be
+    # byte-for-byte the pre-042 output (no ANSI beyond what the +/- emit kinds add).
+    assert _diff_events(highlight=False) == [
         ("muted", "  ⎿ +1 -1"),
         ("del", "  - a = 1"),
         ("add", "  + a = 2"),
     ]
     # the helper itself is an identity function when disabled
-    assert render._highlight_code("def f(): pass", "x.py") == "def f(): pass"
+    assert render._highlight_code("def f(): pass", "x.py", highlight=False) == "def f(): pass"
 
 
-def test_highlight_adds_color_when_pygments_present(monkeypatch):
+def test_highlight_adds_color_when_pygments_present():
     import pytest
     pytest.importorskip("pygments")            # optional extra; skip on a bare install
-    monkeypatch.setattr(render, "_HAS_PYGMENTS", True)
     hl = render._highlight_code("def f(): pass", "x.py")
     assert "\033[" in hl                       # pygments injected ANSI token colors
     assert "f(): pass" in _strip_ansi(hl)      # ...without dropping the code content

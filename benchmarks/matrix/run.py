@@ -447,7 +447,7 @@ def _table_runs(a) -> list:
     table may be asked for several, and `_runs` means every `repN*` under it. Imported
     lazily so a night's run never depends on the reporting side."""
     from scorecard import run_dirs
-    return run_dirs(getattr(a, "runs", None) or [RUNS])
+    return run_dirs(a.runs or [RUNS])
 
 
 def _gguf():
@@ -654,7 +654,7 @@ def start_proxy(a=None):
     plog = open(os.path.join(RUNS, "sampler-proxy.log"), "w")
     argv = [sys.executable, os.path.join(HERE, "sampler_proxy.py"),
             "--listen", str(PORT), "--upstream", str(UPSTREAM_PORT), "--runs", RUNS]
-    if getattr(a, "capture_bodies", False):
+    if a is not None and a.capture_bodies:
         # Whole request bodies, one file per request, for diffing consecutive turns of
         # one harness (`body_diff.py`). Off by default: bodies hold every prompt the
         # harness sent, and `_runs/bodies/` is never committed.
@@ -1047,7 +1047,7 @@ def _resolved_arms(arms: list) -> tuple:
 
 
 def _grid(arms, a) -> dict:
-    name = getattr(a, "grid_name", "grid")
+    name = a.grid_name
     arms, skipped = _resolved_arms(arms)
     for arm, why in skipped.items():
         print(f"  {arm:20s} SKIPPED: {why}", flush=True)
@@ -1057,7 +1057,7 @@ def _grid(arms, a) -> dict:
     prov.setdefault("harness_versions", {}).update(_harness_versions(arms))
     _save("provenance", prov)
     rows = _load(name) or []
-    rep0 = getattr(a, "rep_label", 0)
+    rep0 = a.rep_label
     for rep in range(a.reps):
         for task in a.tasks:
             for arm in arms:
@@ -1096,7 +1096,7 @@ def _from_smoke(a) -> list:
 
 
 def arm_llama(a) -> None:
-    if getattr(a, "from_smoke", False):
+    if a.from_smoke:
         a.arms = _from_smoke(a)
     proc = start_server(a)
     prox = start_proxy(a)
@@ -1392,6 +1392,8 @@ def main(argv=None) -> int:
     ap.add_argument("--capture-bodies", action="store_true",
                     help="llama/smoke: have the proxy write every request body under "
                          "_runs/bodies/ (never committed) for body_diff.py")
+    # Which grid file a run writes and the rep label it starts from; smoke overrides both.
+    ap.set_defaults(grid_name="grid", rep_label=0)
     a = ap.parse_args(argv)
     a.tasks = [x for x in a.tasks.split(",") if x.strip()]
     a.arms = [x for x in a.arms.split(",") if x.strip()]

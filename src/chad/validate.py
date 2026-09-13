@@ -29,7 +29,7 @@ import re
 from typing import Callable, List, Optional, Tuple
 
 from . import config
-from .tools import JsonValue, active_schemas
+from .tools import JsonValue, active_schemas, is_json_object
 
 # A/B knob, the single source of truth for both the
 # typed-validate path here and the lenient tool-call parse in toolcall_parse.py.
@@ -72,7 +72,7 @@ def legacy_validate(name, args):
     self-repair. Returns an error string, or None when the args pass."""
     if _param_schema(name) is None:
         return f"[unknown tool '{name}'. Available: {', '.join(_known_tools())}]"
-    if not isinstance(args, dict):
+    if not is_json_object(args):
         return f"[arguments for '{name}' must be a JSON object]"
     required = _param_schema(name).get("required", [])
     missing = [p for p in required if p not in args]
@@ -383,7 +383,7 @@ def coerce_and_validate(name: str, args: JsonValue) -> Tuple[JsonValue, List[Err
         un = repair_json(args)
         if un is not None:
             args = un
-    if not isinstance(args, dict):
+    if not is_json_object(args):
         return args, [Err("$", "object", _tname(args))]
     return _walk(args, schema, "")
 
@@ -429,7 +429,7 @@ def _echo_call(name: str, args: JsonValue) -> str:
     This echo sits directly above the model's retry, so it is a few-shot example of the
     call shape whether or not it is meant as one; rendering it as a JSON object showed
     the model a format its template forbids, and misquoted what it had actually sent."""
-    if not isinstance(args, dict):
+    if not is_json_object(args):
         return ""
     parts = [f"<tool_call>\n<function={name}>"]
     for k, v in args.items():

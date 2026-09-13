@@ -7,7 +7,6 @@ field-level error — never silently drops or silently dispatches garbage.
 Run: `uv run python tests/test_validate.py`
 """
 
-import os
 
 from chad import skills, tools
 from chad.validate import (
@@ -206,8 +205,7 @@ def test_installed_skills_add_no_tool(tmp_path, monkeypatch):
     so installing one must not change the validator's view of the tool surface."""
     empty_home = tmp_path / "_home"
     empty_home.mkdir()
-    monkeypatch.setattr(os.path, "expanduser",
-                        lambda p: str(empty_home) if p == "~" or p.startswith("~/") else p)
+    monkeypatch.setenv("HOME", str(empty_home))
     proj = tmp_path / "proj"
     (proj / ".agents" / "skills" / "widgets").mkdir(parents=True)
     (proj / ".agents" / "skills" / "widgets" / "SKILL.md").write_text(

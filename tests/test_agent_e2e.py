@@ -955,12 +955,12 @@ def test_headless_outside_write_is_blocked_with_a_reason(tmp_path, monkeypatch):
     ws = tmp_path / "ws"
     ws.mkdir()
     monkeypatch.chdir(ws)
-    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
     outside = tmp_path / "outside.txt"
     agent = _agent([_tool_call("write", path=str(outside), content="out\n"),
                     _tool_call("done", summary="claims success"),
                     _tool_call("done", summary="claims success."),
-                    _tool_call("done", summary="claims success!")])
+                    _tool_call("done", summary="claims success!")],
+                   is_tty=lambda: False)
 
     agent.run_turn("create outside.txt")
 

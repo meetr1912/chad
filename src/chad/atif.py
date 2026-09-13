@@ -36,11 +36,11 @@ import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from . import config
 from .toolcall_parse import parse_tool_calls, strip_think
-from .tools import JsonValue
+from .tools import JsonValue, is_json_object
 
 log = logging.getLogger("chad")
 
@@ -90,18 +90,18 @@ def _metrics(stat: dict) -> dict:
 _STAMPS: dict[int, tuple[dict, str]] = {}
 
 
-def _stamp(m: dict) -> str:
+def _stamp(m: dict, clock: Callable[[], str] = _now) -> str:
     """The time `m` was first seen in a rebuild, minted on first sight."""
     hit = _STAMPS.get(id(m))
     if hit is not None and hit[0] is m:
         return hit[1]
-    ts = _now()
+    ts = clock()
     _STAMPS[id(m)] = (m, ts)
     return ts
 
 
 def steps_from_messages(messages: list, model_name: Optional[str],
-                        stats: list) -> list[dict]:
+                        stats: list, clock: Callable[[], str] = _now) -> list[dict]:
     """Convert one Agent's `messages` into ATIF steps (without global `step_id`s).
 
     A `role: "tool"` message is not a step — it is an *observation* attached to the
@@ -122,11 +122,11 @@ def steps_from_messages(messages: list, model_name: Optional[str],
         role, content = m.get("role"), m.get("content") or ""
         if role == "system":
             steps.append({"source": "system", "message": content,
-                          "timestamp": _stamp(m)})
+                          "timestamp": _stamp(m, clock)})
             i += 1
         elif role == "user":
             steps.append({"source": "user", "message": content,
-                          "timestamp": _stamp(m)})
+                          "timestamp": _stamp(m, clock)})
             i += 1
         elif role == "assistant":
             reasoning, visible = split_think(content)
@@ -138,7 +138,7 @@ def steps_from_messages(messages: list, model_name: Optional[str],
                 j += 1
 
             step: dict[str, JsonValue] = {"source": "agent", "message": visible,
-                                          "timestamp": _stamp(m)}
+                                          "timestamp": _stamp(m, clock)}
             if model_name:
                 step["model_name"] = model_name
             if reasoning.strip():
@@ -150,7 +150,7 @@ def steps_from_messages(messages: list, model_name: Optional[str],
                     cid = f"call_{len(steps) + 1}_{k}"
                     call_ids.append(cid)
                     tcs.append({"tool_call_id": cid, "function_name": name,
-                                "arguments": args if isinstance(args, dict) else {}})
+                                "arguments": args if is_json_object(args) else {}})
                 step["tool_calls"] = tcs
             if results:
                 step["observation"] = {"results": [

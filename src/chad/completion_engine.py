@@ -42,7 +42,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING, Callable, Iterator, Optional
+from typing import TYPE_CHECKING, Callable, Generator, Optional
 
 from .base_engine import THINK_CLOSE, BackendError, GenStats, TailWatch, think_ceiling_hit
 
@@ -198,7 +198,7 @@ class CompletionEngine:
         except Exception:  # noqa: BLE001 — offline/older server → fallback, not a crash
             return None
 
-    def _stream_completion(self, body: dict) -> Iterator[str]:
+    def _stream_completion(self, body: dict) -> Generator[str, None, None]:
         """POST the /completion request and yield raw SSE lines. The ONLY generation
         network code in this file; unit tests monkeypatch it with a canned line
         generator. An HTTP error surfaces the server's message (e.g. llama.cpp's
@@ -347,9 +347,7 @@ class CompletionEngine:
                     if salvage_here or (should_stop and should_stop()):
                         break
             finally:
-                close = getattr(stream, "close", None)
-                if close:
-                    close()
+                stream.close()
 
             all_gen_ids.extend(gen_ids)
             if timings:
