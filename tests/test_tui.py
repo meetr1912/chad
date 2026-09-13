@@ -492,7 +492,7 @@ def test_leftover_steer_falls_back_to_typeahead():
     _stop_worker(tui, th)
 
 
-def test_idle_refresher_redraws_only_on_change(monkeypatch):
+def test_idle_refresher_redraws_only_on_change():
     # An idle prompt must not redraw 20 times a second forever: that is a standing wakeup
     # on a laptop and a GIL grab against generation. Only a change buys an idle frame; a
     # running turn and an open mic take redraw every tick.
@@ -512,9 +512,7 @@ def test_idle_refresher_redraws_only_on_change(monkeypatch):
         tui._shutdown = tick[0] == 10
 
     tui._flush = scripted_flush
-    real_sleep = asyncio.sleep
-    monkeypatch.setattr(asyncio, "sleep", lambda _delay: real_sleep(0))
-    asyncio.run(tui._refresher())
+    asyncio.run(tui._refresher(interval=0))  # one loop pass per tick, no wall-clock wait
     assert tick[0] == 10
     # idle 1-3: nothing · emit at 4: one frame · idle 5-6 · busy 7-8 · recording 9-10
     assert frames == [4, 7, 8, 9, 10]

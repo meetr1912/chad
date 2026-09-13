@@ -19,8 +19,14 @@ import re
 import subprocess
 import threading
 from collections import deque
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 from . import config
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
 
 # Parakeet TDT v3 (0.6B, multilingual): the engine Hex ships as its default,
 # and for the same reasons — a class faster than Whisper per clip, better
@@ -133,7 +139,7 @@ def available():
 SAY_BIN = "/usr/bin/say"
 
 
-def tts_status():
+def tts_status(say_bin: str = SAY_BIN):
     """(ok, reason) for the SPOKEN-REPLY half, checked at /speech enable.
 
     Deliberately not part of `available()`: a machine without `say` can still
@@ -143,13 +149,13 @@ def tts_status():
     nonzero), so voice mode would promise spoken replies and stay silent
     forever with nothing to pull on.
     """
-    if not os.path.exists(SAY_BIN):
-        return False, f"{SAY_BIN} not found — dictation works, replies won't be spoken"
+    if not os.path.exists(say_bin):
+        return False, f"{say_bin} not found — dictation works, replies won't be spoken"
     voice = config.env_str("CHAD_VOICE")
     if not voice:
         return True, ""
     try:
-        out = subprocess.run([SAY_BIN, "-v", "?"], capture_output=True,
+        out = subprocess.run([say_bin, "-v", "?"], capture_output=True,
                              text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return True, ""  # can't enumerate: don't cry wolf, let speak() try
@@ -291,10 +297,10 @@ def trim_silence(audio, threshold: float = 0.01, pad_s: float = 0.25):
     return audio[max(0, int(idx[0]) - pad):int(idx[-1]) + pad]
 
 
-def say_argv(text: str) -> list:
+def say_argv(text: str, say_bin: str = SAY_BIN) -> list:
     """argv for macOS `say`. Text passed as a single argument (no shell), voice
     and rate env-tunable. `--` guards a transcript that starts with a dash."""
-    argv = ["/usr/bin/say"]
+    argv = [say_bin]
     voice = config.env_str("CHAD_VOICE")
     if voice:
         argv += ["-v", voice]
@@ -313,8 +319,9 @@ class Speaker:
     arrive faster than they can be read aloud, and stale speech about turn N
     while reading turn N+1 is worse than silence."""
 
-    def __init__(self):
-        self._proc = None
+    def __init__(self, say_bin: str = SAY_BIN):
+        self._say_bin = say_bin
+        self._proc: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
 
     def speak(self, text: str):
@@ -325,7 +332,7 @@ class Speaker:
             self._kill_locked()
             try:
                 self._proc = subprocess.Popen(
-                    say_argv(text),
+                    say_argv(text, self._say_bin),
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except OSError:  # not macOS / say missing — speech stays best-effort
                 self._proc = None
@@ -525,17 +532,11 @@ def release_model() -> bool:
     return True
 
 
-def transcribe(audio) -> str:
-    """Parakeet over a raw 16 kHz array. First call downloads + loads the model
-    (cached in-process afterwards); runs on the same GPU as the coding model,
-    which is idle between turns — exactly when dictation happens."""
-    audio = trim_silence(audio)
-    if len(audio) < SAMPLE_RATE // 4:  # <0.25s of actual sound: a tap, not speech
-        return ""
-    # Ceiling guard, paired with Recorder's cap: transcribe() is also reachable
-    # with an array the recorder never bounded (tests, a future caller), and the
-    # encoder should never be handed an unbounded one.
-    audio = audio[:int(MAX_TAKE_S * SAMPLE_RATE)]
+def _decode_parakeet(audio) -> str:
+    """Parakeet over a bounded 16 kHz take: the raw transcript. First call
+    downloads + loads the model (cached in-process afterwards); runs on the same
+    GPU as the coding model, which is idle between turns — exactly when
+    dictation happens."""
     import mlx.core as mx
     from huggingface_hub.utils import (
         are_progress_bars_disabled,
@@ -577,10 +578,24 @@ def transcribe(audio) -> str:
     finally:
         if not bars_off:
             enable_progress_bars()
+    return result.text
+
+
+def transcribe(audio, decode: Callable[[NDArray[np.float32]], str] = _decode_parakeet) -> str:
+    """A push-to-talk take (raw 16 kHz array) -> text for the input box. `decode`
+    turns the trimmed, bounded take into a raw transcript (Parakeet on MLX by
+    default); the cleanup around it is the same whatever decodes."""
+    audio = trim_silence(audio)
+    if len(audio) < SAMPLE_RATE // 4:  # <0.25s of actual sound: a tap, not speech
+        return ""
+    # Ceiling guard, paired with Recorder's cap: transcribe() is also reachable
+    # with an array the recorder never bounded (tests, a future caller), and the
+    # encoder should never be handed an unbounded one.
+    audio = audio[:int(MAX_TAKE_S * SAMPLE_RATE)]
     # collapse_repeats stays as cheap insurance: Parakeet's TDT decoder lacks
     # Whisper's repetition-loop failure mode, but a flooded input box is bad
     # enough to keep the guard anyway.
-    text = collapse_repeats(result.text.strip())
+    text = collapse_repeats(decode(audio).strip())
     try:
         text = apply_remaps(text, load_remaps())
     except (ValueError, OSError):

@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 from collections import deque
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Protocol
 
 log = logging.getLogger("chad.tui")
 
@@ -56,6 +56,10 @@ from .agent import INIT_PROMPT, MODE_LABEL, Agent
 from .base_engine import BaseEngine
 from .ignore import IGNORE_DIRS
 from .render import C_RST, C_YEL, ansi_fragment, banner, confirm_preview, render_tool_result
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
 
 # Styling for the pinned bottom region only (status line + input). The transcript
 # above is plain ANSI (see _ansi_for), so it lives in normal terminal scrollback.
@@ -321,11 +325,66 @@ def _make_history():
         return InMemoryHistory()
 
 
+# ---------------------------------------------------------------------------
+# Voice mode's collaborators, as the TUI drives them. The chad.speech module is the
+# production _SpeechModule (imported on first /speech, so a non-speech session never
+# loads it), and its Recorder and Speaker are the production mic and TTS player.
+# ---------------------------------------------------------------------------
+
+class _Recorder(Protocol):
+    PRE_ROLL_S: float
+
+    @property
+    def recording(self) -> bool: ...
+
+    @property
+    def take_full(self) -> bool: ...
+
+    def open_stream(self) -> None: ...
+
+    def start(self) -> None: ...
+
+    def stop(self) -> "NDArray[np.float32]": ...
+
+    def cancel(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class _Speaker(Protocol):
+    def speak(self, text: str) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class _SpeechModule(Protocol):
+    MAX_TAKE_S: int
+
+    def available(self) -> tuple[bool, str]: ...
+
+    def tts_status(self) -> tuple[bool, str]: ...
+
+    def stt_status(self) -> tuple[bool, str]: ...
+
+    def stt_model(self) -> str: ...
+
+    def load_remaps(self) -> dict[str, str]: ...
+
+    def remap_path(self) -> str: ...
+
+    def model_cached(self) -> bool: ...
+
+    def release_model(self) -> bool: ...
+
+    def transcribe(self, audio: "NDArray[np.float32]") -> str: ...
+
+
 class TUI:
     def __init__(self, engine: BaseEngine, ctx_limit: int, mode: str = "normal",
                  thinking: bool = True, max_chars: int = 400_000, resume: list = None,
                  ctx_window: int = None, finalize=None, ctx_limit_fn=None,
-                 native_ctx: int = None):
+                 native_ctx: int = None, speech: Optional[_SpeechModule] = None,
+                 recorder: Optional[_Recorder] = None, speaker: Optional[_Speaker] = None):
         self.engine = engine
         self.ctx_limit = ctx_limit
         self._ctx_limit_fn = ctx_limit_fn  # live per-turn recheck
@@ -400,9 +459,12 @@ class TUI:
         # audio deps are an optional extra, so a non-speech session never
         # imports them. `_speech_phase` drives the status-line indicator:
         # "" | "recording" | "transcribing".
+        # The speech module, TTS player and mic stay None until the first /speech
+        # unless the caller passed its own.
         self.speech_on = False
-        self._speaker = None
-        self._recorder = None
+        self._speech = speech
+        self._speaker = speaker
+        self._recorder = recorder
         self._speech_phase = ""
         # Mirrored off speech.MAX_TAKE_S at enable so the per-frame status
         # render never imports the speech module.
@@ -681,7 +743,7 @@ class TUI:
             self._pending.clear()
         sys.stdout.write(chunk)
 
-    async def _refresher(self):
+    async def _refresher(self, interval: float = 0.05):
         while not self._shutdown:
             self._flush()
             if self._busy:
@@ -692,7 +754,7 @@ class TUI:
             if self._busy or self._dirty or self._speech_phase == "recording":
                 self._dirty = False
                 self.app.invalidate()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(interval)
 
     # -- key bindings ----------------------------------------------------
 
@@ -893,8 +955,15 @@ class TUI:
 
     # -- voice mode (/speech) ---------------------------------------------
 
+    def _speech_module(self) -> _SpeechModule:
+        """chad.speech, imported on first use unless the TUI was given one."""
+        if self._speech is None:
+            from . import speech
+            self._speech = speech
+        return self._speech
+
     def _toggle_speech(self):
-        from . import speech
+        speech = self._speech_module()
         if self.speech_on:
             was_decoding = self._speech_phase == "transcribing"
             self.speech_on = False
@@ -919,8 +988,9 @@ class TUI:
         if not ok:
             self._emit("info", reason)
             return
-        self._speaker = self._speaker or speech.Speaker()
-        self._recorder = self._recorder or speech.Recorder()
+        from .speech import Recorder, Speaker
+        self._speaker = self._speaker or Speaker()
+        self._recorder = self._recorder or Recorder()
         # Open the warm stream NOW: the TCC permission prompt fires here, at an
         # explicit /speech, and a denied mic fails here with the reason —
         # not silently as an empty take later.
@@ -932,7 +1002,7 @@ class TUI:
         self.speech_on = True
         self._speech_max_s = int(speech.MAX_TAKE_S)
         self._emit("info", f"speech on — the mic stays open (see status line) with a "
-                           f"{speech.Recorder.PRE_ROLL_S:.2g}s pre-roll so your first "
+                           f"{self._recorder.PRE_ROLL_S:.2g}s pre-roll so your first "
                            f"word isn't clipped. ctrl-t to talk, ctrl-t again to "
                            f"transcribe, esc discards a take; replies are read aloud "
                            f"(ctrl-c hushes). all local: {speech.stt_model()} + macOS say.")
@@ -989,7 +1059,7 @@ class TUI:
         exception it may call outright, because prompt_toolkit does that hop
         itself.
         """
-        from . import speech
+        speech = self._speech_module()
         if self._speech_phase == "transcribing":
             return  # previous utterance still decoding; one at a time
         if not self._recorder.recording:

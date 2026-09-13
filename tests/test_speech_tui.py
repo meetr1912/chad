@@ -10,21 +10,21 @@ break.
 Nothing here imports sounddevice. Importing it INITIALIZES PortAudio (a
 CoreAudio client thread that can crash interpreter teardown when it was started
 for no reason), which is exactly why speech.available() probes with find_spec
-instead of importing. A fake Recorder/Speaker plus a monkeypatched
-speech.transcribe reaches every branch without touching a device, and the
-Recorder's own ring/take logic is unit-tested for real in test_speech.py.
+instead of importing. The TUI takes its speech module, recorder and speaker as
+constructor arguments, so fakes of all three reach every branch without touching
+a device, and the Recorder's own ring/take logic is unit-tested for real in
+test_speech.py.
 
 What is deliberately NOT here: audio in -> transcript out. That needs a mic and
 a human ear, and lives in the manual pass.
 """
 import os
+import signal
 import sys
 import threading
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-
-import pytest  # noqa: E402
 
 from chad import speech  # noqa: E402
 from chad.engine import Engine  # noqa: E402
@@ -43,6 +43,8 @@ def _fake_engine():
 class _FakeRecorder:
     """Stands in for speech.Recorder: same surface, no PortAudio. `audio` is
     what stop() hands back, so a test can decide what was "said"."""
+
+    PRE_ROLL_S = speech.Recorder.PRE_ROLL_S
 
     def __init__(self, audio="AUDIO", open_raises=None, start_raises=None):
         self.recording = False
@@ -90,34 +92,61 @@ class _FakeSpeaker:
         self.stops += 1
 
 
-class _Factory:
-    """Callable stand-in for a class: `speech.Recorder()` returns our instance,
-    while `speech.Recorder.PRE_ROLL_S` (read by the /speech banner) still
-    resolves. A bare lambda would break the second one."""
+class _FakeSpeech:
+    """Stands in for the chad.speech module as the TUI calls it: every probe
+    answers what the test configured, transcribe() runs the test's function, and
+    release_model() counts how often the weights were handed back."""
 
-    def __init__(self, obj, **attrs):
-        self._obj = obj
-        for k, v in attrs.items():
-            setattr(self, k, v)
+    def __init__(self, *, available=(True, ""), tts=(True, ""), stt=(True, ""),
+                 remaps_error=None, cached=True, transcribe=None,
+                 max_take_s=speech.MAX_TAKE_S):
+        self.MAX_TAKE_S = max_take_s
+        self.releases = 0
+        self._available = available
+        self._tts = tts
+        self._stt = stt
+        self._remaps_error = remaps_error
+        self._cached = cached
+        self._transcribe = transcribe if transcribe is not None else (lambda _audio: "")
 
-    def __call__(self):
-        return self._obj
+    def available(self):
+        return self._available
+
+    def tts_status(self):
+        return self._tts
+
+    def stt_status(self):
+        return self._stt
+
+    def stt_model(self):
+        return "test/stt-model"
+
+    def load_remaps(self):
+        if self._remaps_error is not None:
+            raise self._remaps_error
+        return {}
+
+    def remap_path(self):
+        return "/nonexistent/speech_words.json"
+
+    def model_cached(self):
+        return self._cached
+
+    def release_model(self):
+        self.releases += 1
+        return True
+
+    def transcribe(self, audio):
+        return self._transcribe(audio)
 
 
-def _tui(monkeypatch, *, recorder=None, speaker=None, available=(True, "")):
+def _tui(*, fake_speech=None, recorder=None, speaker=None):
     """A TUI wired to fakes, with voice mode not yet enabled."""
-    t = TUI(_fake_engine(), ctx_limit=24000)
     rec = recorder if recorder is not None else _FakeRecorder()
     spk = speaker if speaker is not None else _FakeSpeaker()
-    monkeypatch.setattr(speech, "available", lambda: available)
-    monkeypatch.setattr(speech, "tts_status", lambda: (True, ""))
-    monkeypatch.setattr(speech, "stt_status", lambda: (True, ""))
-    monkeypatch.setattr(speech, "load_remaps", lambda: {})
-    monkeypatch.setattr(speech, "model_cached", lambda: True)
-    monkeypatch.setattr(speech, "release_model", lambda: False)
-    monkeypatch.setattr(speech, "Recorder",
-                        _Factory(rec, PRE_ROLL_S=speech.Recorder.PRE_ROLL_S))
-    monkeypatch.setattr(speech, "Speaker", _Factory(spk))
+    t = TUI(_fake_engine(), ctx_limit=24000,
+            speech=fake_speech if fake_speech is not None else _FakeSpeech(),
+            recorder=rec, speaker=spk)
     return t, rec, spk
 
 
@@ -131,56 +160,54 @@ def _status(t):
 
 # -- /speech enable: the four things that can go wrong before you ever talk ---
 
-def test_enable_refuses_and_explains_when_deps_missing(monkeypatch):
-    t, rec, _ = _tui(monkeypatch, available=(False, "speech needs sounddevice — install with X"))
+def test_enable_refuses_and_explains_when_deps_missing():
+    fake = _FakeSpeech(available=(False, "speech needs sounddevice — install with X"))
+    t, rec, _ = _tui(fake_speech=fake)
     t._toggle_speech()
     assert t.speech_on is False           # refused, not half-on
     assert not rec.stream_open            # and the mic was never opened
     assert "install with X" in _out(t)    # verbatim reason, so it names the fix
 
 
-def test_enable_surfaces_mic_denial_instead_of_recording_silence(monkeypatch):
+def test_enable_surfaces_mic_denial_instead_of_recording_silence():
     # TCC refusal, unplugged device: must fail HERE, loudly, not later as an
     # empty take the user mistakes for "it didn't hear me".
     rec = _FakeRecorder(open_raises=RuntimeError("PortAudioError: device unavailable"))
-    t, rec, _ = _tui(monkeypatch, recorder=rec)
+    t, rec, _ = _tui(recorder=rec)
     t._toggle_speech()
     assert t.speech_on is False
     assert "mic unavailable" in _out(t)
     assert "device unavailable" in _out(t)
 
 
-def test_enable_reports_bad_voice_and_bad_quant_without_blocking(monkeypatch):
+def test_enable_reports_bad_voice_and_bad_quant_without_blocking():
     # Both are invisible otherwise: `say` exits nonzero and Speaker swallows it,
     # and stt_quant_bits() only raises from inside transcribe() — i.e. after you
     # have already spoken. Neither should block dictation.
-    t, rec, _ = _tui(monkeypatch)
-    monkeypatch.setattr(speech, "tts_status", lambda: (False, "CHAD_VOICE='Samanta' is not an installed voice"))
-    monkeypatch.setattr(speech, "stt_status", lambda: (False, "CHAD_STT_QUANT must be 8 (default), 4, or none"))
+    fake = _FakeSpeech(tts=(False, "CHAD_VOICE='Samanta' is not an installed voice"),
+                       stt=(False, "CHAD_STT_QUANT must be 8 (default), 4, or none"))
+    t, rec, _ = _tui(fake_speech=fake)
     t._toggle_speech()
     assert t.speech_on is True            # warnings, not a refusal
     assert "not an installed voice" in _out(t)
     assert "CHAD_STT_QUANT must be" in _out(t)
 
 
-def test_enable_reports_malformed_word_table(monkeypatch):
-    t, rec, _ = _tui(monkeypatch)
-    monkeypatch.setattr(speech, "load_remaps",
-                        lambda: (_ for _ in ()).throw(ValueError("must be a JSON object")))
+def test_enable_reports_malformed_word_table():
+    t, rec, _ = _tui(fake_speech=_FakeSpeech(remaps_error=ValueError("must be a JSON object")))
     t._toggle_speech()
     assert t.speech_on is True            # remaps are optional; voice mode still works
     assert "word remaps IGNORED" in _out(t)
 
 
-def test_enable_warns_when_weights_are_not_cached(monkeypatch):
-    t, rec, _ = _tui(monkeypatch)
-    monkeypatch.setattr(speech, "model_cached", lambda: False)
+def test_enable_warns_when_weights_are_not_cached():
+    t, rec, _ = _tui(fake_speech=_FakeSpeech(cached=False))
     t._toggle_speech()
     assert "aren't cached" in _out(t)     # so a 2.5GB fetch doesn't read as a hang
 
 
-def test_enable_opens_the_mic_and_says_so_in_the_status_line(monkeypatch):
-    t, rec, _ = _tui(monkeypatch)
+def test_enable_opens_the_mic_and_says_so_in_the_status_line():
+    t, rec, _ = _tui()
     assert "mic open" not in _status(t)
     t._toggle_speech()
     assert t.speech_on is True
@@ -191,37 +218,35 @@ def test_enable_opens_the_mic_and_says_so_in_the_status_line(monkeypatch):
 
 # -- /speech disable ---------------------------------------------------------
 
-def test_disable_releases_mic_speaker_and_weights(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
-    freed = []
-    monkeypatch.setattr(speech, "release_model", lambda: freed.append(1) or True)
+def test_disable_releases_mic_speaker_and_weights():
+    fake = _FakeSpeech()
+    t, rec, spk = _tui(fake_speech=fake)
     t._toggle_speech()
     t._toggle_speech()
     assert t.speech_on is False
     assert rec.closed                     # mic fully released, warm ring included
     assert spk.stops >= 1                 # a reply mid-sentence is cut
-    assert freed == [1]                   # ~790MB handed back
+    assert fake.releases == 1             # ~790MB handed back
     assert "mic open" not in _status(t)
 
 
-def test_disable_does_not_free_weights_while_a_decode_is_in_flight(monkeypatch):
+def test_disable_does_not_free_weights_while_a_decode_is_in_flight():
     # The worker holds a live reference to the model inside generate(); freeing
     # it underneath would be a use-after-free at the Metal layer.
-    t, rec, spk = _tui(monkeypatch)
-    calls = []
-    monkeypatch.setattr(speech, "release_model", lambda: calls.append(1) or True)
+    fake = _FakeSpeech()
+    t, rec, spk = _tui(fake_speech=fake)
     t._toggle_speech()
     t._speech_phase = "transcribing"
     t._toggle_speech()
     assert t.speech_on is False
     assert rec.closed                     # the mic still goes
-    assert calls == []                    # the weights do NOT
+    assert fake.releases == 0             # the weights do NOT
 
 
 # -- push-to-talk: the state machine -----------------------------------------
 
-def test_ctrl_t_starts_a_take_and_hushes_our_own_tts(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
+def test_ctrl_t_starts_a_take_and_hushes_our_own_tts():
+    t, rec, spk = _tui()
     t._toggle_speech()
     t._toggle_recording()
     assert rec.recording
@@ -230,9 +255,8 @@ def test_ctrl_t_starts_a_take_and_hushes_our_own_tts(monkeypatch):
     assert "● rec" in _status(t)
 
 
-def test_ctrl_t_twice_transcribes_into_the_input_box_unsent(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
-    monkeypatch.setattr(speech, "transcribe", lambda a: "fix the failing test")
+def test_ctrl_t_twice_transcribes_into_the_input_box_unsent():
+    t, rec, spk = _tui(fake_speech=_FakeSpeech(transcribe=lambda a: "fix the failing test"))
     t._toggle_speech()
     t._toggle_recording()                 # start
     t._toggle_recording()                 # stop -> spawns the worker
@@ -243,17 +267,17 @@ def test_ctrl_t_twice_transcribes_into_the_input_box_unsent(monkeypatch):
     assert not rec.recording
 
 
-def test_start_failure_is_reported_and_leaves_no_half_take(monkeypatch):
+def test_start_failure_is_reported_and_leaves_no_half_take():
     rec = _FakeRecorder(start_raises=RuntimeError("device unplugged"))
-    t, rec, _ = _tui(monkeypatch, recorder=rec)
+    t, rec, _ = _tui(recorder=rec)
     t._toggle_speech()
     t._toggle_recording()
     assert t._speech_phase == ""          # not stuck showing "● rec"
     assert "mic unavailable" in _out(t)
 
 
-def test_second_ctrl_t_is_ignored_while_still_decoding(monkeypatch):
-    t, rec, _ = _tui(monkeypatch)
+def test_second_ctrl_t_is_ignored_while_still_decoding():
+    t, rec, _ = _tui()
     t._toggle_speech()
     t._speech_phase = "transcribing"
     t._toggle_recording()
@@ -261,11 +285,10 @@ def test_second_ctrl_t_is_ignored_while_still_decoding(monkeypatch):
     assert t._speech_phase == "transcribing"
 
 
-def test_transcription_failure_resets_the_phase_and_tells_the_user(monkeypatch):
+def test_transcription_failure_resets_the_phase_and_tells_the_user():
     # A stuck spinner is worse than an error: the user waits forever.
-    t, rec, _ = _tui(monkeypatch)
-    monkeypatch.setattr(speech, "transcribe",
-                        lambda a: (_ for _ in ()).throw(RuntimeError("metal oom")))
+    fake = _FakeSpeech(transcribe=lambda a: (_ for _ in ()).throw(RuntimeError("metal oom")))
+    t, rec, _ = _tui(fake_speech=fake)
     t._toggle_speech()
     t._toggle_recording()
     t._toggle_recording()
@@ -275,9 +298,8 @@ def test_transcription_failure_resets_the_phase_and_tells_the_user(monkeypatch):
     assert "metal oom" in _out(t)
 
 
-def test_empty_transcript_says_heard_nothing(monkeypatch):
-    t, rec, _ = _tui(monkeypatch)
-    monkeypatch.setattr(speech, "transcribe", lambda a: "")
+def test_empty_transcript_says_heard_nothing():
+    t, rec, _ = _tui(fake_speech=_FakeSpeech(transcribe=lambda a: ""))
     t._toggle_speech()
     t._toggle_recording()
     t._toggle_recording()
@@ -285,17 +307,16 @@ def test_empty_transcript_says_heard_nothing(monkeypatch):
     assert "heard nothing" in _out(t)
 
 
-def test_transcript_is_discarded_when_speech_was_turned_off_mid_decode(monkeypatch):
+def test_transcript_is_discarded_when_speech_was_turned_off_mid_decode():
     # The first-use window is long (a 2.5GB download), so this is a real race,
     # not a theoretical one. Text must not appear in a mode the user left.
-    t, rec, _ = _tui(monkeypatch)
     gate = threading.Event()
 
     def slow(_audio):
         gate.wait(_JOIN)
         return "late transcript"
 
-    monkeypatch.setattr(speech, "transcribe", slow)
+    t, rec, _ = _tui(fake_speech=_FakeSpeech(transcribe=slow))
     t._toggle_speech()
     t._toggle_recording()
     t._toggle_recording()                 # worker now blocked in slow()
@@ -308,21 +329,21 @@ def test_transcript_is_discarded_when_speech_was_turned_off_mid_decode(monkeypat
 
 # -- the take cap ------------------------------------------------------------
 
-def test_status_line_announces_a_capped_take(monkeypatch):
-    t, rec, _ = _tui(monkeypatch)
+def test_status_line_announces_a_capped_take():
+    t, rec, _ = _tui(fake_speech=_FakeSpeech(max_take_s=90))
     t._toggle_speech()
     t._toggle_recording()
     assert "max length" not in _status(t)
     rec.take_full = True
     s = _status(t)
-    assert "max length" in s and str(int(speech.MAX_TAKE_S)) in s
+    assert "max length (90s)" in s        # the cap the speech module enforces
     assert "● rec" in s                   # still recording — the mic stays honest
 
 
 # -- spoken replies ----------------------------------------------------------
 
-def test_reply_is_spoken_with_markup_and_code_stripped(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
+def test_reply_is_spoken_with_markup_and_code_stripped():
+    t, rec, spk = _tui()
     t._toggle_speech()
     t.agent = type("A", (), {"messages": [
         {"role": "user", "content": "fix it"},
@@ -335,24 +356,24 @@ def test_reply_is_spoken_with_markup_and_code_stripped(monkeypatch):
     assert "*" not in said and "x=1" not in said
 
 
-def test_empty_final_reply_is_not_spoken(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
+def test_empty_final_reply_is_not_spoken():
+    t, rec, spk = _tui()
     t._toggle_speech()
     t.agent = type("A", (), {"messages": [{"role": "assistant", "content": ""}]})()
     t._speak_reply()
     assert spk.said == []                 # no process for an empty utterance
 
 
-def test_no_assistant_message_is_not_spoken(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
+def test_no_assistant_message_is_not_spoken():
+    t, rec, spk = _tui()
     t._toggle_speech()
     t.agent = type("A", (), {"messages": [{"role": "user", "content": "hi"}]})()
     t._speak_reply()
     assert spk.said == []
 
 
-def test_shutdown_releases_mic_and_silences_speech(monkeypatch):
-    t, rec, spk = _tui(monkeypatch)
+def test_shutdown_releases_mic_and_silences_speech():
+    t, rec, spk = _tui()
     t._toggle_speech()
     t._shutdown_app(type("E", (), {"app": type("A", (), {"exit": lambda self: None})()})())
     assert rec.closed
@@ -371,8 +392,10 @@ def _join_stt():
 
 # === speech.py orchestration gaps the pure-layer file left open ==============
 
-def test_release_model_is_a_noop_when_nothing_is_loaded(monkeypatch):
-    monkeypatch.setattr(speech, "_stt", {})
+def test_release_model_is_a_noop_when_nothing_is_loaded():
+    # No test loads STT weights (real MLX, and a 2.5GB download on first use),
+    # so the process-wide cache is empty here.
+    assert speech._stt == {}
     assert speech.release_model() is False   # and does not import mlx to say so
 
 
@@ -394,36 +417,45 @@ def test_model_cached_false_when_the_hub_lookup_fails(monkeypatch):
     assert speech.model_cached() is False    # -> the TUI prints the download notice
 
 
-def test_tts_status_reports_a_missing_say_binary(monkeypatch):
-    monkeypatch.setattr(speech, "SAY_BIN", "/nonexistent/say")
-    ok, reason = speech.tts_status()
+def _fake_say(tmp_path, script, executable=True):
+    """A stand-in `say` at a real path. tts_status and Speaker run their real
+    subprocess calls against it."""
+    path = tmp_path / "say"
+    path.write_text("#!/bin/sh\n" + script)
+    path.chmod(0o755 if executable else 0o644)
+    return str(path)
+
+
+_VOICE_LIST = ("Samantha           en_US    # Hi, my name is Samantha.\n"
+               "Eddy (English (UK)) en_GB   # Hello, my name is Eddy.\n")
+
+
+def test_tts_status_reports_a_missing_say_binary(tmp_path):
+    ok, reason = speech.tts_status(say_bin=str(tmp_path / "say"))
     assert ok is False
     assert "replies won't be spoken" in reason
 
 
-def test_tts_status_accepts_an_installed_voice_and_rejects_a_typo(monkeypatch):
-    monkeypatch.setattr(os.path, "exists", lambda p: True)
-    listing = ("Samantha           en_US    # Hi, my name is Samantha.\n"
-               "Eddy (English (UK)) en_GB   # Hello, my name is Eddy.\n")
-    monkeypatch.setattr(speech.subprocess, "run",
-                        lambda *a, **k: type("R", (), {"stdout": listing})())
+def test_tts_status_accepts_an_installed_voice_and_rejects_a_typo(monkeypatch, tmp_path):
+    # Lists voices only when asked the way tts_status asks (`say -v ?`).
+    say = _fake_say(tmp_path, '[ "$1" = "-v" ] && [ "$2" = "?" ] || exit 64\n'
+                              "cat <<'EOF'\n" + _VOICE_LIST + "EOF\n")
     monkeypatch.setenv("CHAD_VOICE", "samantha")          # case-insensitive
-    assert speech.tts_status() == (True, "")
+    assert speech.tts_status(say_bin=say) == (True, "")
     monkeypatch.setenv("CHAD_VOICE", "Eddy (English (UK))")  # spaces in the name
-    assert speech.tts_status() == (True, "")
+    assert speech.tts_status(say_bin=say) == (True, "")
     monkeypatch.setenv("CHAD_VOICE", "Samanta")           # the typo
-    ok, reason = speech.tts_status()
+    ok, reason = speech.tts_status(say_bin=say)
     assert ok is False
     assert "Samanta" in reason and "Samantha" in reason    # names the near miss
 
 
-def test_tts_status_stays_quiet_when_voices_cannot_be_listed(monkeypatch):
-    # Don't cry wolf on a probe failure — let speak() try.
-    monkeypatch.setattr(os.path, "exists", lambda p: True)
+def test_tts_status_stays_quiet_when_voices_cannot_be_listed(monkeypatch, tmp_path):
+    # Don't cry wolf on a probe failure — let speak() try. The binary exists but
+    # cannot be executed, so listing the voices raises OSError.
+    say = _fake_say(tmp_path, "exit 0\n", executable=False)
     monkeypatch.setenv("CHAD_VOICE", "Whoever")
-    monkeypatch.setattr(speech.subprocess, "run",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("boom")))
-    assert speech.tts_status() == (True, "")
+    assert speech.tts_status(say_bin=say) == (True, "")
 
 
 def test_stt_status_catches_a_bad_quant_width(monkeypatch):
@@ -435,74 +467,58 @@ def test_stt_status_catches_a_bad_quant_width(monkeypatch):
     assert speech.stt_status() == (True, "")
 
 
-def test_speaker_preempts_the_previous_utterance(monkeypatch):
+def test_speaker_preempts_the_previous_utterance(tmp_path):
     # A reply about turn N read aloud while you are reading turn N+1 is worse
     # than silence, so a new speak() kills the old process.
-    killed = []
-
-    class _Proc:
-        def __init__(self, *a, **k):
-            self.killed = False
-
-        def poll(self):
-            return None            # still running
-
-        def kill(self):
-            self.killed = True
-            killed.append(1)
-
-    monkeypatch.setattr(speech.subprocess, "Popen", lambda *a, **k: _Proc())
-    sp = speech.Speaker()
+    sp = speech.Speaker(say_bin=_fake_say(tmp_path, "exec sleep 30\n"))
     sp.speak("first")
+    first = sp._proc
     sp.speak("second")
-    assert killed == [1]           # exactly the first one
+    second = sp._proc
+    assert first.wait(timeout=_JOIN) == -signal.SIGKILL   # the first one was killed
+    assert second.poll() is None                           # the second still speaks
     sp.stop()
-    assert len(killed) == 2
+    assert second.wait(timeout=_JOIN) == -signal.SIGKILL
     assert sp._proc is None
 
 
-def test_speaker_survives_a_missing_say_binary(monkeypatch):
-    monkeypatch.setattr(speech.subprocess, "Popen",
-                        lambda *a, **k: (_ for _ in ()).throw(OSError("no say")))
-    sp = speech.Speaker()
+def test_speaker_survives_a_missing_say_binary(tmp_path):
+    sp = speech.Speaker(say_bin=str(tmp_path / "say"))
     sp.speak("hello")              # best-effort: must not raise into the turn
     assert sp._proc is None
 
 
 # -- the take cap, at the Recorder level -------------------------------------
 
-def test_recorder_stops_growing_the_take_at_the_cap(monkeypatch):
+def test_recorder_stops_growing_the_take_at_the_cap():
     import numpy as np
-    monkeypatch.setattr(speech, "MAX_TAKE_S", 1.0)
     rec = speech.Recorder()
     rec.start()
     sr = speech.SAMPLE_RATE
-    for _ in range(30):                       # 3s of audio into a 1s cap
-        rec._on_audio(np.ones(sr // 10, dtype=np.float32))
+    cap = int(speech.MAX_TAKE_S * sr)
+    second = np.ones(sr, dtype=np.float32)     # one buffer, appended by reference
+    for _ in range(int(speech.MAX_TAKE_S) + 5):  # five seconds past the cap
+        rec._on_audio(second)
     assert rec.take_full is True
     audio = rec.stop()
-    assert sr <= len(audio) <= int(1.2 * sr)  # capped, chunk-granular
-    assert rec.take_full is False             # reset for the next take
+    assert cap <= len(audio) < cap + sr        # capped, chunk-granular
+    assert rec.take_full is False              # reset for the next take
 
 
-def test_transcribe_truncates_an_over_long_array(monkeypatch):
+def test_transcribe_truncates_an_over_long_array(monkeypatch, tmp_path):
     # The ceiling guard pairs with the recorder cap: transcribe() is also
     # reachable with an array nothing bounded.
     import numpy as np
-    monkeypatch.setattr(speech, "MAX_TAKE_S", 1.0)
-    seen = {}
+    monkeypatch.setenv("CHAD_SPEECH_WORDS", str(tmp_path / "none.json"))
+    sr = speech.SAMPLE_RATE
+    cap = int(speech.MAX_TAKE_S * sr)
+    audio = np.zeros(cap + 10 * sr, dtype=np.float32)
+    audio[0] = audio[-1] = 0.5                 # sound at both ends: trimming keeps it all
+    handed_over = []
 
-    def fake_logmel(arr, _cfg):
-        seen["n"] = arr.size
-        raise RuntimeError("stop here — we only care about the length handed over")
+    def decode(take):
+        handed_over.append(len(take))
+        return "heard"
 
-    monkeypatch.setattr(speech, "trim_silence", lambda a, **k: a)
-    pytest.importorskip("mlx.core")
-    from chad import parakeet
-    monkeypatch.setattr(parakeet, "get_logmel", fake_logmel)
-    stub = type("M", (), {"preprocessor_config": None})()   # never really used
-    monkeypatch.setattr(speech, "_stt",
-                        {(speech.stt_model(), speech.stt_quant_bits()): stub})
-    with pytest.raises(RuntimeError):
-        speech.transcribe(np.ones(10 * speech.SAMPLE_RATE, dtype=np.float32))
-    assert seen["n"] == speech.SAMPLE_RATE    # 10s handed in, 1s handed over
+    assert speech.transcribe(audio, decode=decode) == "heard"
+    assert handed_over == [cap]                # 10s past the cap handed in, the cap handed over
