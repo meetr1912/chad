@@ -313,7 +313,7 @@ def _compute_ctx_limit(eng):
             # cache already grown) measures the same model floor the startup call
             # does — otherwise the limit would shrink as the cache approaches it.
             active_floor = (mx.get_active_memory()
-                            - eng.kv_bytes_per_token * getattr(eng, "resident_tokens", 0))
+                            - eng.kv_bytes_per_token * eng.resident_tokens)
             ctx_limit = ram_aware_ctx_limit(
                 eng.effective_ctx,
                 mx.device_info()["max_recommended_working_set_size"],

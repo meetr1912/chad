@@ -172,6 +172,13 @@ class CompletionEngine:
             self.effective_ctx = int(n_ctx) if n_ctx else 32768
         return time.time() - t0
 
+    @property
+    def resident_tokens(self) -> int:
+        """Tokens in the server's prompt cache, as mirrored here. They cost this
+        process no memory (`kv_bytes_per_token` is 0), so cli's RAM-aware window sizing
+        subtracts nothing for them."""
+        return len(self._cached_ids)
+
     def reset(self) -> None:
         """Forget the mirrored cache state. The server keeps its slot cache, but the
         next prompt will simply prefix-match whatever is there (or not) — dropping
