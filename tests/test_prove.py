@@ -15,7 +15,7 @@ import subprocess
 
 import pytest
 
-from chad import prove
+from chad import cli, prove
 
 # ---- task fixtures: solvable, and the verifier discriminates --------------------
 
@@ -166,51 +166,53 @@ def test_verify_treats_a_hung_or_unrunnable_check_as_a_failure(tmp_path, monkeyp
     monkeypatch.chdir(tmp_path)
     _seed(task, tmp_path)
 
-    def hang(*a, **k):
-        raise subprocess.TimeoutExpired(cmd="check.py", timeout=60)
+    def hang(check_path):
+        raise subprocess.TimeoutExpired(cmd=check_path, timeout=60)
 
-    monkeypatch.setattr(prove.subprocess, "run", hang)
-    assert prove._verify(task) is False
+    assert prove._verify(task, run_check=hang) is False
 
-    def unrunnable(*a, **k):
+    def unrunnable(check_path):
         raise OSError("no such interpreter")
 
-    monkeypatch.setattr(prove.subprocess, "run", unrunnable)
-    assert prove._verify(task) is False
+    assert prove._verify(task, run_check=unrunnable) is False
 
 
 def test_a_task_that_raises_becomes_a_failed_row(tmp_path, monkeypatch, capsys):
     """One task blowing up must not cost the user the scorecard and results.json — the
     two artifacts the command exists to produce."""
-    from chad import cli, engine
 
     class _FakeEngine:
-        def __init__(self, **kw):
-            pass
-
         def load(self):
             return 1.0
 
-    monkeypatch.chdir(tmp_path)
+    # A complete single-file snapshot in the cache: the model check passes, no download.
+    snapshot = tmp_path / "hf-snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "model.safetensors").write_text("x")
+
+    def cached_file(repo_id, filename):
+        path = snapshot / filename
+        return str(path) if path.exists() else None
+
+    host = cli.Host(platform_id=lambda: ("Darwin", "arm64"), ram_gb=lambda: 64.0,
+                    cached_file=cached_file)
+    invoking_dir = tmp_path / "invoking"
+    invoking_dir.mkdir()
+    monkeypatch.chdir(invoking_dir)
     monkeypatch.setenv("HF_HUB_OFFLINE", "0")      # run() sets it; restore after
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(cli, "_preflight", lambda backend="mlx": None)
-    monkeypatch.setattr(cli, "_ensure_model", lambda model_id: None)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(engine, "Engine", _FakeEngine)
-    monkeypatch.setattr(prove, "_install_socket_guard", lambda: (lambda: None))
-    import huggingface_hub
-    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", lambda *a, **k: "cfg")
 
-    def boom(*a, **k):
+    def boom(engine, task, capture_ttft=False):
         raise RuntimeError("the engine fell over")
 
-    monkeypatch.setattr(prove, "_run_one", boom)
+    real_connect = socket.socket.connect
+    rc = prove.run(cli._prove_parser().parse_args([]), host=host,
+                   make_engine=lambda model_id: _FakeEngine(), run_one=boom)
 
-    rc = prove.run(argparse.Namespace(backend="mlx", model=None))
-
+    assert socket.socket.connect is real_connect  # the offline guard never outlives run()
     assert rc == 1
-    rows = json.loads((tmp_path / "results.json").read_text())["results"]
+    rows = json.loads((invoking_dir / "results.json").read_text())["results"]
     assert len(rows) == len(prove.TASKS)
     assert all(r["passed"] is False and r["error"] == "RuntimeError" for r in rows), rows
     card = capsys.readouterr().out

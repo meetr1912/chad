@@ -20,17 +20,16 @@ import re
 import subprocess
 import sys
 import time
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 from . import config, guardrails, levers
 from .base_engine import BackendError
 from .diag import log
 
 if TYPE_CHECKING:
-    from .agent import Agent, repl
+    from .agent import Agent
     from .engine import Engine
-else:
-    Engine = Agent = repl = None  # bound on first use by _backend_classes()
 
 # Package dir is src/chad/; the project root (two levels up) is the dev clone. If a
 # locally-built weights tree exists at <root>/models/ it's preferred (see _pick_model);
@@ -82,17 +81,6 @@ def _env_float(name):
     return float(val) if val else None
 
 
-# The three sampler knobs travel TOGETHER, as one call, deliberately.
-#
-# They used to be three sibling blocks inlined in `main()`, which meant every path that
-# builds its own engine had to remember to copy all three — and one didn't copy any, so
-# it ran without CHAD_MIN_P and nothing said so. The
-# failure shape is that sibling settings drift ONE AT A TIME: a later fix honors the field
-# it touched, looks complete, and leaves its neighbours silently dead. There is one
-# function now, so a caller cannot honor `temp` and forget `min_p`.
-SAMPLER_ENV = (("temp", "CHAD_TEMP"), ("min_p", "CHAD_MIN_P"), ("top_p", "CHAD_TOP_P"),
-               ("top_k", "CHAD_TOP_K"), ("presence_penalty", "CHAD_PRESENCE_PENALTY"))
-
 # Qwen3.8's two published sampling recipes. The model card gives DIFFERENT settings
 # per mode, and the difference is not cosmetic: non-thinking mode has no reasoning
 # block to absorb a loop, so the card calls for a presence penalty ("adjust
@@ -120,10 +108,45 @@ def apply_sampler_preset(eng, thinking: bool):
     """Apply the model-card sampling recipe for the active reasoning mode.
 
     Call BEFORE apply_sampler_env so an explicit CHAD_* override still wins."""
-    for attr, val in (THINKING_SAMPLER if thinking else NONTHINKING_SAMPLER).items():
-        setattr(eng, attr, val)
+    preset = THINKING_SAMPLER if thinking else NONTHINKING_SAMPLER
+    eng.temp = preset["temp"]
+    eng.top_p = preset["top_p"]
+    eng.top_k = preset["top_k"]
+    eng.min_p = preset["min_p"]
+    eng.presence_penalty = preset["presence_penalty"]
 
 
+_Knob = TypeVar("_Knob", int, float)
+
+
+def _sampler_knob(var: str, parse: Callable[[str], _Knob]) -> Optional[_Knob]:
+    """`parse` applied to env var `var`; None when it is unset, or when it is not a number
+    (said once on stderr, and the engine keeps whatever it had)."""
+    raw = config.env_str(var)
+    if not raw:
+        return None
+    try:
+        return parse(raw)
+    except ValueError:
+        sys.stderr.write(f"[ignoring {var}={raw!r}: not a number]\n")
+        return None
+
+
+def _whole_number(raw: str) -> int:
+    # top_k indexes a vocab axis and is passed to mx.topk — it must stay an int, where
+    # every other sampler knob is a float. Coercing it to float would make CHAD_TOP_K=20 a
+    # TypeError deep in the sampler; "20.0" is still accepted.
+    return int(float(raw))
+
+
+# The sampler knobs travel TOGETHER, as one call, deliberately.
+#
+# They used to be sibling blocks inlined in `main()`, which meant every path that builds
+# its own engine had to remember to copy all of them — and one didn't copy any, so it ran
+# without CHAD_MIN_P and nothing said so. The failure shape is that sibling settings drift
+# ONE AT A TIME: a later fix honors the field it touched, looks complete, and leaves its
+# neighbours silently dead. There is one function now, so a caller cannot honor `temp`
+# and forget `min_p`.
 def apply_sampler_env(eng):
     """Apply the sampler-knob environment overrides to `eng`, in place.
 
@@ -141,28 +164,37 @@ def apply_sampler_env(eng):
     model card's anti-repetition knob for non-thinking mode (useful range 0-2).
 
     Applied AFTER any mode preset, so an explicit env var always wins."""
-    for attr, var in SAMPLER_ENV:
-        raw = config.env_str(var)
-        if not raw:
-            continue
-        try:
-            # top_k indexes a vocab axis and is passed to mx.topk — it must stay an
-            # int, where every other knob here is a float. Coercing the whole family
-            # to float would make CHAD_TOP_K=20 a TypeError deep in the sampler.
-            setattr(eng, attr, int(float(raw)) if attr == "top_k" else float(raw))
-        except ValueError:
-            sys.stderr.write(f"[ignoring {var}={raw!r}: not a number]\n")
+    temp = _sampler_knob("CHAD_TEMP", float)
+    if temp is not None:
+        eng.temp = temp
+    min_p = _sampler_knob("CHAD_MIN_P", float)
+    if min_p is not None:
+        eng.min_p = min_p
+    top_p = _sampler_knob("CHAD_TOP_P", float)
+    if top_p is not None:
+        eng.top_p = top_p
+    top_k = _sampler_knob("CHAD_TOP_K", _whole_number)
+    if top_k is not None:
+        eng.top_k = top_k
+    presence_penalty = _sampler_knob("CHAD_PRESENCE_PENALTY", float)
+    if presence_penalty is not None:
+        eng.presence_penalty = presence_penalty
 
 
-def _version_string():
+def _direct_url_json():
+    """This install's `direct_url.json` dist-info record (PEP 610), or "" without one."""
+    from importlib.metadata import distribution
+    return distribution("chad").read_text("direct_url.json") or ""
+
+
+def _version_string(direct_url_json=_direct_url_json):
     """chad <version> (<vcs commit>) — commit resolves for git installs via
     dist-info/direct_url.json, or from the dev clone's .git; absent otherwise."""
     from . import __version__
     detail = ""
     try:
         import json
-        from importlib.metadata import distribution
-        raw = distribution("chad").read_text("direct_url.json") or ""
+        raw = direct_url_json()
         commit = json.loads(raw).get("vcs_info", {}).get("commit_id", "") if raw else ""
         if not commit and os.path.isdir(os.path.join(_PROJECT_ROOT, ".git")):
             commit = subprocess.check_output(
@@ -335,23 +367,6 @@ def peek_ctx_limit(model_id, window):
         return None
 
 
-def _preflight(backend="mlx"):
-    """chad's default in-process engine runs only on Apple Silicon — MLX has no CPU/CUDA
-    build. Hard-stop with a human message instead of letting `uv sync`/import fail
-    cryptically elsewhere. The remote backend (`--backend llama`) loads NO MLX —
-    only a tokenizer plus HTTP — so it runs anywhere (e.g. inside a Linux
-    container reaching a remote server); skip the Apple-Silicon gate for it."""
-    if backend == "llama":
-        return
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        sys.stderr.write(
-            "chad: requires an Apple Silicon Mac (arm64 macOS).\n"
-            f"  detected: {platform.system()} {platform.machine() or '?'}\n"
-            "  MLX ships no CPU/CUDA build — there is no supported non-Apple path.\n"
-            "  (For a remote engine on this host, use --backend llama.)\n")
-        sys.exit(1)
-
-
 def _detect_ram_gb():
     """Physical RAM in GiB via sysctl, or None if it can't be read."""
     try:
@@ -359,46 +374,6 @@ def _detect_ram_gb():
         return int(out.strip()) / (1024 ** 3)
     except Exception:  # noqa: BLE001 — any failure → caller picks the safe (smaller) model
         return None
-
-
-def _resolve(local, repo):
-    """Prefer a locally-built models/ dir over the HF repo when it exists."""
-    return local if os.path.isdir(local) else repo
-
-
-def _pick_model(spec=None):
-    """Resolve the model id and a human label for *why* it was chosen.
-
-    Order: explicit `--model` (`spec`) → CHAD_MODEL → the shipped default. There are no
-    size shorthands any more — chad ships exactly one model (2.0.0 retired the Ornith
-    35B/9B pair and the RAM-aware pick that chose between them). `auto` still means "the
-    default"; anything else is passed through untouched as an HF repo id or local dir.
-
-    A box below the 24 GB target is warned about once, on stderr, and then served
-    anyway: chad advises, the caller decides.
-    """
-    # Name the winning source in the reason: it is only ever ambiguous when both the
-    # flag and the env var are set, which is exactly when the user needs to be told.
-    source = "--model" if spec is not None else "CHAD_MODEL"
-    spec = spec or config.env_str("CHAD_MODEL")
-    if spec and spec.strip().lower() != "auto":
-        return spec, f"explicitly requested ({source} override)"
-    ram = _detect_ram_gb()
-    if ram is None or ram < _MIN_RAM_GB:
-        got = "undetectable" if ram is None else f"{ram:.0f} GB"
-        sys.stderr.write(
-            f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
-            f"model needs ~12 GB resident plus its KV cache, so expect a small context "
-            f"window and possible thrashing. Proceeding.\n")
-    return _resolve(_LOCAL_MODEL, _HF_MODEL), "default"
-
-
-def _model_download_gb(model_id):
-    """Approximate download size in GiB for the shipped model (for the disk preflight
-    and the confirm prompt — display honesty, not accounting): ~12.1 GB of weights
-    plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
-    ahead of the resolve, so it gets the same figure."""
-    return 13.2
 
 
 def _free_disk_gb(path):
@@ -417,7 +392,109 @@ def _free_disk_gb(path):
         return None
 
 
-def _cached_weights_complete(model_id) -> bool:
+def _hf_cached_file(repo_id: str, filename: str) -> Optional[str]:
+    """Path of `filename` from `repo_id` in the local Hugging Face cache, or None.
+
+    The hub answers with a path, with None, or with a sentinel recording that the file is
+    known NOT to exist upstream. Only a path means the bytes are on this disk, so the
+    sentinel is folded into None here, once, for every caller."""
+    from huggingface_hub import try_to_load_from_cache
+    path = try_to_load_from_cache(repo_id, filename)
+    return path if isinstance(path, str) else None
+
+
+def _platform_id() -> tuple[str, str]:
+    """(OS, CPU architecture) as the interpreter reports them, e.g. ("Darwin", "arm64")."""
+    return platform.system(), platform.machine()
+
+
+def _stdin_isatty() -> bool:
+    return sys.stdin.isatty()
+
+
+@dataclass(frozen=True)
+class Host:
+    """The machine chad runs on and the person at its terminal, as startup reads them.
+
+    Every first-run decision — the Apple Silicon gate, the small-box warning, the disk
+    preflight, the cache check, the download consent, the session pick — comes down to one
+    of these reads. Each is a callable made at the moment the decision is, so the defaults
+    behave exactly like calling `platform`, `sysctl`, `shutil`, the HF cache, `sys.stdin`
+    and `input` inline, and a caller can swap any single one without the others."""
+
+    platform_id: Callable[[], tuple[str, str]] = _platform_id
+    ram_gb: Callable[[], Optional[float]] = _detect_ram_gb
+    free_disk_gb: Callable[[str], Optional[float]] = _free_disk_gb
+    cached_file: Callable[[str, str], Optional[str]] = _hf_cached_file
+    stdin_isatty: Callable[[], bool] = _stdin_isatty
+    ask: Callable[[str], str] = input
+
+
+HOST = Host()
+
+
+def _preflight(backend="mlx", *, host: Host = HOST):
+    """chad's default in-process engine runs only on Apple Silicon — MLX has no CPU/CUDA
+    build. Hard-stop with a human message instead of letting `uv sync`/import fail
+    cryptically elsewhere. The remote backend (`--backend llama`) loads NO MLX —
+    only a tokenizer plus HTTP — so it runs anywhere (e.g. inside a Linux
+    container reaching a remote server); skip the Apple-Silicon gate for it."""
+    if backend == "llama":
+        return
+    system, machine = host.platform_id()
+    if system != "Darwin" or machine != "arm64":
+        sys.stderr.write(
+            "chad: requires an Apple Silicon Mac (arm64 macOS).\n"
+            f"  detected: {system} {machine or '?'}\n"
+            "  MLX ships no CPU/CUDA build — there is no supported non-Apple path.\n"
+            "  (For a remote engine on this host, use --backend llama.)\n")
+        sys.exit(1)
+
+
+def _resolve(local, repo):
+    """Prefer a locally-built models/ dir over the HF repo when it exists."""
+    return local if os.path.isdir(local) else repo
+
+
+def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL):
+    """Resolve the model id and a human label for *why* it was chosen.
+
+    Order: explicit `--model` (`spec`) → CHAD_MODEL → the shipped default. There are no
+    size shorthands any more — chad ships exactly one model (2.0.0 retired the Ornith
+    35B/9B pair and the RAM-aware pick that chose between them). `auto` still means "the
+    default"; anything else is passed through untouched as an HF repo id or local dir.
+    The default is the locally-built weights at `local_model` when that directory exists
+    (a dev clone), else the Hugging Face repo.
+
+    A box below the 24 GB target is warned about once, on stderr, and then served
+    anyway: chad advises, the caller decides.
+    """
+    # Name the winning source in the reason: it is only ever ambiguous when both the
+    # flag and the env var are set, which is exactly when the user needs to be told.
+    source = "--model" if spec is not None else "CHAD_MODEL"
+    spec = spec or config.env_str("CHAD_MODEL")
+    if spec and spec.strip().lower() != "auto":
+        return spec, f"explicitly requested ({source} override)"
+    ram = host.ram_gb()
+    if ram is None or ram < _MIN_RAM_GB:
+        got = "undetectable" if ram is None else f"{ram:.0f} GB"
+        sys.stderr.write(
+            f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
+            f"model needs ~12 GB resident plus its KV cache, so expect a small context "
+            f"window and possible thrashing. Proceeding.\n")
+    return _resolve(local_model, _HF_MODEL), "default"
+
+
+def _model_download_gb(model_id):
+    """Approximate download size in GiB for the shipped model (for the disk preflight
+    and the confirm prompt — display honesty, not accounting): ~12.1 GB of weights
+    plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
+    ahead of the resolve, so it gets the same figure."""
+    return 13.2
+
+
+def _cached_weights_complete(
+        model_id, *, cached_file: Callable[[str, str], Optional[str]] = _hf_cached_file) -> bool:
     """Whether the HF cache holds this repo's WEIGHTS, not merely its small files.
 
     The cheap check ("is config.json cached?") is wrong in the one case that matters.
@@ -428,29 +505,27 @@ def _cached_weights_complete(model_id) -> bool:
     state except hand-deleting the cache. So verify what the loader will actually
     read: every shard the index names, or a single-file/loose layout on disk.
     """
-    from huggingface_hub import try_to_load_from_cache
-    cached = lambda f: isinstance(try_to_load_from_cache(model_id, f), str)  # noqa: E731
-    index = try_to_load_from_cache(model_id, "model.safetensors.index.json")
-    if isinstance(index, str):
+    index = cached_file(model_id, "model.safetensors.index.json")
+    if index is not None:
         try:
             with open(index, encoding="utf-8") as f:
                 shards = set(json.load(f).get("weight_map", {}).values())
         except (OSError, ValueError):
             return False  # unreadable index: treat as incomplete, re-fetch resumes
-        return bool(shards) and all(cached(s) for s in shards)
-    if cached("model.safetensors"):
+        return bool(shards) and all(cached_file(model_id, s) is not None for s in shards)
+    if cached_file(model_id, "model.safetensors") is not None:
         return True
     # No index and no conventionally-named file: an unusual layout is not our business
     # to second-guess, so accept any .safetensors already sitting in the snapshot (this
     # is what mlx_lm globs for) rather than forcing a re-download of a working cache.
-    config_path = try_to_load_from_cache(model_id, "config.json")
-    if isinstance(config_path, str):
+    config_path = cached_file(model_id, "config.json")
+    if config_path is not None:
         import glob
         return bool(glob.glob(os.path.join(os.path.dirname(config_path), "*.safetensors")))
     return False
 
 
-def _ensure_model(model_id):
+def _ensure_model(model_id, *, host: Host = HOST):
     """If model_id is a HF repo id not yet in the local cache, confirm and download it
     into ~/.cache/huggingface (shared, resumable, paid once per machine). Local dirs
     and already-cached repos return immediately. Headless (no TTY) auto-downloads.
@@ -459,11 +534,11 @@ def _ensure_model(model_id):
     if os.path.isdir(model_id):
         return  # a local path — nothing to fetch
     from huggingface_hub import snapshot_download
-    if _cached_weights_complete(model_id):
+    if _cached_weights_complete(model_id, cached_file=host.cached_file):
         return  # already in the HF cache
     need_gb = _model_download_gb(model_id)
     hf_home = os.environ.get("HF_HOME", "~/.cache/huggingface")
-    free_gb = _free_disk_gb(hf_home)
+    free_gb = host.free_disk_gb(hf_home)
     # need + 2 GB headroom: the HF cache writes temp blobs beside the final files.
     if free_gb is not None and free_gb < need_gb + 2.0:
         sys.stderr.write(
@@ -478,8 +553,7 @@ def _ensure_model(model_id):
     # Say WHICH of the two situations this is. "Downloading again" on a machine the
     # user believes already has the model reads as a bug unless the partial cache is
     # named; only the completed blobs are re-used, so the second run is also shorter.
-    from huggingface_hub import try_to_load_from_cache
-    partial = isinstance(try_to_load_from_cache(model_id, "config.json"), str)
+    partial = host.cached_file(model_id, "config.json") is not None
     sys.stderr.write(
         (f"\nchad: the cached copy of '{model_id}' is incomplete (an interrupted "
          f"download left its metadata but not all of its weights).\nResuming — only "
@@ -487,8 +561,8 @@ def _ensure_model(model_id):
          f"\nchad needs the model '{model_id}' "
          f"({size} — minutes on fast fiber, ~20 min on 100 Mbit; resumable).\n"
          "It downloads once into ~/.cache/huggingface and is reused across projects.\n"))
-    if sys.stdin.isatty():
-        ans = input("Download now? [Y/n] ").strip().lower()
+    if host.stdin_isatty():
+        ans = host.ask("Download now? [Y/n] ").strip().lower()
         if ans and ans not in ("y", "yes"):
             sys.stderr.write(
                 "Aborted. Set CHAD_MODEL to a local model dir to skip the download.\n")
@@ -502,7 +576,7 @@ def _ensure_model(model_id):
     try:
         snapshot_download(model_id)  # tqdm progress to stderr
     except Exception as e:  # noqa: BLE001 — offline / gated / typo'd repo / full disk → guidance, not a traceback
-        no_space = isinstance(e, OSError) and getattr(e, "errno", None) == 28
+        no_space = isinstance(e, OSError) and e.errno == 28
         extra = ("  note:  the disk filled up mid-download — free space and re-run "
                  "(it resumes).\n" if no_space or "No space left" in str(e) else "")
         sys.stderr.write(
@@ -565,16 +639,16 @@ def _maybe_home_dir_note():
             "(cd into one and rerun).\n")
 
 
-def _pick_session(items):
-    """Prompt the user to pick one of `items` (from session.list_sessions) by number.
-    Returns the chosen item, or None to start fresh. Requires a TTY — the caller
-    guards that before calling."""
+def _pick_session(items, *, ask: Callable[[str], str] = input):
+    """Prompt the user to pick one of `items` (from session.list_sessions) by number,
+    reading the answer through `ask`. Returns the chosen item, or None to start fresh.
+    Requires a TTY — the caller guards that before calling."""
     from . import session
     sys.stderr.write("Resume which session? (this directory's recent sessions)\n")
     for i, it in enumerate(items, 1):
         sys.stderr.write(f"  {i}. {session.describe(it)}\n")
     try:
-        raw = input("session number (blank to cancel): ").strip()
+        raw = ask("session number (blank to cancel): ").strip()
     except (EOFError, KeyboardInterrupt):
         return None
     if not raw:
@@ -700,35 +774,47 @@ def _run_levers():
     return 0
 
 
-def _backend_classes():
+@dataclass(frozen=True)
+class Backend:
+    """What a run is assembled from: the MLX engine, the agent loop, and the two
+    interactive front ends (plain REPL and full-screen TUI)."""
+
+    engine: Callable[..., "Engine"]
+    agent: Callable[..., "Agent"]
+    repl: Callable[..., None]
+    tui: Callable[..., None]
+
+
+def _run_tui(engine, ctx_limit, **kw):
+    """The full-screen TUI, imported only on the path that opens it (it pulls in
+    prompt_toolkit, which a headless run has no use for)."""
+    from .tui import run_tui
+    run_tui(engine, ctx_limit, **kw)
+
+
+def _load_backend() -> Backend:
     """Import the engine and agent on first use, not with this module: `chad.engine`
     pulls in mlx_lm and transformers (~0.75 s), which `chad --help`, `--version` and
-    `chad levers` would otherwise pay before argparse even runs. A name that is already
-    bound is left alone, so tests can swap in fakes."""
-    global Engine, Agent, repl
-    if Engine is None:
-        from .engine import Engine as _Engine
-        Engine = _Engine
-    if Agent is None:
-        from .agent import Agent as _Agent
-        Agent = _Agent
-    if repl is None:
-        from .agent import repl as _repl
-        repl = _repl
-    return Engine, Agent, repl
+    `chad levers` would otherwise pay before argparse even runs."""
+    from .agent import Agent, repl
+    from .engine import Engine
+    return Backend(engine=Engine, agent=Agent, repl=repl, tui=_run_tui)
 
 
-def main(argv=None):
+def main(argv=None, *, host=HOST, load_backend=_load_backend):
     """Console entrypoint. Wraps `_main` only to turn a backend fault that escaped the
     agent's retry loop into guidance — it can surface from the one-shot, --repl, or TUI
-    path alike, and all three would otherwise exit through a raw traceback."""
+    path alike, and all three would otherwise exit through a raw traceback.
+
+    `host` is the machine and terminal startup reads; `load_backend` is called once
+    argparse and the subcommands are through, and returns what the run is built from."""
     try:
-        return _main(argv)
+        return _main(argv, host, load_backend)
     except BackendError as e:
         _fail_backend(e, _resolved_base_url)
 
 
-def _main(argv=None):
+def _main(argv, host, load_backend):
     global _resolved_base_url
     argv = list(sys.argv[1:] if argv is None else argv)
     sub = argv[0] if argv and argv[0] in _SUBCOMMANDS else None
@@ -737,7 +823,7 @@ def _main(argv=None):
         sys.exit(_run_levers())
     if sub == "prove":
         from . import prove
-        sys.exit(prove.run(_prove_parser().parse_args(argv[1:])))
+        sys.exit(prove.run(_prove_parser().parse_args(argv[1:]), host=host))
 
     args = _agent_parser().parse_args(argv)
     if args.levers:  # deprecated spelling of `chad levers`
@@ -750,7 +836,7 @@ def _main(argv=None):
     except levers.UnknownLever as e:
         sys.stderr.write(f"chad: {e}\n")
         sys.exit(1)
-    _preflight(args.backend)  # Apple Silicon only for MLX; the remote backend runs anywhere
+    _preflight(args.backend, host=host)  # Apple Silicon only for MLX; remote runs anywhere
     # --think-budget reaches the TUI/REPL Agents through the same env knob
     # their __init__ reads, so the flag works on every entrypoint, not just headless.
     if args.think_budget is not None:
@@ -761,7 +847,7 @@ def _main(argv=None):
     turn_budget_s = config.env_float("CHAD_TURN_BUDGET_S")
     task = args.task or args.prompt_flag
     # --model / CHAD_MODEL, else the shipped default; local-dir-preferred, HF fallback.
-    model_id, why = _pick_model(args.model)
+    model_id, why = _pick_model(args.model, host=host)
 
     # Advanced, rarely-touched knobs live in env vars to keep the CLI sane:
     #   CHAD_MAX_CONTEXT       YaRN-extend the window (e.g. 131072 for 128k)
@@ -781,7 +867,7 @@ def _main(argv=None):
     kv_cache_max_gb = _env_int("CHAD_KV_CACHE_MAX_GB")
     kv_cache_max_bytes = (kv_cache_max_gb if kv_cache_max_gb is not None else 8) * 1024**3
 
-    Engine, Agent, repl = _backend_classes()
+    backend = load_backend()
 
     if args.backend == "llama":
         # Drive the chad harness against a remote llama.cpp server instead
@@ -805,8 +891,9 @@ def _main(argv=None):
         sys.stderr.write(f"backend={args.backend} · base_url={base_url} · model={model_id} "
                          f"(tokenizer local, generation proxied) ...\n")
     else:
-        _ensure_model(model_id)  # first-run download-on-consent if it's an uncached HF repo
-        eng = Engine(
+        # first-run download-on-consent if it's an uncached HF repo
+        _ensure_model(model_id, host=host)
+        eng = backend.engine(
             model_id=model_id,
             kv_bits=kv_bits,
             max_context=max_context,
@@ -860,12 +947,12 @@ def _main(argv=None):
         items = session.list_sessions(os.getcwd(), limit=10)
         if not items:
             sys.stderr.write("no saved sessions for this directory; starting fresh\n")
-        elif not sys.stdin.isatty():
+        elif not host.stdin_isatty():
             sys.stderr.write("chad --resume needs an interactive terminal to pick a "
                              "session; use -c to resume the most recent one.\n")
             sys.exit(1)
         else:
-            pick = _pick_session(items)
+            pick = _pick_session(items, ask=host.ask)
             if pick:
                 data = session.load_session(os.getcwd(), pick["session_id"])
                 if data:
@@ -885,13 +972,13 @@ def _main(argv=None):
         # reads from stdin, which EOFs with no TTY and would abort every edit. So
         # auto-approve mutating tools unless the user asked for read-only --plan.
         run_mode = start_mode
-        if run_mode == "normal" and not sys.stdin.isatty():
+        if run_mode == "normal" and not host.stdin_isatty():
             run_mode = "yolo"
             sys.stderr.write("[headless: auto-approving tools (use --plan for read-only)]\n")
-        agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
-                      mode=run_mode, thinking=thinking, resume=resume, persist=True,
-                      think_budget=args.think_budget,
-                      turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn)
+        agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
+                              mode=run_mode, thinking=thinking, resume=resume, persist=True,
+                              think_budget=args.think_budget,
+                              turn_budget_s=turn_budget_s, ctx_limit_fn=ctx_limit_fn)
         # Wall time across ALL of this task's turns (initial + any auto-continue
         # relaunches), measured against the wall budget to decide the early-finish review.
         task_start = time.monotonic()
@@ -944,13 +1031,12 @@ def _main(argv=None):
             # A deterministic (temp-0) stall replays itself verbatim on retry — the
             # measured 3/3 byte-identical failing reps. Give the relaunch a
             # sampling distribution so it can take a different path.
-            if getattr(eng, "temp", None) is not None:
-                eng.temp = max(eng.temp, 0.6)
+            eng.temp = max(eng.temp, 0.6)
             eng.reset()
-            agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
-                          mode=run_mode, thinking=thinking, persist=True,
-                          think_budget=args.think_budget,
-                          turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn)
+            agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
+                                  mode=run_mode, thinking=thinking, persist=True,
+                                  think_budget=args.think_budget,
+                                  turn_budget_s=relaunch_s, ctx_limit_fn=ctx_limit_fn)
             agent.run_turn(f"{task}\n\n[{note}]")
         # Early-finish self-review: if the task settled CLEANLY (no
         # banked budget note) with more than 30% of the wall budget still unspent, relaunch
@@ -969,18 +1055,17 @@ def _main(argv=None):
             sys.stderr.write(f"[review] task finished with {turn_budget_s - elapsed:.0f}s "
                              "of budget left; running one fresh-context verification pass\n")
             eng.reset()
-            agent = Agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
-                          mode=run_mode, thinking=thinking, persist=True,
-                          think_budget=args.think_budget,
-                          turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)
+            agent = backend.agent(eng, yolo=(run_mode == "yolo"), ctx_limit=ctx_limit,
+                                  mode=run_mode, thinking=thinking, persist=True,
+                                  think_budget=args.think_budget,
+                                  turn_budget_s=review_budget, ctx_limit_fn=ctx_limit_fn)
             agent.run_turn(task + guardrails.REVIEW_PASS_PROMPT)
         agent.save()  # persist so a follow-up `chad -c "..."` picks up the thread
     elif args.repl:
-        repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume, thinking=thinking,
-             ctx_limit_fn=ctx_limit_fn)
+        backend.repl(eng, yolo=args.yolo, ctx_limit=ctx_limit, resume=resume,
+                     thinking=thinking, ctx_limit_fn=ctx_limit_fn)
     else:
         from .engine import peek_context_window
-        from .tui import run_tui
         _maybe_home_dir_note()
         # Cheap config-only window for the banner + a provisional compaction limit, both
         # shown instantly; `finalize` runs the real load on the TUI's background thread and
@@ -997,9 +1082,9 @@ def _main(argv=None):
             load_s = eng.load()
             return load_s, _compute_ctx_limit(eng)
 
-        run_tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
-                ctx_window=provisional, native_ctx=window, finalize=finalize,
-                ctx_limit_fn=ctx_limit_fn)
+        backend.tui(eng, provisional, mode=start_mode, thinking=thinking, resume=resume,
+                    ctx_window=provisional, native_ctx=window, finalize=finalize,
+                    ctx_limit_fn=ctx_limit_fn)
 
 
 if __name__ == "__main__":

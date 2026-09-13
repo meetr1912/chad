@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Callable
 
 # Reuse the exact model selection chad itself uses (RAM-aware default, local-dir-preferred,
 # HF fallback) so the benchmark measures the model you'd actually run.
@@ -34,7 +35,7 @@ def _bench_engine(model_id: str) -> Engine:
     passes it to Engine; the two benchmarks each constructed Engine directly and so always
     measured the AUTO kv width whatever the env said — a `CHAD_KV_BITS=0` A/B against the
     shipped 8-bit default reported a clean null, which is the most expensive way for a
-    benchmark to be wrong. It is the failure shape `cli.SAMPLER_ENV` already documents:
+    benchmark to be wrong. It is the failure shape `cli.apply_sampler_env` already documents:
     sibling settings drift ONE AT A TIME, and the later fix looks complete while leaving
     its neighbours dead. There is one function now, so a third benchmark cannot forget.
 
@@ -185,7 +186,10 @@ def _run_agentic(model_id: str, why: str, context_tokens: int) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def main(argv=None, *,
+         run_agentic: Callable[[str, str, int], int] = _run_agentic) -> int:
+    """`chad-bench`. `--agentic` hands the resolved model, the reason it was picked and
+    `--context-tokens` to `run_agentic`; otherwise the throughput benchmark runs here."""
     ap = argparse.ArgumentParser(
         prog="chad-bench",
         description="Measure chad's prefill / decode / warm-step throughput on this machine.",
@@ -211,7 +215,7 @@ def main(argv=None) -> int:
     if args.agentic:
         model_id, why = _pick_model()
         _ensure_model(model_id)
-        return _run_agentic(model_id, why, args.context_tokens)
+        return run_agentic(model_id, why, args.context_tokens)
 
     model_id, why = _pick_model()
     _ensure_model(model_id)
@@ -249,7 +253,7 @@ def main(argv=None) -> int:
     # measurement that cannot lie about it — it halves with the cache width.
     kv_label = f"{eng.kv_bits}-bit group-64" if eng.kv_bits else "fp16"
     chunk_label = (f"{args.chunk}" if args.chunk
-                   else f"adaptive (base {2048 if getattr(eng, '_is_moe', False) else 512})")
+                   else f"adaptive (base {2048 if eng._is_moe else 512})")
     print(f"config                   kv cache {kv_label} "
           f"({eng.kv_bytes_per_token:,.0f} B/tok) | prefill chunk {chunk_label}")
     print(f"model load               {load_s:6.1f} s")

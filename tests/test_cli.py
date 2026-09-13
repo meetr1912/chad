@@ -1,7 +1,8 @@
 """Characterization tests for cli.py's model-resolution + env parsing — the bootstrap
-path that currently has ZERO direct coverage. All model-free: we never call main()
-(which loads MLX and reads argv); we drive the pure helpers `_env_int` and `_pick_model`,
-monkeypatching `_detect_ram_gb` (it shells out to sysctl) and `os.path.isdir`.
+path that currently has ZERO direct coverage. All model-free: we never load a model; we
+drive the pure helpers `_env_int` and `_pick_model` directly, handing them a `cli.Host`
+whose RAM probe is a stub (the real one shells out to sysctl) and a local-build path
+under tmp_path that does or does not exist.
 
 A bug in `_pick_model` silently picks the wrong model size, or downloads a 12 GB repo
 on a box that can't run it; a bug in `_env_int` mis-parses an advanced knob. These pin
@@ -10,6 +11,7 @@ the current contract so a refactor can't drift it.
 Run: `uv run python tests/test_cli.py`
 """
 
+import inspect
 import json
 import os
 import subprocess
@@ -21,6 +23,20 @@ from chad import cli
 
 PASS = 0
 FAIL = 0
+
+_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+
+
+def _env_with_src():
+    """This process's environment with the checkout's src/ first on PYTHONPATH, for a
+    fresh interpreter that must import this tree's `chad`."""
+    return {**os.environ, "PYTHONPATH": os.pathsep.join(
+        p for p in (_SRC, os.environ.get("PYTHONPATH")) if p)}
+
+
+def _host(ram):
+    """A Host whose physical-RAM probe reads `ram` GiB (None = unreadable)."""
+    return cli.Host(ram_gb=lambda: ram)
 
 
 def check(name, cond, detail=""):
@@ -56,27 +72,28 @@ def test_env_int(monkeypatch):
     check("non-numeric raises ValueError", raised)
 
 
-def test_pick_model_override(monkeypatch):
+def test_pick_model_override(monkeypatch, tmp_path):
     # An explicit CHAD_MODEL wins outright, regardless of RAM or local dirs, and the
     # reason says the choice was requested rather than defaulted.
     monkeypatch.setenv("CHAD_MODEL", "/some/local/model")
-    # even with isdir/ram set to surprising values the override must short-circuit first
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)
-    model, why = cli._pick_model()
+    # even with a surprising RAM reading and a local build present, the override must
+    # short-circuit first
+    local = tmp_path / "local-build"
+    local.mkdir()
+    model, why = cli._pick_model(host=_host(8.0), local_model=str(local))
     check("override returns CHAD_MODEL value", model == "/some/local/model", model)
     check("override reason says requested", "requested" in why.lower(), why)
     # `--model` (the `spec` argument) outranks CHAD_MODEL: the flag is the more specific
     # signal, and a shell that exports CHAD_MODEL globally must not pin every run.
-    model, _ = cli._pick_model("/flag/model")
+    model, _ = cli._pick_model("/flag/model", host=_host(8.0), local_model=str(local))
     check("--model beats CHAD_MODEL", model == "/flag/model", model)
     # `--model auto` is the explicit spelling of "ignore the override, use the default".
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("auto")
+    model, why = cli._pick_model("auto", host=_host(64.0),
+                                 local_model=str(tmp_path / "no-local-build"))
     check("auto falls through to the shipped default", model == cli._HF_MODEL, model)
 
 
-def test_pick_model_no_size_shorthands(monkeypatch):
+def test_pick_model_no_size_shorthands(monkeypatch, tmp_path):
     """2.0.0 retired the Ornith pair and with it `--model 35b` / `--model 9b`.
 
     The shorthands must not silently resolve to anything: they are now ordinary specs,
@@ -85,49 +102,44 @@ def test_pick_model_no_size_shorthands(monkeypatch):
     the user never learns their flag stopped meaning anything.
     """
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
+    no_local = str(tmp_path / "no-local-build")
     for spec in ("9b", "35b", "27b", "mlx-community/Whatever-4bit"):
-        model, why = cli._pick_model(spec)
+        model, why = cli._pick_model(spec, host=_host(64.0), local_model=no_local)
         check(f"--model {spec} passes through literally", model == spec, model)
         check(f"--model {spec} reason says requested", "requested" in why.lower(), why)
 
 
-def test_pick_model_one_model_every_box(monkeypatch):
+def test_pick_model_one_model_every_box(monkeypatch, tmp_path):
     """One model, whatever the RAM: there is no smaller tier to fall back to."""
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)   # no local build -> HF repo
+    no_local = str(tmp_path / "no-local-build")   # no local build -> HF repo
     for ram in (16.0, 24.0, 64.0, None):
-        monkeypatch.setattr(cli, "_detect_ram_gb", lambda ram=ram: ram)
-        model, why = cli._pick_model()
+        model, why = cli._pick_model(host=_host(ram), local_model=no_local)
         check(f"RAM {ram} -> the shipped repo", model == cli._HF_MODEL, model)
         check(f"RAM {ram} reason is a default", "default" in why, why)
 
 
-def test_pick_model_small_box_warns(monkeypatch, capsys):
+def test_pick_model_small_box_warns(monkeypatch, capsys, tmp_path):
     """Below the 24 GB target chad warns and proceeds — it advises, it does not gate.
 
     Retiring the 9B removed the safe fallback, so this warning is the only thing
     standing between a 16 GB Mac and a silently unusable context window.
     """
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    no_local = str(tmp_path / "no-local-build")
 
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 16.0)
-    model, _ = cli._pick_model()
+    model, _ = cli._pick_model(host=_host(16.0), local_model=no_local)
     err = capsys.readouterr().err
     check("small box still served", model == cli._HF_MODEL, model)
     check("small box warns", "below the" in err, err)
     check("warning names the RAM read", "16 GB" in err, err)
 
     # RAM unreadable: same warning path, named as undetectable rather than a number.
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: None)
-    cli._pick_model()
+    cli._pick_model(host=_host(None), local_model=no_local)
     check("unknown RAM warns 'undetectable'", "undetectable" in capsys.readouterr().err)
 
     # At/above the target: silent.
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 24.0)
-    cli._pick_model()
+    cli._pick_model(host=_host(24.0), local_model=no_local)
     check("24 GB box does not warn", capsys.readouterr().err == "")
 
 
@@ -144,120 +156,127 @@ def test_free_disk_gb():
     check("missing path climbs to parent", free is not None and free > 0, free)
 
 
-def test_ensure_model_disk_preflight(monkeypatch, capsys):
+class _Terminal:
+    """A person at a TTY who answers every prompt with `answer`, and what they were asked."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.asked = []
+
+    def ask(self, prompt):
+        self.asked.append(prompt)
+        return self.answer
+
+
+def test_ensure_model_disk_preflight(monkeypatch, capsys, tmp_path):
     """Devex review T2: a machine without room for the download must be refused
     BEFORE the download starts, with the shortfall and the cache-GC command named."""
-    import huggingface_hub
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
-                        lambda *a, **k: None)
-    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 1.0)
+    monkeypatch.chdir(tmp_path)  # the repo id is not a local directory from here
+    terminal = _Terminal("n")
+    host = cli.Host(cached_file=lambda repo, filename: None,  # nothing cached
+                    free_disk_gb=lambda path: 1.0,
+                    stdin_isatty=lambda: True, ask=terminal.ask)
     with pytest.raises(SystemExit) as e:
-        cli._ensure_model(cli._HF_MODEL)
+        cli._ensure_model(cli._HF_MODEL, host=host)
     check("preflight exits 1", e.value.code == 1, e.value.code)
+    check("refused before the consent prompt", terminal.asked == [], terminal.asked)
     err = capsys.readouterr().err
     check("names the shortfall", "not enough free disk" in err, err)
     check("names required space", "~13 GB" in err, err)
     check("points at cache GC", "hf cache" in err, err)
 
 
-def test_ensure_model_disk_preflight_unreadable(monkeypatch):
+def test_ensure_model_disk_preflight_unreadable(monkeypatch, tmp_path):
     """If free disk can't be read the preflight must NOT block (it guards, never
     gates): the flow proceeds to the confirm prompt / download attempt."""
-    import huggingface_hub
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    # Cache hit short-circuits before any prompt — proves we got PAST the preflight.
-    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
-                        lambda *a, **k: None)
-    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: None)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    monkeypatch.chdir(tmp_path)  # the repo id is not a local directory from here
+    terminal = _Terminal("n")
+    host = cli.Host(cached_file=lambda repo, filename: None,  # nothing cached
+                    free_disk_gb=lambda path: None,           # free disk unreadable
+                    stdin_isatty=lambda: True, ask=terminal.ask)
     with pytest.raises(SystemExit) as e:
-        cli._ensure_model(cli._HF_MODEL)
+        cli._ensure_model(cli._HF_MODEL, host=host)
     # Exit came from the user's "n" at the prompt, not the disk preflight.
     check("unreadable disk does not block", e.value.code == 1, e.value.code)
+    check("reached the consent prompt", terminal.asked == ["Download now? [Y/n] "],
+          terminal.asked)
 
 
-def test_cached_weights_complete(monkeypatch, tmp_path):
+def test_cached_weights_complete(tmp_path):
     """The guard must read WEIGHTS, not metadata. An interrupted first download leaves
     config.json + tokenizer in the snapshot and no tensors; treating that as a cache hit
     is what sent the load into mlx_lm's `No safetensors found` with no way back."""
-    import huggingface_hub
     snap = tmp_path / "snapshots" / "abc"
     snap.mkdir(parents=True)
     (snap / "config.json").write_text("{}")
     index = snap / "model.safetensors.index.json"
 
-    def fake_cache(repo, filename, **kw):
+    def fake_cache(repo, filename):
         f = snap / filename
         return str(f) if f.exists() else None
-    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", fake_cache)
+
+    def complete():
+        return cli._cached_weights_complete("repo/x", cached_file=fake_cache)
 
     # metadata only — the exact state a ctrl-c'd first run leaves behind
-    check("metadata alone is not complete",
-          cli._cached_weights_complete("repo/x") is False)
+    check("metadata alone is not complete", complete() is False)
 
     # sharded, index present but a shard still missing
     index.write_text(json.dumps({"weight_map": {
         "a": "model-00001-of-00002.safetensors", "b": "model-00002-of-00002.safetensors"}}))
     (snap / "model-00001-of-00002.safetensors").write_text("x")
-    check("missing shard is not complete",
-          cli._cached_weights_complete("repo/x") is False)
+    check("missing shard is not complete", complete() is False)
 
     (snap / "model-00002-of-00002.safetensors").write_text("x")
-    check("all shards present is complete",
-          cli._cached_weights_complete("repo/x") is True)
+    check("all shards present is complete", complete() is True)
 
     # a corrupt index must re-fetch rather than crash
     index.write_text("{not json")
-    check("unreadable index is not complete",
-          cli._cached_weights_complete("repo/x") is False)
+    check("unreadable index is not complete", complete() is False)
 
     # single-file layout
     index.unlink()
     (snap / "model.safetensors").write_text("x")
-    check("single-file layout is complete",
-          cli._cached_weights_complete("repo/x") is True)
+    check("single-file layout is complete", complete() is True)
 
 
-def test_ensure_model_resumes_partial_cache(monkeypatch, capsys):
+def test_ensure_model_resumes_partial_cache(monkeypatch, capsys, tmp_path):
     """A partial cache must NOT be reported as a fresh download: the message names the
     interrupted download, so a re-fetch on a machine that 'already has' the model does
     not read as a bug."""
-    import huggingface_hub
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
+    monkeypatch.chdir(tmp_path)  # the repo id is not a local directory from here
     # config.json cached, no weights anywhere — the interrupted-download state.
-    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache",
-                        lambda repo, filename, **kw: "/c/config.json"
-                        if filename == "config.json" else None)
-    monkeypatch.setattr(cli, "_free_disk_gb", lambda path: 500.0)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    host = cli.Host(cached_file=lambda repo, filename: "/c/config.json"
+                    if filename == "config.json" else None,
+                    free_disk_gb=lambda path: 500.0,
+                    stdin_isatty=lambda: True, ask=_Terminal("n").ask)
     with pytest.raises(SystemExit):
-        cli._ensure_model("repo/x")
+        cli._ensure_model("repo/x", host=host)
     err = capsys.readouterr().err
     check("names the incomplete cache", "incomplete" in err, err)
     check("says it resumes", "Resuming" in err, err)
 
 
-def test_pick_model_prefers_local_dir(monkeypatch):
+def test_pick_model_prefers_local_dir(monkeypatch, tmp_path):
     # A dev clone that already built the weights uses them instead of re-downloading.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    monkeypatch.setattr(os.path, "isdir", lambda p: p == cli._LOCAL_MODEL)
-    model, _ = cli._pick_model()
-    check("local build preferred over HF repo", model == cli._LOCAL_MODEL, model)
+    local = tmp_path / "models" / "Qwen3.8-27B-q3_e3h5"
+    local.mkdir(parents=True)
+    model, _ = cli._pick_model(host=_host(64.0), local_model=str(local))
+    check("local build preferred over HF repo", model == str(local), model)
     # `--model auto` takes the same path (it means "the default", not "ignore local").
-    model, _ = cli._pick_model("auto")
-    check("auto also prefers the local build", model == cli._LOCAL_MODEL, model)
+    model, _ = cli._pick_model("auto", host=_host(64.0), local_model=str(local))
+    check("auto also prefers the local build", model == str(local), model)
+    # ...and the build looked for by default is the dev clone's own models/ dir.
+    default = inspect.signature(cli._pick_model).parameters["local_model"].default
+    check("default local build is the dev clone's", default == cli._LOCAL_MODEL, default)
 
 
-def test_pick_model_flag_auto_ignores_env(monkeypatch):
+def test_pick_model_flag_auto_ignores_env(monkeypatch, tmp_path):
     # '--model auto' forces the default even when CHAD_MODEL is set: the env must NOT win.
     monkeypatch.setenv("CHAD_MODEL", "/env/repo")
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("auto")
+    model, why = cli._pick_model("auto", host=_host(64.0),
+                                 local_model=str(tmp_path / "no-local-build"))
     check("--model auto ignores env", model == cli._HF_MODEL, model)
     check("--model auto reason is a default", "default" in why, why)
 
@@ -266,30 +285,27 @@ def test_pick_model_flag_repo_passthrough(monkeypatch):
     # A spec is a literal repo id / local dir, passed through unchanged (the CLI twin of
     # CHAD_MODEL). RAM is irrelevant.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 8.0)
-    model, why = cli._pick_model("/some/local/model")
+    model, why = cli._pick_model("/some/local/model", host=_host(8.0))
     check("--model repo passthrough", model == "/some/local/model", model)
     check("passthrough reason names source + override",
           "--model" in why and "override" in why.lower(), why)
 
 
-def test_pick_model_flag_beats_env(monkeypatch):
+def test_pick_model_flag_beats_env(monkeypatch, tmp_path):
     # Both set -> the CLI flag wins over CHAD_MODEL.
     monkeypatch.setenv("CHAD_MODEL", "/env/repo")
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    model, why = cli._pick_model("/flag/repo")
+    model, why = cli._pick_model("/flag/repo", host=_host(64.0),
+                                 local_model=str(tmp_path / "no-local-build"))
     check("--model beats CHAD_MODEL", model == "/flag/repo", model)
     check("winner reason names --model", "--model" in why, why)
 
 
-def test_pick_model_default_equals_auto(monkeypatch):
+def test_pick_model_default_equals_auto(monkeypatch, tmp_path):
     # Regression lock for bench.py's no-arg callers: _pick_model() must behave exactly
     # like _pick_model("auto") for a fixed environment.
     monkeypatch.delenv("CHAD_MODEL", raising=False)
-    monkeypatch.setattr(os.path, "isdir", lambda p: False)
-    monkeypatch.setattr(cli, "_detect_ram_gb", lambda: 64.0)
-    check("no-arg == auto", cli._pick_model() == cli._pick_model("auto"))
+    fixed = {"host": _host(64.0), "local_model": str(tmp_path / "no-local-build")}
+    check("no-arg == auto", cli._pick_model(**fixed) == cli._pick_model("auto", **fixed))
 
 
 def test_ram_aware_ctx_limit():
@@ -402,109 +418,90 @@ def test_env_float(monkeypatch):
     check("empty float -> None", cli._env_float("CHAD_X_F") is None)
 
 
-def test_version_flag(monkeypatch, capsys):
+def test_version_flag():
     # argparse's `version` action prints to stdout and exits 0 during parse_args(),
-    # BEFORE _preflight() ever runs — so --version works even off Apple Silicon.
-    monkeypatch.setattr("sys.argv", ["chad", "--version"])
-    with pytest.raises(SystemExit) as exc:
-        cli.main()
-    check("--version exits 0", exc.value.code == 0, repr(exc.value.code))
-    out = capsys.readouterr().out
+    # BEFORE _preflight() ever runs — so --version works even off Apple Silicon. A real
+    # process, so the flag arrives the way the console script receives it: on argv.
     from chad import __version__
+    out = subprocess.run([sys.executable, "-m", "chad.cli", "--version"],
+                         capture_output=True, text=True, env=_env_with_src(), timeout=120)
+    check("--version exits 0", out.returncode == 0, repr(out.returncode) + out.stderr)
     check(f"--version prints chad {__version__}",
-          out.startswith(f"chad {__version__}"), out)
+          out.stdout.startswith(f"chad {__version__}"), out.stdout)
 
 
 def test_import_does_not_load_the_engine():
     # `chad --help`, `--version` and `chad levers` run with only this module imported, so
     # the ~0.75 s of mlx_lm + transformers must wait for a real run. A fresh interpreter,
     # because this one has already imported the engine for other tests.
-    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
     code = ("import sys, chad.cli; print([m for m in ('chad.engine', 'mlx_lm', "
             "'transformers') if m in sys.modules])")
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
-        p for p in (src, os.environ.get("PYTHONPATH")) if p)}
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                         env=env, timeout=120, check=True)
+                         env=_env_with_src(), timeout=120, check=True)
     check("import chad.cli pulls in no engine", out.stdout.strip() == "[]",
           out.stdout + out.stderr)
 
 
-def test_backend_classes_bind_on_first_use(monkeypatch):
-    # `_main` reaches Engine / Agent / repl through module attributes bound on first
-    # use. An unbound name gets the real class; a bound one (a test's fake) is kept.
+def test_default_backend_is_the_real_engine_agent_and_repl():
+    # `_main` builds its engine, agent loop and REPL from `_load_backend()`, which it
+    # calls only once argparse and the subcommands are through (so the import cost above
+    # is paid by real runs alone). What comes back must be the real classes.
     from chad.agent import Agent, repl
     from chad.engine import Engine
-    for name in ("Engine", "Agent", "repl"):
-        monkeypatch.setattr(cli, name, None)
-    check("unbound names resolve to the real backend",
-          cli._backend_classes() == (Engine, Agent, repl))
-    fake = object()
-    monkeypatch.setattr(cli, "Engine", fake)
-    check("an already-bound name is left alone", cli._backend_classes()[0] is fake)
+    backend = cli._load_backend()
+    check("real engine class", backend.engine is Engine, backend.engine)
+    check("real agent class", backend.agent is Agent, backend.agent)
+    check("real repl", backend.repl is repl, backend.repl)
 
 
-def test_preflight_skips_apple_gate_for_remote_backend(monkeypatch):
+def test_preflight_skips_apple_gate_for_remote_backend(capsys):
     # The remote backend loads no MLX, so _preflight must NOT hard-stop on a non-Apple
     # host — that's what lets chad run inside a Linux benchmark container against a remote
     # server. Simulate a Linux/x86 box and assert llama passes while mlx would exit.
-    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(cli.platform, "machine", lambda: "x86_64")
-    cli._preflight("llama")   # must return, not exit
+    linux = cli.Host(platform_id=lambda: ("Linux", "x86_64"))
+    cli._preflight("llama", host=linux)   # must return, not exit
     with pytest.raises(SystemExit) as exc:
-        cli._preflight("mlx")
+        cli._preflight("mlx", host=linux)
     check("mlx backend still gated off Apple Silicon", exc.value.code == 1)
+    err = capsys.readouterr().err
+    check("names the detected platform", "detected: Linux x86_64" in err, err)
+    # An Apple Silicon Mac passes the gate.
+    cli._preflight("mlx", host=cli.Host(platform_id=lambda: ("Darwin", "arm64")))
 
 
-def test_version_string_never_raises(monkeypatch):
+def test_version_string_never_raises():
     # The commit detail is best-effort: if distribution metadata is unreadable the
     # helper must still return a plain "chad <version>" string, never propagate.
-    def boom(*_a, **_k):
+    def unreadable_metadata():
         raise RuntimeError("no metadata")
-    monkeypatch.setattr("importlib.metadata.distribution", boom)
-    s = cli._version_string()
+    s = cli._version_string(direct_url_json=unreadable_metadata)
     check("still a string", isinstance(s, str), repr(s))
     check("starts with chad ", s.startswith("chad "), s)
 
 
-def test_home_dir_note_written_in_home(monkeypatch, capsys):
+def test_home_dir_note_written_in_home(monkeypatch, capsys, tmp_path):
     # Launching in ~ prints a one-line nudge to cd into a project — no exit,
     # no behavior change. chad snapshots the cwd, so home is rarely the intended dir.
-    home = os.path.expanduser("~")
-    monkeypatch.setattr(os, "getcwd", lambda: home)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", os.getcwd())  # launched from `~` itself
     cli._maybe_home_dir_note()
     err = capsys.readouterr().err
     check("home-dir note written", "home directory" in err, err)
 
 
-def test_home_dir_note_absent_in_project(monkeypatch, capsys):
+def test_home_dir_note_absent_in_project(monkeypatch, capsys, tmp_path):
     # A real project dir (not ~) gets no note — home-dir only, no marker-file guessing.
-    monkeypatch.setattr(os, "getcwd", lambda: "/Users/x/some/project")
+    project = tmp_path / "some" / "project"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(project)
     cli._maybe_home_dir_note()
     err = capsys.readouterr().err
     check("no note outside home", err == "", repr(err))
 
 
 if __name__ == "__main__":
-    test_ram_aware_ctx_limit()
-    test_host_band_is_a_guard_not_the_primary_constraint()
-    with pytest.MonkeyPatch.context() as mp:
-        test_env_float(mp)
-    with pytest.MonkeyPatch.context() as mp:
-        test_env_int(mp)
-    with pytest.MonkeyPatch.context() as mp:
-        test_pick_model_override(mp)
-    with pytest.MonkeyPatch.context() as mp:
-        test_pick_model_one_model_every_box(mp)
-    with pytest.MonkeyPatch.context() as mp:
-        test_pick_model_no_size_shorthands(mp)
-    with pytest.MonkeyPatch.context() as mp:
-        test_pick_model_prefers_local_dir(mp)
-    with pytest.MonkeyPatch.context() as mp:
-        test_version_string_never_raises(mp)
-    print(f"\n{PASS} passed, {FAIL} failed")
-    # Note: the home-dir note tests need pytest's capsys fixture; run them via `pytest`.
-    raise SystemExit(1 if FAIL else 0)
+    raise SystemExit(pytest.main([__file__, "-q"]))
 
 
 # --- sampler env: one call, so the knobs cannot drift apart ---------------

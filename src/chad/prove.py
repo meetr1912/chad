@@ -34,6 +34,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import TYPE_CHECKING, Callable
+
+from . import cli, config
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 # The proof tasks, ported verbatim from the dev eval suite (disclosed above).
 # `check` is the verifier SOURCE — re-written to `check_path` immediately before
@@ -158,9 +164,16 @@ def _install_socket_guard():
     return uninstall
 
 
-def _verify(task):
-    """Re-seed the check script from its read-only source, then run it. The re-write
-    is the anti-spoof: an agent edit to a seeded check.py is overwritten here.
+def _run_check(check_path: str) -> subprocess.CompletedProcess[str]:
+    """Run one check script under this interpreter, output captured, 60 s at most."""
+    return subprocess.run([sys.executable, check_path],
+                          capture_output=True, text=True, timeout=60)
+
+
+def _verify(task, run_check: Callable[[str], subprocess.CompletedProcess[str]] = _run_check):
+    """Re-seed the check script from its read-only source, then run it through
+    `run_check`. The re-write is the anti-spoof: an agent edit to a seeded check.py is
+    overwritten here.
 
     A check that hangs (the agent left a server running, a `input()` in the code under
     test) or cannot be run at all is a failed task, not a crashed run: this is the one
@@ -168,8 +181,7 @@ def _verify(task):
     try:
         with open(task["check_path"], "w") as f:
             f.write(task["check"])
-        vr = subprocess.run([sys.executable, task["check_path"]],
-                            capture_output=True, text=True, timeout=60)
+        vr = run_check(task["check_path"])
     except (subprocess.TimeoutExpired, OSError):
         return False
     out = (vr.stdout or "") + (vr.stderr or "")
@@ -298,10 +310,24 @@ def _scorecard(results, meta):
     return "\n".join(lines)
 
 
-def run(args):
+def _load_engine(model_id: str) -> "Engine":
+    """The engine prove drives, imported on first use (it pulls in mlx_lm).
+
+    Same engine configuration chad ships: the on-disk KV checkpoint of the stable
+    system+tools prefix (~/.cache/chad/kv) is part of the product's first-token story —
+    prove without it would report a cold prefill no real session pays."""
+    from .engine import Engine
+    return Engine(model_id=model_id, cache_dir=os.path.expanduser("~/.cache/chad/kv"))
+
+
+def run(args, *, host: cli.Host = cli.HOST,
+        make_engine: Callable[[str], "Engine"] = _load_engine, run_one=_run_one):
     """Entry point (dispatched from cli.main on the literal task `prove`).
-    Returns the process exit code."""
-    from . import cli, config
+    Returns the process exit code.
+
+    `host` is the machine and terminal the preflight, cache check and RAM note read;
+    `make_engine` builds the (unloaded) engine for a model id; `run_one` runs one task
+    against it and returns its scorecard row."""
     if args.backend != "mlx":
         sys.stderr.write(
             f"chad prove verifies the local in-process engine; --backend "
@@ -309,10 +335,12 @@ def run(args):
             "not this machine). Run it without --backend.\n")
         return 2
     try:
-        cli._preflight("mlx")
+        cli._preflight("mlx", host=host)
     except SystemExit:
         return 2
-    if config.env_str("CHAD_MODEL") or getattr(args, "model", None):
+    # `chad prove` has no --model flag (argparse refuses one), so CHAD_MODEL is the only
+    # override that can reach this run; the notice names both, as the main CLI takes both.
+    if config.env_str("CHAD_MODEL"):
         sys.stderr.write("[prove pins the shipped model — CHAD_MODEL and --model are "
                          "ignored for this run]\n")
     # Pinned to the shipped default rather than a smaller stand-in: prove exists to
@@ -322,10 +350,9 @@ def run(args):
     model_id = cli._HF_MODEL
     invoking_dir = os.getcwd()
 
-    from huggingface_hub import try_to_load_from_cache
-    cached = isinstance(try_to_load_from_cache(model_id, "config.json"), str)
+    cached = host.cached_file(model_id, "config.json") is not None
     try:
-        cli._ensure_model(model_id)  # consent + disk preflight + resumable download
+        cli._ensure_model(model_id, host=host)  # consent + disk preflight + resumable download
     except SystemExit:
         return 2
     download_mode = ("model already cached, offline guard engaged" if cached
@@ -337,18 +364,13 @@ def run(args):
     uninstall_guard = _install_socket_guard()
 
     big_ram_note = None
-    ram = cli._detect_ram_gb()
+    ram = host.ram_gb()
     if ram is not None and ram < cli._MIN_RAM_GB:
         big_ram_note = (f"{ram:.0f} GB RAM is below the ~{cli._MIN_RAM_GB:.0f} GB chad "
                         "targets; timings here will be pessimistic")
         sys.stderr.write(f"[{big_ram_note}]\n")
 
-    from .engine import Engine
-    # Same engine configuration chad ships: the on-disk KV checkpoint of the stable
-    # system+tools prefix (~/.cache/chad/kv) is part of the product's first-token
-    # story — prove without it would report a cold prefill no real session pays.
-    eng = Engine(model_id=model_id,
-                 cache_dir=os.path.expanduser("~/.cache/chad/kv"))
+    eng = make_engine(model_id)
     sys.stderr.write(f"loading {os.path.basename(model_id.rstrip('/'))} "
                      "[prove: pinned to the shipped model] ...\n")
     try:
@@ -367,7 +389,7 @@ def run(args):
             sys.stderr.write(f"task {i + 1}/{len(TASKS)}: {task['name']} ...\n")
             t0 = time.time()
             try:
-                r = _run_one(eng, task, capture_ttft=(i == 0))
+                r = run_one(eng, task, capture_ttft=(i == 0))
             except Exception as e:  # noqa: BLE001 — one broken task is a failed row
                 # A task that raises is a failed task, not a failed run: the remaining
                 # tasks still have something to say, and the scorecard — which this
