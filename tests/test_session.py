@@ -1,6 +1,6 @@
 """Unit tests for session persistence (session.py) — save/load round-trip + isolation.
 
-The store itself (session.SESS_DIR) is pointed at a per-test tmp dir by conftest.
+The store itself (CHAD_SESSION_DIR) is pointed at a per-test tmp dir by conftest.
 
 Run: `uv run python tests/test_session.py`
 """
@@ -126,7 +126,7 @@ def test_prune_keeps_newest(tmp_path):
 def test_adopt_legacy(tmp_path):
     # A pre-043 single-slot <cwdhash>.json is adopted as one session on first listing.
     a = _proj(tmp_path, "proj_legacy")
-    os.makedirs(session.SESS_DIR, exist_ok=True)
+    os.makedirs(session.sessions_root(), exist_ok=True)
     legacy = session._legacy_path(a)
     with open(legacy, "w") as f:
         json.dump({"cwd": a, "updated": time.time(), "meta": {},
@@ -147,7 +147,7 @@ def test_adopt_legacy_keeps_the_source_when_the_copy_fails(tmp_path):
     cannot be written, deleting it destroys the user's transcript; keeping it means the
     next listing simply tries again."""
     a = _proj(tmp_path, "proj_legacy_unwritable")
-    os.makedirs(session.SESS_DIR, exist_ok=True)
+    os.makedirs(session.sessions_root(), exist_ok=True)
     legacy = session._legacy_path(a)
     with open(legacy, "w") as f:
         json.dump({"cwd": a, "updated": time.time(), "meta": {},
@@ -172,7 +172,7 @@ def test_adopt_legacy_sets_an_unparseable_file_aside(tmp_path):
     rename it rather than delete it — and renaming also ends the adoption attempt, which
     would otherwise repeat on every listing."""
     a = _proj(tmp_path, "proj_legacy_corrupt")
-    os.makedirs(session.SESS_DIR, exist_ok=True)
+    os.makedirs(session.sessions_root(), exist_ok=True)
     legacy = session._legacy_path(a)
     with open(legacy, "w") as f:
         f.write("{ this is not json")
@@ -242,7 +242,7 @@ if __name__ == "__main__":
                  test_persisted_copy_masks_known_prefix_secrets):
         # Same isolation conftest gives each test under pytest.
         with tempfile.TemporaryDirectory() as home, pytest.MonkeyPatch.context() as mp:
-            mp.setattr(session, "SESS_DIR", os.path.join(home, "sessions"))
+            mp.setenv("CHAD_SESSION_DIR", os.path.join(home, "sessions"))
             test(pathlib.Path(home))
     print(f"\n{PASS} passed, {FAIL} failed")
     raise SystemExit(1 if FAIL else 0)

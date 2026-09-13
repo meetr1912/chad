@@ -22,7 +22,7 @@ import signal
 import subprocess
 import threading
 import time
-from typing import TYPE_CHECKING, Mapping, Sequence, TypedDict, Union
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence, TypedDict, Union
 
 from . import config, levers, seatbelt, spill, syntaxgate
 from .ignore import IGNORE_DIRS  # noqa: F401 — re-exported for agent.expand_mentions
@@ -125,8 +125,10 @@ def _bash_env() -> dict | None:
             if not _ENV_SECRET_RE.search(k) and not _is_credential_url(k, v)}
 
 
-def tool_bash(command: str, timeout: int = 120, should_stop=None) -> str:
-    argv = seatbelt.wrap_argv(command)
+def tool_bash(command: str, timeout: int = 120, should_stop=None,
+              wrap: Callable[[str], Optional[list[str]]] = seatbelt.wrap_argv) -> str:
+    # `wrap` confines the command: the sandboxed argv to spawn, or None for a plain shell.
+    argv = wrap(command)
     try:
         # errors="replace": text mode decodes strictly by default, so binary bytes in the
         # output (hexdump, `cat` on an archive) killed the reader thread mid-communicate —

@@ -28,6 +28,7 @@ import os
 import secrets
 import time
 
+from . import config
 from .diag import redact
 
 SESS_DIR = os.path.expanduser("~/.chad/sessions")
@@ -39,14 +40,20 @@ def _key(cwd: str) -> str:
     return hashlib.sha1(os.path.abspath(cwd).encode("utf-8", "ignore")).hexdigest()[:16]
 
 
+def sessions_root() -> str:
+    """The store: `CHAD_SESSION_DIR` when set, else ~/.chad/sessions. Read on every call,
+    so a test or eval suite can relocate it without ever writing real home state."""
+    return config.env_str("CHAD_SESSION_DIR") or SESS_DIR
+
+
 def _dir(cwd: str) -> str:
     """Per-cwd session directory."""
-    return os.path.join(SESS_DIR, _key(cwd))
+    return os.path.join(sessions_root(), _key(cwd))
 
 
 def _legacy_path(cwd: str) -> str:
     """The pre-043 single-slot file (`<cwdhash>.json`), adopted on first listing."""
-    return os.path.join(SESS_DIR, _key(cwd) + ".json")
+    return os.path.join(sessions_root(), _key(cwd) + ".json")
 
 
 def _session_path(cwd: str, session_id: str) -> str:

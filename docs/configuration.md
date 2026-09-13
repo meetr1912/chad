@@ -825,6 +825,7 @@ CHAD_SPILL_DIR=/tmp/spill           uv run chad  # where truncated tool output s
 CHAD_DUMP_RENDER=/tmp/prompt.txt    uv run chad  # dump the fully-rendered prompt each step
 CHAD_PREFILL_TRACE=/tmp/pf.jsonl    uv run chad  # per-step prefill/cache telemetry
 CHAD_CHECKPOINT_DIR=/tmp/ckpt       uv run chad  # relocate the shadow-git edit checkpoints
+CHAD_SESSION_DIR=/tmp/sessions      uv run chad  # relocate saved sessions (--continue/--resume)
 ```
 
 - `CHAD_CHECKPOINT_DIR`: where the shadow-git repositories backing `/undo` and
@@ -833,6 +834,9 @@ CHAD_CHECKPOINT_DIR=/tmp/ckpt       uv run chad  # relocate the shadow-git edit 
   the TUI's prompt-history file. The store is private (mode `0700`), never snapshots
   `.env*`, `*.pem`, `*.key` or SSH private keys, and a workspace's snapshots are swept
   after 30 days without an edit.
+- `CHAD_SESSION_DIR`: where saved conversations live (default `~/.chad/sessions`, one
+  directory per project) for `--continue`, `--resume` and the TUI `/resume` picker. Like
+  `CHAD_CHECKPOINT_DIR`, it exists so a test or eval suite never touches real home state.
 
 ### Tree-sitter tags (ambient structure)
 

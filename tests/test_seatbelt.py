@@ -280,20 +280,18 @@ def test_tool_bash_unwrapped_runs_plain_shell():
     assert "plain" in out
 
 
-def test_tool_bash_denial_note_and_fire(monkeypatch):
+def test_tool_bash_denial_note_and_fire():
     """A wrapped command whose output shows the EPERM marker gets the explanatory
     note appended."""
     fake = ["/bin/sh", "-c", "echo 'x: Operation not permitted'; exit 1"]
-    monkeypatch.setattr(seatbelt, "wrap_argv", lambda cmd: fake)
-    out = tools.tool_bash("anything")
+    out = tools.tool_bash("anything", wrap=lambda cmd: fake)
     assert "Operation not permitted" in out
     assert "seatbelt:" in out
 
 
-def test_tool_bash_wrapped_clean_run_no_note(monkeypatch):
+def test_tool_bash_wrapped_clean_run_no_note():
     fake = ["/bin/sh", "-c", "echo all good"]
-    monkeypatch.setattr(seatbelt, "wrap_argv", lambda cmd: fake)
-    out = tools.tool_bash("anything")
+    out = tools.tool_bash("anything", wrap=lambda cmd: fake)
     assert "all good" in out
     assert "seatbelt:" not in out
 

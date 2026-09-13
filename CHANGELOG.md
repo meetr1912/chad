@@ -149,6 +149,10 @@ checklist the tool rejects, so a model that followed its prompt burned a step on
 rejected call. Changing the prompt changes the stable prefix every warm-start
 checkpoint is keyed on, so the first run after upgrading re-prefills it once.
 
+**`CHAD_SESSION_DIR` relocates saved sessions**, the way `CHAD_CHECKPOINT_DIR` already
+relocates edit checkpoints: an eval or test suite can keep `--continue`/`--resume` state
+out of `~/.chad/sessions`. Unset, nothing changes.
+
 ## [2.0.3] — 2026-09-08
 
 **Fix: the on-disk warm start now hits in every directory.** The system-prompt KV
