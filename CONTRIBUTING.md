@@ -4,6 +4,9 @@ chad is a local, single-user, Apple-Silicon coding agent. It's a small project w
 sharp design constraint (prefill is the bill, the KV cache stays warm), so here's the
 honest map of what lands easily and what needs a conversation first.
 
+Working here with an agent? Start at [`AGENTS.md`](AGENTS.md); the per-module map is in
+[`docs/design.md#architecture-map`](docs/design.md#architecture-map).
+
 ## What lands easily
 
 Docs fixes, tests, bug fixes that come with a failing-test repro, portability and
