@@ -12,6 +12,8 @@ Run: `uv run python tests/test_cli.py`
 
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -411,6 +413,35 @@ def test_version_flag(monkeypatch, capsys):
     from chad import __version__
     check(f"--version prints chad {__version__}",
           out.startswith(f"chad {__version__}"), out)
+
+
+def test_import_does_not_load_the_engine():
+    # `chad --help`, `--version` and `chad levers` run with only this module imported, so
+    # the ~0.75 s of mlx_lm + transformers must wait for a real run. A fresh interpreter,
+    # because this one has already imported the engine for other tests.
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+    code = ("import sys, chad.cli; print([m for m in ('chad.engine', 'mlx_lm', "
+            "'transformers') if m in sys.modules])")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        p for p in (src, os.environ.get("PYTHONPATH")) if p)}
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                         env=env, timeout=120, check=True)
+    check("import chad.cli pulls in no engine", out.stdout.strip() == "[]",
+          out.stdout + out.stderr)
+
+
+def test_backend_classes_bind_on_first_use(monkeypatch):
+    # `_main` reaches Engine / Agent / repl through module attributes bound on first
+    # use. An unbound name gets the real class; a bound one (a test's fake) is kept.
+    from chad.agent import Agent, repl
+    from chad.engine import Engine
+    for name in ("Engine", "Agent", "repl"):
+        monkeypatch.setattr(cli, name, None)
+    check("unbound names resolve to the real backend",
+          cli._backend_classes() == (Engine, Agent, repl))
+    fake = object()
+    monkeypatch.setattr(cli, "Engine", fake)
+    check("an already-bound name is left alone", cli._backend_classes()[0] is fake)
 
 
 def test_preflight_skips_apple_gate_for_remote_backend(monkeypatch):

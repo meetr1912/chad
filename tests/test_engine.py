@@ -785,9 +785,9 @@ def test_adaptive_chunk_bounds():
 def test_load_fails_fast_without_mlx():
     """Tier 1 (no weights): when the mlx imports failed (broken/half-installed
     mlx-metal, or a non-Apple host that somehow built an Engine), load() must raise
-    a RuntimeError naming the original import cause — NOT fall through to `load(path)`
-    and die with a bare `TypeError: 'NoneType' object is not callable` 300 lines from
-    the real problem. Regression for the missing-libmlx.dylib dogfood incident."""
+    a RuntimeError naming the original import cause — NOT fall through to a nulled
+    mlx_lm loader and die with a bare `TypeError: 'NoneType' object is not callable`
+    far from the real problem. Regression for the missing-libmlx.dylib dogfood incident."""
     from chad import engine as engmod
     from chad.engine import Engine
 
@@ -1003,6 +1003,50 @@ def test_ckpt_path_keys_on_rope_override():
     eng.effective_ctx = 131072
     extended = eng._ckpt_path([1, 2, 3])
     check("YaRN-extended window keys differently", extended != native, extended)
+
+
+def test_load_weights_loads_each_once_under_ctx_override():
+    """Tier 1 (no weights): `_ctx_override` reads only the tokenizer, so extending the
+    window must not load the weights twice. The tokenizer loads first, with the stop ids
+    `mlx_lm.load` would have given it, and the override reaches the one weight load."""
+    from pathlib import Path
+
+    from chad import engine as engmod
+    from chad.engine import Engine
+
+    yarn = {"max_position_embeddings": 131072,
+            "rope_scaling": {"type": "yarn", "factor": 2.0}}
+    saved = (engmod._download, engmod.load_config, engmod.load_tokenizer,
+             engmod.load_model)
+    for override, eff in ((yarn, 131072), (None, 65536)):
+        calls = []
+        tok = object()
+
+        class _Probe(Engine):
+            def _ctx_override(self, repo, override=override, eff=eff):
+                calls.append(("ctx_override", repo, self.tok))
+                return override, eff
+
+        eng = object.__new__(_Probe)  # bypass __init__ (no weights)
+        try:
+            engmod._download = Path
+            engmod.load_config = lambda p: {"eos_token_id": [7, 8]}
+            engmod.load_tokenizer = lambda p, eos_token_ids=None: (
+                calls.append(("tokenizer", p, eos_token_ids)) or tok)
+            engmod.load_model = lambda p, model_config=None: (
+                calls.append(("model", p, model_config)) or ("weights", {}))
+            eng._load_weights("/models/m")
+        finally:
+            (engmod._download, engmod.load_config, engmod.load_tokenizer,
+             engmod.load_model) = saved
+        m = Path("/models/m")
+        check(f"override={override is not None}: tokenizer, then override, then ONE "
+              "weight load carrying the override",
+              calls == [("tokenizer", m, [7, 8]), ("ctx_override", "/models/m", tok),
+                        ("model", m, override)], calls)
+        check("loaded objects and window land on the engine",
+              (eng.tok, eng.model, eng.effective_ctx) == (tok, "weights", eff),
+              (eng.tok, eng.model, eng.effective_ctx))
 
 
 def _plain_generate_engine(resets):
@@ -1389,6 +1433,7 @@ if __name__ == "__main__":
              test_ckpt_path_filenames_are_warm_tagged,
              test_adaptive_chunk_bounds,
              test_load_fails_fast_without_mlx,
+             test_load_weights_loads_each_once_under_ctx_override,
              test_prefill_oom_retry_rolls_back,
              test_snapshot_survives_empty_kvcache,
              test_bounded_rewind_orchestration,

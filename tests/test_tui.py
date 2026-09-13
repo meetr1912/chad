@@ -6,6 +6,7 @@ update state but NEVER queue a transcript fragment (they must stay in the pinned
 region, not leak into the terminal scrollback). `_emit` is exercised on a bare instance
 so we don't have to construct an Engine/Agent.
 """
+import asyncio
 import os
 import sys
 import threading
@@ -489,6 +490,34 @@ def test_leftover_steer_falls_back_to_typeahead():
     assert done.wait(_JOIN), "the leftover steer never ran as a follow-up turn"
     assert fake.calls == ["task", "too late to steer"]
     _stop_worker(tui, th)
+
+
+def test_idle_refresher_redraws_only_on_change(monkeypatch):
+    # An idle prompt must not redraw 20 times a second forever: that is a standing wakeup
+    # on a laptop and a GIL grab against generation. Only a change buys an idle frame; a
+    # running turn and an open mic take redraw every tick.
+    tui = TUI(_fake_engine(), ctx_limit=24000)
+    frames, tick = [], [0]
+    tui.app.invalidate = lambda: frames.append(tick[0])
+
+    def scripted_flush():  # the refresher's first call each iteration sets this tick's state
+        tick[0] += 1
+        if tick[0] == 4:
+            tui._emit("info", "hello")
+        elif tick[0] == 7:
+            tui._busy = True
+        elif tick[0] == 9:
+            tui._busy = False
+            tui._speech_phase = "recording"
+        tui._shutdown = tick[0] == 10
+
+    tui._flush = scripted_flush
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda _delay: real_sleep(0))
+    asyncio.run(tui._refresher())
+    assert tick[0] == 10
+    # idle 1-3: nothing · emit at 4: one frame · idle 5-6 · busy 7-8 · recording 9-10
+    assert frames == [4, 7, 8, 9, 10]
 
 
 # -- The approval panel: what you are actually approving must be legible ------

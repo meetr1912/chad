@@ -39,9 +39,10 @@ import numpy as np
 # remote-only host somehow builds one, it fails fast on the first `mx.` use.
 try:
     import mlx.core as mx
-    from mlx_lm import load, stream_generate
+    from mlx_lm import stream_generate
     from mlx_lm.models import cache as cache_utils
     from mlx_lm.sample_utils import apply_min_p, apply_top_p, make_sampler
+    from mlx_lm.utils import _download, load_config, load_model, load_tokenizer
     _HAS_MLX = True
     _MLX_IMPORT_ERROR: Optional[BaseException] = None
 except ImportError as _e:  # non-Apple host: remote backend only
@@ -49,13 +50,14 @@ except ImportError as _e:  # non-Apple host: remote backend only
     # installed (mac). On the Linux lint runner mlx is absent, `ignore_missing_imports`
     # types these as Any, and the bare ignore would trip `warn_unused_ignores`.
     mx = None  # type: ignore[assignment, unused-ignore]
-    load = stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment, unused-ignore]
+    stream_generate = cache_utils = make_sampler = None  # type: ignore[assignment, unused-ignore]
     apply_min_p = apply_top_p = None  # type: ignore[assignment, unused-ignore]
+    _download = load_config = load_model = load_tokenizer = None  # type: ignore[assignment, unused-ignore]
     _HAS_MLX = False
     # Stash the real cause. A *missing* mlx is the benign Linux case; a mlx that
     # is present but fails to import (e.g. a half-installed mlx-metal wheel whose
     # libmlx.dylib got dropped by a partial `uv sync`) is a broken Apple env, and
-    # load() below raises this instead of nulling `load` and dying 300 lines later
+    # load() below raises this instead of calling a nulled loader and dying later
     # with a bare `TypeError: 'NoneType' object is not callable`.
     _MLX_IMPORT_ERROR = _e
 
@@ -96,7 +98,7 @@ def _log_mlx_provenance() -> None:
 
 
 def _local_path(model_id: str) -> str:
-    """Resolve a cached HF repo id to its on-disk snapshot dir so `mlx_lm.load` (and
+    """Resolve a cached HF repo id to its on-disk snapshot dir so the weight load (and
     `_read_config`) skip the hub revision check — a ~1s network/stat round-trip on every
     launch, pure overhead once the weights are local. A local dir or an uncached id
     passes through unchanged; the uncached case is downloaded by `cli._ensure_model`
@@ -599,8 +601,8 @@ class Engine:
     def load(self):
         if not _HAS_MLX:
             # We're on the in-process MLX path (Engine was constructed), but the mlx
-            # imports failed. Surface the ORIGINAL dlopen/import error — otherwise
-            # `load` is None and the next line dies with an opaque NoneType TypeError.
+            # imports failed. Surface the ORIGINAL dlopen/import error — otherwise the
+            # mlx_lm loaders are None and the first call dies with an opaque TypeError.
             raise RuntimeError(
                 "MLX is unavailable, so the in-process engine cannot load a model. "
                 "On Apple Silicon this usually means a broken mlx/mlx-metal install "
@@ -613,13 +615,7 @@ class Engine:
         # skips the per-launch hub revision check on both the weights and _read_config.
         path = _local_path(self.model_id)
         self._model_path = path
-        # Load tokenizer first (cheap) so _ctx_override can read its documented max.
-        self.model, self.tok = load(path)
-        override, eff = self._ctx_override(path)
-        self.effective_ctx = eff
-        if override is not None:
-            # reload main with YaRN extension applied
-            self.model, self.tok = load(path, model_config=override)
+        self._load_weights(path)
         self._read_model_shape(path)
         # Decode fast-path (fused projections + compiled S=1 layer step) for the
         # dense qwen3_5 hybrid; silent no-op on any other model or on failure.
@@ -655,6 +651,18 @@ class Engine:
         self._reset_cache()
         self.kv_bytes_per_token = self._measure_kv_bytes_per_token()
         return time.time() - t0
+
+    def _load_weights(self, path: str) -> None:
+        """Tokenizer first, then the weights exactly once. `_ctx_override` needs only the
+        tokenizer's documented max; reading it off a full `mlx_lm.load` cost a second
+        weight load whenever the override applied. Hands each loader what `mlx_lm.load`
+        does, including the tokenizer's stop ids from the model config (which folds in
+        generation_config.json; the override never touches them)."""
+        model_path = _download(path)
+        eos = load_config(model_path).get("eos_token_id")
+        self.tok = load_tokenizer(model_path, eos_token_ids=eos)
+        override, self.effective_ctx = self._ctx_override(path)
+        self.model, _ = load_model(model_path, model_config=override)
 
     def _read_model_shape(self, path: str) -> None:
         """Capture the config facts the adaptive prefill chunk needs:

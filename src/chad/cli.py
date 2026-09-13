@@ -20,12 +20,17 @@ import re
 import subprocess
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from . import config, guardrails, levers
-from .agent import Agent, repl
 from .base_engine import BackendError
 from .diag import log
-from .engine import Engine
+
+if TYPE_CHECKING:
+    from .agent import Agent, repl
+    from .engine import Engine
+else:
+    Engine = Agent = repl = None  # bound on first use by _backend_classes()
 
 # Package dir is src/chad/; the project root (two levels up) is the dev clone. If a
 # locally-built weights tree exists at <root>/models/ it's preferred (see _pick_model);
@@ -695,6 +700,24 @@ def _run_levers():
     return 0
 
 
+def _backend_classes():
+    """Import the engine and agent on first use, not with this module: `chad.engine`
+    pulls in mlx_lm and transformers (~0.75 s), which `chad --help`, `--version` and
+    `chad levers` would otherwise pay before argparse even runs. A name that is already
+    bound is left alone, so tests can swap in fakes."""
+    global Engine, Agent, repl
+    if Engine is None:
+        from .engine import Engine as _Engine
+        Engine = _Engine
+    if Agent is None:
+        from .agent import Agent as _Agent
+        Agent = _Agent
+    if repl is None:
+        from .agent import repl as _repl
+        repl = _repl
+    return Engine, Agent, repl
+
+
 def main(argv=None):
     """Console entrypoint. Wraps `_main` only to turn a backend fault that escaped the
     agent's retry loop into guidance — it can surface from the one-shot, --repl, or TUI
@@ -757,6 +780,8 @@ def _main(argv=None):
     cache_dir = os.path.expanduser("~/.cache/chad/kv")
     kv_cache_max_gb = _env_int("CHAD_KV_CACHE_MAX_GB")
     kv_cache_max_bytes = (kv_cache_max_gb if kv_cache_max_gb is not None else 8) * 1024**3
+
+    Engine, Agent, repl = _backend_classes()
 
     if args.backend == "llama":
         # Drive the chad harness against a remote llama.cpp server instead

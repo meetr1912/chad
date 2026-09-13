@@ -358,6 +358,7 @@ class TUI:
         self._busy = False
         self._cur_prompt_tokens = 0        # last rendered prompt size (context gauge)
         self._tick = 0                     # animation frame counter (spinner)
+        self._dirty = False                # something the status line shows changed
         self._phase = "Thinking"           # current activity verb shown by the spinner
         # Live activity readouts for the bottom status line. Reset per
         # turn in _worker; updated by the agent's gen/prefill emits. Display-only.
@@ -453,6 +454,12 @@ class TUI:
     # -- agent I/O callbacks (called from the worker thread) --------------
 
     def _emit(self, kind: str, text: str):
+        self._apply_emit(kind, text)
+        # Marked after the state lands, never before: the refresher clears the mark and
+        # then redraws, so an early mark could buy a frame that still shows the old state.
+        self._dirty = True
+
+    def _apply_emit(self, kind: str, text: str):
         # Map activity to the spinner verb, then queue the transcript fragment (if any).
         if kind == "think":
             self._phase = "Thinking"
@@ -541,6 +548,7 @@ class TUI:
                 self._queue.append(self._steer_queue.popleft())
             except IndexError:
                 break
+            self._dirty = True  # steer:N on the status line became queued:N
 
     def _confirm(self, name, args) -> bool:
         # Block the worker until the user answers y/n in the UI.
@@ -678,7 +686,12 @@ class TUI:
             self._flush()
             if self._busy:
                 self._tick += 1
-            self.app.invalidate()
+            # An idle prompt redraws only when something on it changed. A running turn
+            # stays live for its spinner and elapsed timer, and so does an open mic take:
+            # the recorder flips `take_full` on the audio thread with nothing to hook.
+            if self._busy or self._dirty or self._speech_phase == "recording":
+                self._dirty = False
+                self.app.invalidate()
             await asyncio.sleep(0.05)
 
     # -- key bindings ----------------------------------------------------
@@ -1280,6 +1293,7 @@ class TUI:
                     self._pending.append("\n")
                 self._busy = False
                 self._settle_ctx_gauge()
+                self._dirty = True  # the last busy frame predates the ready line
 
     def _settle_ctx_gauge(self):
         """Refresh the end-of-turn context gauge WITHOUT re-tokenizing the transcript
@@ -1307,6 +1321,7 @@ The turn's last `ctx` emit already set `_cur_prompt_tokens` to the
             self._emit("error", f"[model load failed: {self._load_error}]")
         finally:
             self._model_ready.set()
+            self._dirty = True  # the status line leaves its loading state
             self._wake.set()  # nudge the worker if a message was queued while loading
 
     def _emit_first_task_hint(self):
