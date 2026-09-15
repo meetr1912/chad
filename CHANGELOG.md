@@ -4,6 +4,8 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+## [2.1.0] — 2026-09-14
+
 **A write outside your workspace always asks — auto and yolo included.** `write` and
 `edit` run in-process, outside the Seatbelt profile that wraps bash, so the modes that
 exist to stop asking about edits were waving through a `~/.zshrc`, a `~/.ssh/config`, or
@@ -110,7 +112,10 @@ dropped by the catch-all, leaving the run decoding with no drafter and nothing s
 downloads a proxy model); mypy is green on Apple Silicon and runs there in CI; a
 plain-language pass over the README and docs; a llama.cpp DFlash2 arm and three more
 measured nights in `benchmarks/`; and new tests for the CLI mode matrix, the `run_turn`
-exit branches and per-test session isolation.
+exit branches and per-test session isolation. Since then: anti-slop runs as the gate's
+fourth lane; every CI action is pinned to a commit, Dependabot skips mlx patch bumps, and
+Python 3.14 joins the test matrix; and `AGENTS.md` carries a routing table and a
+per-module architecture map.
 
 **Six small correctness fixes**, independent of each other and each user-visible:
 
