@@ -53,17 +53,17 @@ resident at a time, each measured with its own benchmark on a 512-token prompt a
 | llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | off in this benchmark |
 | llama.cpp `llama-server` (build 10917), serial | 97 tok/s | 11.3 tok/s | off |
 | llama.cpp `llama-server` (build 10917) | 95 tok/s | 11.1 tok/s² | DFlash2 drafter (Q4_K_M GGUF) |
-| **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
-| **chad**, default | 98 tok/s | **62 tok/s**¹ | DFlash2 block drafter |
+| **chad**, serial (`CHAD_NO_DFLASH=1`) | 100 tok/s | 17.9 tok/s | off |
+| **chad**, default | 101 tok/s | **62.9 tok/s**¹ | DFlash2 block drafter |
 
-A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 62. You wait for
+A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 63. You wait for
 the first one and you talk to the second.
 
 Ollama does not get its own row: it is llama.cpp underneath, measured without speculative
 decoding, and on the same GGUF (0.32.15, Modelfile `FROM` only) it measures 96 tok/s
 prefill and the same **10.9** decode.
 
-¹ 62 is a ceiling: `chad-bench`'s prompt is tiled code the drafter reads easily. Replayed
+¹ 63 is a ceiling: `chad-bench`'s prompt is tiled code the drafter reads easily. Replayed
 against ten real mid-session contexts from `~/.chad/sessions` (12-19k tokens, tool results in
 place, 384-token decodes) the same engine measures **31.7 tok/s median / 21.4 floor** greedy
 against 14.8 serial, and **27.6 / 17.7** thinking against 13.9. That ~2× is what a session
@@ -89,7 +89,7 @@ one checkpoint it ships:
   rejection sampling keeps every emitted token the model's own.
 - A persistent prefix KV cache. The transcript is kept a strict token-prefix of the live
   cache, so a follow-up step prefills the ~16 tokens it appended instead of the 5,000 it
-  already read: **~0.75 s per step instead of ~50 s**. Any server with prompt caching gets
+  already read: **~0.55 s per step instead of ~48 s**. Any server with prompt caching gets
   the easy case; the work is holding it true across compaction, truncated turns and restarts.
   The system prefix is checkpointed to disk, so the second session anywhere starts warm
   (75.6 s → 5.5 s to the first tool call).

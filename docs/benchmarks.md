@@ -33,14 +33,14 @@ that appends ~16 tokens):
 
 | Model | Prefill (cold) | Decode | Warm-step prefill |
 |---|---|---|---|
-| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped, default) | ~101 tok/s | ~58 tok/s | ~0.6 s (16 tok) |
-| same, serial (`CHAD_NO_DFLASH=1`) | ~99 tok/s | ~18 tok/s | ~0.6 s (16 tok) |
+| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped, default) | ~104 tok/s | ~59 tok/s | ~0.55 s (16 tok) |
+| same, serial (`CHAD_NO_DFLASH=1`) | ~105 tok/s | ~18 tok/s | ~0.55 s (16 tok) |
 
 > Measured on this machine with the command above. Run it on yours; these are hardware
 > numbers, not scores.
 
 Prefill is the honest cost of a dense checkpoint: every one of the 27B parameters is read
-for every token of the prompt, so ~99 tok/s is close to this chip's compute roofline rather
+for every token of the prompt, so ~105 tok/s is close to this chip's compute roofline rather
 than a tuning failure. It is also why the [warm prefix
 cache](#the-second-session-in-a-project-starts-warm) matters more than any decode work: the
 third column, not the first, is what a session actually pays after its first turn.
@@ -87,8 +87,8 @@ because importing a GGUF into Ollama needs ~45 GB of scratch disk for nothing ne
 | llama.cpp `llama-bench` (stock, build 10470) | 102 tok/s | 10.9 tok/s | off in this benchmark |
 | llama.cpp `llama-server` (build 10917), serial | 97 tok/s | 11.3 tok/s | off |
 | llama.cpp `llama-server` (build 10917) | 95 tok/s | 11.1 tok/s | DFlash2 drafter (Q4_K_M GGUF) |
-| **chad**, serial (`CHAD_NO_DFLASH=1`) | 99 tok/s | 18.1 tok/s | off |
-| **chad**, default | 98 tok/s | **62 tok/s** | DFlash2 block drafter |
+| **chad**, serial (`CHAD_NO_DFLASH=1`) | 100 tok/s | 17.9 tok/s | off |
+| **chad**, default | 101 tok/s | **62.9 tok/s** | DFlash2 block drafter |
 
 Reproduce it with `uv run python benchmarks/stock/stock.py llama`, `… llama-dflash` and
 `… chad`, one arm at a time since each loads ~13 GB, then `… table` to render the rows.
@@ -120,7 +120,7 @@ committed under `benchmarks/stock/_runs/`. How to read it:
   [below](#two-throughput-levers)), which is the difference between the two drafted rows.
   llama.cpp's DFlash2 PR reports ~1.8× on an M5 Pro with a Q4_K_M target, so this measures
   this GGUF on this Mac, not llama.cpp's DFlash2 in general.
-- 62 is a ceiling, and a session runs slower. `chad-bench` tiles a block of code, the
+- 63 is a ceiling, and a session runs slower. `chad-bench` tiles a block of code, the
   drafter accepts nearly all of it, and a 128-token run mostly measures the width
   schedule's opening regime. On real mid-session contexts the same engine measures 31.7
   tok/s median / 21.4 floor greedy and 27.6 / 17.7 at the thinking preset (the
@@ -129,22 +129,22 @@ committed under `benchmarks/stock/_runs/`. How to read it:
 - The per-step cost in an agent loop is what no single-shot benchmark shows. Both
   engines can reuse a prompt prefix; the difference is that chad keeps the transcript a
   strict token-prefix of the live cache *by construction*, across compaction and across
-  sessions. That is the [next section](#the-agentic-loop-win-075-s-per-step-not-50-s).
+  sessions. That is the [next section](#the-agentic-loop-win-055-s-per-step-not-48-s).
 
-## The agentic-loop win: ~0.75 s per step, not ~50 s
+## The agentic-loop win: ~0.55 s per step, not ~48 s
 
 The headline is what a *follow-up* turn costs, not the cold-prefill rate. On the shipped
-model a 5,000-token transcript prefills cold in **~50 s**. The next agentic step
+model a 5,000-token transcript prefills cold in **~48 s**. The next agentic step
 only appends the model's reply, a tool call, and the tool's output, so with the persistent
 prefix cache it re-reads **nothing**: the follow-up turn prefills just the ~16 appended
-tokens in **~0.75 s**.
+tokens in **~0.55 s**.
 
 ```
-cache-less backend:  re-prefill all 5,143 tokens  ->  ~50 s of dead air, every step
-chad (prefix cache): prefill the 16 new tokens     ->  ~0.75 s, every step
+cache-less backend:  re-prefill all 5,143 tokens  ->  ~48 s of dead air, every step
+chad (prefix cache): prefill the 16 new tokens     ->  ~0.55 s, every step
 ```
 
-That ~67× gap is the entire reason a local model can feel like an agent instead of a batch
+That ~85× gap is the entire reason a local model can feel like an agent instead of a batch
 job, and it widens with the transcript, since the cache-less side grows while the warm step
 stays flat. Note which side of the trade the slow cold prefill lands on: it is paid once per
 divergence, and the cache is what makes it once. Why that cache is *append-only* (and why
@@ -153,7 +153,7 @@ that's the right trade for a hybrid SSM/attention model) is in
 
 ## The second session in a project starts warm
 
-The ~0.75 s figure above is the *within*-session win. Across sessions there is a second one,
+The ~0.55 s figure above is the *within*-session win. Across sessions there is a second one,
 and it is larger: chad checkpoints the stable system+tools KV prefix to disk
 (`engine.warm_prefix`) and reloads it when you next start in the same project, so the
 ~2.8k-token system+tools prefix is prefilled **once, ever** rather than once per session.

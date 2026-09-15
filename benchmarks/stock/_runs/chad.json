@@ -1,21 +1,21 @@
 {
   "engine": "chad",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "model": "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX",
   "prompt_tokens": 512,
   "gen_tokens": 128,
   "serial": {
-    "prefill_tps": 99.0,
-    "decode_tps": 18.1,
+    "prefill_tps": 100.0,
+    "decode_tps": 17.9,
     "warm_step_new_tokens": 16,
-    "warm_step_prefill_s": 0.54,
+    "warm_step_prefill_s": 0.53,
     "flags": "CHAD_NO_DFLASH=1"
   },
   "default": {
-    "prefill_tps": 98.0,
-    "decode_tps": 62.0,
+    "prefill_tps": 101.0,
+    "decode_tps": 62.9,
     "warm_step_new_tokens": 16,
-    "warm_step_prefill_s": 0.57,
+    "warm_step_prefill_s": 0.56,
     "flags": "DFlash2 block drafter, per-round width schedule"
   }
 }

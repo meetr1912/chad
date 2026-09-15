@@ -31,7 +31,7 @@ output to the transcript, so a naive backend re-reads an ever-longer prompt *eve
 That is O(n) work per step and O(n²) over a session.
 
 Concretely, on a 24 GB M4 Pro: by step 20 a real coding session is ~5,000 tokens of
-transcript, which the shipped 27B prefills in ~50 s (~99 tok/s, because a dense model
+transcript, which the shipped 27B prefills in ~48 s (~105 tok/s, because a dense model
 reads every one of its parameters for every token of the prompt). Re-reading that every step
 is most of a minute of dead air before the model says anything, and it grows faster than
 linearly, since the prefill *rate* also falls as the prompt lengthens. Over a 40-step task,
@@ -48,11 +48,11 @@ step N prompt:  [ system + tools | cwd · CLAUDE.md | turn 1 | … | turn N-1 | 
 ```
 
 Same session, a couple of dozen new tokens per step instead of 5,000: **under a second of
-prefill per step instead of ~50 s** (measured warm step: ~0.75 s for 16 appended tokens).
-That ~67× gap is why a 27B model on a laptop answers in seconds, and it *widens*
+prefill per step instead of ~48 s** (measured warm step: ~0.55 s for 16 appended tokens).
+That ~85× gap is why a 27B model on a laptop answers in seconds, and it *widens*
 with the transcript, since the cache-less side grows while the
 warm step stays flat. The numbers are in
-[benchmarks](benchmarks.md#the-agentic-loop-win-075-s-per-step-not-50-s).
+[benchmarks](benchmarks.md#the-agentic-loop-win-055-s-per-step-not-48-s).
 
 ### Why prefill is *hard* as well as expensive
 
