@@ -662,9 +662,20 @@ class Engine:
         does, including the tokenizer's stop ids from the model config (which folds in
         generation_config.json; the override never touches them)."""
         model_path = _download(path)
-        eos = load_config(model_path).get("eos_token_id")
+        cfg = load_config(model_path)
+        eos = cfg.get("eos_token_id")
         self.tok = load_tokenizer(model_path, eos_token_ids=eos)
         override, self.effective_ctx = self._ctx_override(path)
+        # Prism's Hadamard-folded ternary packs carry weights in a rotated basis and
+        # declare their own model_type. mlx-lm's affine loader would find the right
+        # shapes, skip the activation transform and return garbage without erroring,
+        # so they route to chad's own loader on the declared type.
+        from . import prism_pack
+        if prism_pack.is_prism_pack(cfg):
+            if override:
+                cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
+            self.model, _ = prism_pack.load(str(model_path), cfg)
+            return
         self.model, _ = load_model(model_path, model_config=override)
 
     def _read_model_shape(self, path: str) -> None:
