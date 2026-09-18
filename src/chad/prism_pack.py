@@ -14,28 +14,60 @@ The pack ships its own `runtime/` Python and asks callers to `sys.path.insert` i
 chad does not import code out of a model download; `Packed` below is a reimplementation
 of that module's forward, and `load()` refuses any pack whose declared quantization is
 not the 2-bit affine g128 container it was written against.
+
+What the loader normalizes, and why:
+
+* The residual stream runs in bf16, like every other checkpoint chad loads. The pack
+  stores its scales in fp16 and its norms, conv and gate projections in fp32, and MLX
+  promotes a mixed-dtype op to the wider type — so taken as shipped, the first
+  RMSNorm turns the stream fp32 and every projection after it runs (and every
+  activation lives) at twice the width. Everything floating is cast to bf16 once here,
+  exactly what mlx-lm's own loader does to a quantized checkpoint's side tensors.
+* The pack carries one sign vector per rotated module, but they are identical for
+  every module of one input width (the whole model rotates the residual stream, the
+  MLP intermediate and the attention/GDN output each with a single fixed vector). The
+  loader shares one array per width, which is what lets the fast-path fuse
+  same-input projections (gate|up, qkv|z, q|k|v) behind ONE rotation.
+* The matmul goes through `mlx_qmm_mma.qmm`, so the speculative verify widths take
+  the small-M MMA kernel exactly as the shipped 3-bit does.
+
+The pack bundles no drafter and declares `mtp: false`; `mlx_dflash` borrows the
+Qwen3.8-27B DFlash2 sidecar from a sibling repo (a drafter reads the target's residual
+stream, which the quantization only perturbs). Its chat template defaults
+`reasoning_effort` to xhigh where the shipped model's defaults to medium — the same
+template otherwise — so the engine carries `REASONING_EFFORT_DEFAULT` for it.
 """
 
 import json
 import math
 import os
-from typing import Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
+from . import mlx_qmm_mma
 from .diag import log
+
+if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
+    import mlx.core as mx
 
 _MODEL_TYPE = "prism_hadamard_qwen35"
 _BLOCKS = (512, 1024, 2048, 4096)
+BITS, GROUP_SIZE = 2, 128
+
+# The pack's template is the Qwen3.8 template with `reasoning_effort|default('xhigh')`
+# where the shipped model's says medium. Passing medium explicitly renders byte-identically
+# to the shipped default, and think-token decode is two thirds of wall on this model.
+REASONING_EFFORT_DEFAULT = "medium"
 
 
 def is_prism_pack(config: dict) -> bool:
     return config.get("model_type") == _MODEL_TYPE
 
 
-def _hadamard(x, block: int, signs, inverse: bool):
+def rotate(x, block: int, signs, inverse: bool = False):
     """Apply the pack's blockwise Hadamard rotation to activations.
 
-    fp32 throughout: the transform sums `block` terms, and at fp16 the accumulation
-    loses the low bits the ternary levels are meant to resolve."""
+    fp32 throughout: the transform sums `block` terms, and at bf16 the accumulation
+    loses the low bits the ternary levels are meant to resolve. Returns x's dtype."""
     import mlx.core as mx
 
     shape, dtype = x.shape, x.dtype
@@ -51,7 +83,13 @@ def _hadamard(x, block: int, signs, inverse: bool):
     return x.astype(dtype)
 
 
+_PACKED: Optional[type] = None
+
+
 def _packed_class():
+    global _PACKED
+    if _PACKED is not None:
+        return _PACKED
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -61,30 +99,36 @@ def _packed_class():
         Stands in for `nn.QuantizedLinear` / `nn.Embedding`. `block == 0` means the
         tensor was stored unrotated and this is a plain 2-bit affine matmul."""
 
+        # chad's fused-projection paths and the MMA probe read these off
+        # QuantizedLinear; the same names make a Packed eligible for both.
+        bits, group_size, mode = BITS, GROUP_SIZE, "affine"
+
         def __init__(self, weight, scales, biases, block, signs, embedding, dtype):
             super().__init__()
             self.weight, self.scales, self.biases = weight, scales, biases
             if signs is not None:
                 self.signs = signs
             self.block, self.embedding, self.dtype = block, embedding, dtype
-            # chad's fused-projection paths read these off QuantizedLinear.
-            self.bits, self.group_size = 2, 128
 
         def __call__(self, x):
             if self.embedding:
                 shape = x.shape
                 out = mx.dequantize(
                     self.weight[x.reshape(-1)], self.scales[x.reshape(-1)],
-                    self.biases[x.reshape(-1)], group_size=128, bits=2,
+                    self.biases[x.reshape(-1)], group_size=GROUP_SIZE, bits=BITS,
                 ).reshape(*shape, -1).astype(self.dtype)
-                return (_hadamard(out, self.block, self.signs, True)
-                        if self.block else out)
+                return rotate(out, self.block, self.signs, True) if self.block else out
             if self.block:
-                x = _hadamard(x, self.block, self.signs, False)
-            return mx.quantized_matmul(x, self.weight, self.scales, self.biases,
-                                       transpose=True, group_size=128, bits=2)
+                x = rotate(x, self.block, self.signs)
+            return mlx_qmm_mma.qmm(x, self.weight, self.scales, self.biases,
+                                   GROUP_SIZE, BITS)
 
+    _PACKED = Packed
     return Packed
+
+
+def is_packed(module) -> bool:
+    return _PACKED is not None and isinstance(module, _PACKED)
 
 
 def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
@@ -102,9 +146,10 @@ def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
     if not is_prism_pack(config):
         raise ValueError(f"not a Prism pack: model_type={config.get('model_type')!r}")
     quant = config.get("quantization") or {}
-    if (quant.get("bits"), quant.get("group_size"), quant.get("mode")) != (2, 128, "affine"):
+    if (quant.get("bits"), quant.get("group_size"), quant.get("mode")) \
+            != (BITS, GROUP_SIZE, "affine"):
         raise ValueError(f"unsupported Prism container {quant!r}; this loader "
-                         "implements 2-bit affine g128 only")
+                         f"implements {BITS}-bit affine g{GROUP_SIZE} only")
 
     model = q35.Model(q35.ModelArgs(model_type="qwen3_5",
                                     text_config=config["text_config"]))
@@ -114,8 +159,13 @@ def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
     loaded = cast(dict, mx.load(os.path.join(model_path, "model.safetensors")))
     weights = {k: v for k, v in loaded.items() if k.startswith("language_model.")}
     del loaded
+    dtype = mx.bfloat16
+    for k, v in weights.items():
+        if v.dtype != mx.uint32 and not k.endswith(".signs"):
+            weights[k] = v.astype(dtype)
     Packed = _packed_class()
     seen: set[str] = set()
+    shared: dict[int, "mx.array"] = {}   # input width -> the one sign vector of that width
     for record in config["modules"]:
         path = record["path"]
         if path in seen:
@@ -128,6 +178,14 @@ def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
         signs = weights.get(key + ".signs")
         if block and signs is None:
             raise ValueError(f"{path}: rotated module with no sign vector")
+        if signs is not None:
+            width = int(signs.shape[0])
+            first = shared.get(width)
+            if first is None:
+                shared[width] = signs
+            elif mx.array_equal(first, signs).item():
+                signs = first
+                weights[key + ".signs"] = first
         # mlx Modules are dicts, so the pack's dotted paths walk by subscript; a
         # numeric segment indexes the plain list `model.layers` is.
         parts = key.split(".")
@@ -136,10 +194,11 @@ def load(model_path: str, config: Optional[dict] = None) -> tuple[Any, dict]:
             parent = parent[int(part)] if part.isdigit() else parent[part]
         parent[parts[-1]] = Packed(
             weights[key + ".weight"], weights[key + ".scales"],
-            weights[key + ".biases"], block, signs, record["embedding"], mx.float16)
+            weights[key + ".biases"], block, signs, record["embedding"], dtype)
     model.load_weights(list(weights.items()), strict=True)
     model.eval()
     mx.eval(model.parameters())
-    log.info("Prism pack loaded: %d rotated modules, 2-bit affine g128, "
-             "vision tower skipped", len(seen))
+    log.info("Prism pack loaded: %d rotated modules, %d-bit affine g%d, bf16 stream, "
+             "%d shared sign vector(s), vision tower skipped",
+             len(seen), BITS, GROUP_SIZE, len(shared))
     return model, config

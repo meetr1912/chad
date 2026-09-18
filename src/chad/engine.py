@@ -518,6 +518,9 @@ class Engine:
     model: Any = field(init=False, default=None)
     tok: Any = field(init=False, default=None)
     effective_ctx: int = field(init=False, default=32768)
+    # A chat-template default the loaded weights need overridden (the Prism pack's
+    # template says xhigh where the shipped model's says medium); None = the template's.
+    reasoning_effort_default: Optional[str] = field(init=False, default=None)
     _cache: Any = field(init=False, default=None)
     _cached_ids: list = field(init=False, default_factory=list)
     # Token ids generated in the CURRENT turn, for the presence penalty. Reset at
@@ -675,6 +678,7 @@ class Engine:
             if override:
                 cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
             self.model, _ = prism_pack.load(str(model_path), cfg)
+            self.reasoning_effort_default = prism_pack.REASONING_EFFORT_DEFAULT
             return
         self.model, _ = load_model(model_path, model_config=override)
 

@@ -521,3 +521,64 @@ def test_schedule_is_the_default_width_policy():
     select the fixed arm at load."""
     assert Engine.dflash_adaptive is True
     assert Engine.dflash_num_draft == 7
+
+
+def _tiny_sidecar(model, tmp_path, bits=4):
+    """A quantized DFlash sidecar for the tiny target, built the way the CLI builds one."""
+    import json
+
+    from mlx.utils import tree_flatten
+
+    args = model.language_model.args
+    n_layers = int(args.num_hidden_layers)
+    hf = {
+        "hidden_size": int(args.hidden_size), "num_hidden_layers": 2,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 64,
+        "intermediate_size": 128, "vocab_size": int(args.vocab_size),
+        "num_target_layers": n_layers, "max_position_embeddings": 512,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "dflash_config": {"block_size": 4, "target_layer_ids": [0, max(1, n_layers - 2)],
+                          "mask_token_id": int(args.vocab_size) - 1,
+                          "selector_rank": 64, "selector_top_k": 4,
+                          "conv_kernel_size": 2, "conv_group_size": 16},
+    }
+    src = tmp_path / "hf"
+    src.mkdir()
+    (src / "config.json").write_text(json.dumps(hf))
+    mx.random.seed(3)
+    bf = mlx_dflash.build(mlx_dflash.DFlashConfig.from_dict(hf))
+    mx.save_safetensors(str(src / "model.safetensors"), dict(tree_flatten(bf.parameters())))
+    return mlx_dflash.build_sidecar(str(src), str(tmp_path / "sidecar"), bits=bits, gs=64)
+
+
+def test_drafter_borrows_a_donor_bundle_for_a_shape_match(monkeypatch, tmp_path):
+    """A checkpoint with no bundled drafter (the Prism ternary pack) takes the sidecar a
+    DONORS sibling of the same (hidden, layers, vocab) bundles — resolved file by file
+    through the hub cache — and nothing else: a shape with no donor, or a model that
+    is itself the donor, decodes serially."""
+    monkeypatch.delenv("CHAD_DFLASH_PATH", raising=False)
+    model = _build_tiny()
+    out = _tiny_sidecar(model, tmp_path)
+    key = mlx_dflash._target_key(model)
+    asked = []
+
+    def donor_file(repo_id, filename):
+        asked.append((repo_id, filename))
+        return os.path.join(out, os.path.basename(filename))
+
+    weights = tmp_path / "weights"          # no dflash/ inside
+    weights.mkdir()
+
+    assert mlx_dflash.load_drafter(model, str(weights), donors={}, fetch=donor_file) is None
+    assert asked == []
+
+    donors = {key: "sibling/repo"}
+    assert mlx_dflash.load_drafter(model, str(weights), repo_id="sibling/repo",
+                                   donors=donors, fetch=donor_file) is None
+    assert asked == []                        # the donor itself: nothing to borrow
+
+    drafter = mlx_dflash.load_drafter(model, str(weights), repo_id="other/pack",
+                                      donors=donors, fetch=donor_file)
+    assert drafter is not None
+    assert asked == [("sibling/repo", "dflash/config.json"),
+                     ("sibling/repo", "dflash/model.safetensors")]

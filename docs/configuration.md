@@ -423,6 +423,46 @@ shipped checkpoint (the DFlash2 drafter, the fused-attention coverage, the fastp
 check, the measured per-token KV cost the governor sizes against) either declines to
 install or falls back to a stock path. The harness itself does not change.
 
+#### The ternary alternative: Prism's Hadamard-folded pack
+
+One other checkpoint runs with the whole stack attached rather than falling back:
+[`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit),
+the same Qwen3.8-27B with every projection stored in a Hadamard-rotated basis and
+quantized to 2-bit affine g128 whose three levels are the ternary set {−s, 0, +s}.
+**7.15 GB of weights** against the shipped 12.33.
+
+```bash
+uv run chad --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit
+```
+
+The rotation is folded into the weights offline, so the matching transform has to hit
+the activations at runtime; mlx-lm's plain affine loader would find weights of exactly the
+right shapes, skip it, and return plausible garbage without raising. chad routes the pack
+on its declared `model_type` to its own loader (`prism_pack.py`), which does not import
+the pack's bundled `runtime/` Python. What the rest of the stack does with it:
+
+- the decode fast-path fuses `gate|up`, `qkv|z` and (new for this pack) `q|k|v` behind
+  **one** rotation each, and folds the sign vectors into the RMSNorm weights and the
+  elementwise gates inside its compiled S=1 bodies, so a rotation costs one kernel;
+- the small-M verify kernel (`mlx_qmm_mma.py`) covers 2-bit g128, which is what makes an
+  8-wide DFlash2 verify cost ~2.2 serial steps here too (the stock 2-bit matmul made it
+  9×, and drafting was a net loss);
+- the pack bundles no drafter (and declares `mtp: false`), so `mlx_dflash` borrows the
+  shipped model's DFlash2 sidecar: a drafter reads the target's residual stream, which a
+  different quantization only perturbs (94% acceptance, same as on the 3-bit);
+- the pack's chat template is the shipped model's with `reasoning_effort` defaulting to
+  xhigh instead of medium; the engine passes medium unless `CHAD_REASONING_EFFORT` says
+  otherwise, since think-token decode is two thirds of wall on this model.
+
+Measured on the 24 GB M4 Pro, one load per process (`docs/benchmarks.md` has the table):
+greedy decode 21 tok/s serial and **64 tok/s drafted** (the shipped quant: 18 / ~60),
+5k prefill 99 tok/s, and the governor's window **~114k tokens** against ~56k on the
+shipped quant, because the 5.2 GB the weights give back is context at 34,816 B/token.
+Teacher-forced NLL on code is unchanged against the pack's own fp32-activation forward
+(1.502 vs 1.500). The tokenizer is the same vocab with different merges, identical on code,
+SQL, CJK and emoji and diverging only on combining marks. `CHAD_PRISM_ROT_FP32=1` runs the
+compiled bodies' rotation in fp32 like the uncompiled path does (an A/B arm).
+
 ### Smoke test (`chad prove`)
 
 ```bash
@@ -678,8 +718,10 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
   reads as set or unset: any non-empty value, `0` included, turns discovery off.
 - `CHAD_NO_FASTPATH`: disables the fused-projection + compiled decode step installed
   at load for the dense `qwen3_5` hybrid (`mlx_fastpath.py`): the MLP `gate|up` concat, the
-  GDN `in_proj` concat, and the compiled S=1 layer step. It is a silent no-op on any other
-  checkpoint, so an arbitrary `--model` neither gains nor loses anything here. Pure speed,
+  GDN `in_proj` concat, and the compiled S=1 layer step; on the
+  [Prism ternary pack](#the-ternary-alternative-prisms-hadamard-folded-pack) also the
+  `q|k|v` concat and the one-rotation-per-fused-matmul bodies. It is a silent no-op on any
+  other checkpoint, so an arbitrary `--model` neither gains nor loses anything here. Pure speed,
   no behavior change, so this is an A/B and bisection knob rather than something to run
   with.
 chad sets **no** `MLX_*` runtime variables, so there is nothing to opt out of:
@@ -742,9 +784,11 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   M4 Pro with the shipped 3-bit quant, 10 prompts × 384-token decodes, medians: greedy
   serial 17.7 → **47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0, top_p
   0.95, top_k 20) 22.4 → **41.4**; non-thinking 23.7 → 42-43; code 24 → 35-37. It engages
-  when the drafter ships with the loaded weights: the shipped model does; an arbitrary
-  `--model` does not, and decodes serially unless you point `CHAD_DFLASH_PATH` at a
-  drafter built for it.
+  when the drafter ships with the loaded weights: the shipped model does; a checkpoint of
+  the same shape with no bundle borrows the shipped model's (`mlx_dflash.DONORS`, keyed on
+  hidden size, layer count and vocab, which is how the Prism ternary pack drafts); any
+  other `--model` decodes serially unless you point `CHAD_DFLASH_PATH` at a drafter built
+  for it.
 - `CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`: the verified width. The drafter always
   proposes its full block of 7; by default a per-round schedule (a cost model over the
   measured round costs and recent acceptance) picks how many of those proposals to verify,

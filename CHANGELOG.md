@@ -4,6 +4,18 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
+**Prism's ternary Qwen3.8-27B runs with the whole stack attached.**
+`--model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` loads the Hadamard-folded 2-bit g128 pack
+through chad's own loader (mlx-lm's would decode garbage silently), and the decode
+fast-path, the small-M verify kernel and the DFlash2 drafter all engage: fused `gate|up`,
+`qkv|z` and `q|k|v` behind one rotation each, the MMA kernel extended to 2-bit g128, and
+the shipped model's drafter borrowed for any same-shape checkpoint with no bundle. On the
+M4 Pro: 7.15 GB of weights (was 12.33), 64 tok/s drafted greedy decode (the pack as loaded:
+12; the shipped quant: ~60), and a ~114k-token governor window against ~56k. The pack's
+template defaults `reasoning_effort` to xhigh; chad passes medium unless
+`CHAD_REASONING_EFFORT` is set. `CHAD_PRISM_ROT_FP32` is the A/B arm for the compiled
+bodies' rotation precision.
+
 ## [2.1.0] — 2026-09-14
 
 **A write outside your workspace always asks — auto and yolo included.** `write` and

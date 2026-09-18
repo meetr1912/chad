@@ -28,14 +28,28 @@ kernels in `mlx_moe_fused.py` worth another 5-7% decode on that geometry. 2.0.0
 removed all of it with the model — the shipped checkpoint is dense, so none of it
 could ever install.
 
+Prism's Hadamard-folded ternary packs (`prism_pack`) are the same dense hybrid with
+every projection stored in a rotated basis, so each takes a blockwise Hadamard of
+its INPUT first. The three transforms above port with one addition each: the
+rotation happens once per fused matmul instead of once per projection (gate|up,
+qkv|z and — new here, the stock model has no such concat — q|k|v all consume the
+same rotated input, and the pack's sign vectors are one per input width), and the
+compiled S=1 bodies fold the sign vectors into the RMSNorm weights and the
+elementwise gates (exact: they are ±1) so a rotation costs one kernel, the
+transform itself. The uncompiled S>1 path keeps the pack's fp32 rotation. The GDN's
+two tiny gate projections (in_proj_b/a) are unrotated bf16 linears in these packs,
+so they fuse into one plain matmul on the unrotated input instead.
+
 Scope: applies when the loaded model looks like the qwen3_5 DENSE hybrid (GDN +
-attention + quantized swiglu MLP). Anything unexpected → install() is a silent
-no-op (stock behavior). Opt out with CHAD_NO_FASTPATH=1.
+attention + quantized swiglu MLP), stock-quantized or a Prism pack. Anything
+unexpected → install() is a silent no-op (stock behavior). Opt out with
+CHAD_NO_FASTPATH=1.
 """
 
+import math
 from typing import TYPE_CHECKING, Callable, Optional
 
-from . import config, mlx_qmm_mma
+from . import config, mlx_qmm_mma, prism_pack
 from .diag import log
 
 if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module loads on Linux
@@ -65,6 +79,15 @@ def install(model: "nn.Module", model_path: Optional[str] = None) -> bool:
             _install_layer_fastpath(model)
             log.info("FASTPATH installed (dense hybrid): fused MLP + fused GDN "
                      "projections + S=1 layer step")
+            return True
+        if _looks_like_prism(model):
+            _concat_prism_gate_up(model)
+            _concat_prism_gdn_in_projs(model)
+            _fuse_prism_attention(model)
+            _install_layer_fastpath(model)
+            log.info("FASTPATH installed (Prism ternary hybrid): fused MLP + fused "
+                     "GDN + fused attention projections, one rotation each, S=1 "
+                     "layer step")
             return True
         return False
     except Exception as e:  # noqa: BLE001 — perf path must never break loading
@@ -157,6 +180,8 @@ def _patch_dense_mlp_call() -> None:
     def fused_call(self, x):
         if not hasattr(self, "_fused_w"):
             return stock_call(self, x)
+        if hasattr(self, "_fused_signs"):     # Prism: one rotation for gate|up
+            x = prism_pack.rotate(x, self._fused_block, self._fused_signs)
         # mlx_qmm_mma.qmm: the small-M MMA kernel on verified (shape, width)
         # pairs — speculative verify widths — stock quantized_matmul otherwise.
         gu = mlx_qmm_mma.qmm(x, self._fused_w, self._fused_s, self._fused_b,
@@ -226,11 +251,19 @@ def _patch_gdn_call() -> None:
         if not hasattr(self, "_fused_w"):
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
-        big = mlx_qmm_mma.qmm(inputs, self._fused_w, self._fused_s, self._fused_b,
-                              self._fused_gs, self._fused_bits)
-        qkv, z, b, a = mx.split(
-            big, [self.conv_dim, self.conv_dim + self.value_dim,
-                  self.conv_dim + self.value_dim + self.num_v_heads], axis=-1)
+        if hasattr(self, "_fused_signs"):
+            # Prism: qkv|z share one rotation; b|a read the unrotated input.
+            xr = prism_pack.rotate(inputs, self._fused_block, self._fused_signs)
+            big = mlx_qmm_mma.qmm(xr, self._fused_w, self._fused_s, self._fused_b,
+                                  self._fused_gs, self._fused_bits)
+            qkv, z = mx.split(big, [self.conv_dim], axis=-1)
+            b, a = mx.split(inputs @ self._fused_ba.T, 2, axis=-1)
+        else:
+            big = mlx_qmm_mma.qmm(inputs, self._fused_w, self._fused_s, self._fused_b,
+                                  self._fused_gs, self._fused_bits)
+            qkv, z, b, a = mx.split(
+                big, [self.conv_dim, self.conv_dim + self.value_dim,
+                      self.conv_dim + self.value_dim + self.num_v_heads], axis=-1)
         z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -345,12 +378,15 @@ def _install_layer_fastpath(model) -> None:
 
 def _compile_gdn_step(layer):
     import mlx.core as mx
-    return mx.compile(_gdn_body(layer))
+    body = (_prism_gdn_body if hasattr(layer.linear_attn, "_fused_signs")
+            else _gdn_body)
+    return mx.compile(body(layer))
 
 
 def _compile_dense_step(layer):
     import mlx.core as mx
-    return mx.compile(_dense_mlp_body(layer))
+    body = _prism_mlp_body if hasattr(layer.mlp, "_fused_signs") else _dense_mlp_body
+    return mx.compile(body(layer))
 
 
 def _dense_mlp_body(layer):
@@ -426,6 +462,282 @@ def _gdn_body(layer):
         out = (nn.silu(z.astype(mx.float32)) * xn.astype(mx.float32)).astype(xin.dtype)
         out = mx.quantized_matmul(out.reshape(B, S, -1), op.weight,
                                   scales=op.scales, biases=op.biases,
+                                  transpose=True, group_size=op.group_size,
+                                  bits=op.bits)
+        return xin + out, new_conv, new_rec
+
+    return fwd
+
+
+# ---------------------------------------------------------------- Prism packs
+
+
+def _looks_like_prism(model) -> bool:
+    """True only for a Prism-packed qwen3_5 DENSE hybrid: every projection a
+    rotated Packed, the GDN's gate projections plain linears, and the same-input
+    projections sharing one sign vector (what makes them fusable behind one
+    rotation)."""
+    import mlx.nn as nn
+    from mlx_lm.models import qwen3_5 as q35
+
+    if not isinstance(model, q35.Model):
+        return False
+    layers = model.language_model.model.layers
+    if not layers:
+        return False
+
+    def rotated(*mods) -> bool:
+        return all(prism_pack.is_packed(m) and m.block and not m.embedding
+                   for m in mods)
+
+    def shared(*mods) -> bool:
+        return all(m.block == mods[0].block and m.signs is mods[0].signs
+                   for m in mods[1:])
+
+    saw_gdn = saw_attn = False
+    for layer in layers:
+        mlp = layer.mlp
+        if not isinstance(mlp, q35.MLP):
+            return False
+        if not (rotated(mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+                and shared(mlp.gate_proj, mlp.up_proj)):
+            return False
+        if layer.is_linear:
+            gd = layer.linear_attn
+            if not isinstance(gd, q35.GatedDeltaNet):
+                return False
+            if not (rotated(gd.in_proj_qkv, gd.in_proj_z, gd.out_proj)
+                    and shared(gd.in_proj_qkv, gd.in_proj_z)):
+                return False
+            for lin in (gd.in_proj_b, gd.in_proj_a):
+                if (not isinstance(lin, nn.Linear) or "bias" in lin
+                        or lin.weight.ndim != 2):
+                    return False
+            saw_gdn = True
+        else:
+            at = layer.self_attn
+            if not (rotated(at.q_proj, at.k_proj, at.v_proj, at.o_proj)
+                    and shared(at.q_proj, at.k_proj, at.v_proj)):
+                return False
+            saw_attn = True
+    return saw_gdn and saw_attn
+
+
+def _stack(mods):
+    """Concatenate Packed projections along the output axis (bit-exact per row),
+    returning the fused arrays; the originals keep placeholder arrays."""
+    import mlx.core as mx
+
+    z = mx.zeros((8,), dtype=mx.uint32)
+    w = mx.contiguous(mx.concatenate([m.weight for m in mods], axis=0))
+    s = mx.contiguous(mx.concatenate([m.scales for m in mods], axis=0))
+    b = mx.contiguous(mx.concatenate([m.biases for m in mods], axis=0))
+    mx.eval(w, s, b)
+    for m in mods:
+        m.weight = z
+        m.scales = z
+        m.biases = z
+    mx.clear_cache()
+    return w, s, b
+
+
+def _record_fuse(owner, mods) -> None:
+    owner._fused_w, owner._fused_s, owner._fused_b = _stack(mods)
+    owner._fused_gs, owner._fused_bits = mods[0].group_size, mods[0].bits
+    owner._fused_block, owner._fused_signs = mods[0].block, mods[0].signs
+
+
+def _concat_prism_gate_up(model) -> None:
+    for layer in model.language_model.model.layers:
+        mlp = layer.mlp
+        _record_fuse(mlp, [mlp.gate_proj, mlp.up_proj])
+    _patch_dense_mlp_call()
+
+
+def _concat_prism_gdn_in_projs(model) -> None:
+    """qkv|z behind one rotation; b|a (plain, unrotated) as one bf16 matmul."""
+    import mlx.core as mx
+
+    for layer in model.language_model.model.layers:
+        if not layer.is_linear:
+            continue
+        gd = layer.linear_attn
+        _record_fuse(gd, [gd.in_proj_qkv, gd.in_proj_z])
+        gd._fused_ba = mx.contiguous(mx.concatenate(
+            [gd.in_proj_b.weight, gd.in_proj_a.weight], axis=0))
+        mx.eval(gd._fused_ba)
+    _patch_gdn_call()
+
+
+_prism_attention_class = None
+
+
+def _fuse_prism_attention(model) -> None:
+    """q|k|v behind one rotation, per instance: the tapped-layer trick from
+    mlx_dflash.install_tap — swap the instance's class for a subclass whose
+    __call__ is the stock attention body with the three projections replaced by
+    the fused matmul. Everything else (norms, rope, the cache, the SDPA helper
+    mlx_qsdpa patches) is the stock code path, resolved at call time."""
+    global _prism_attention_class
+    import mlx.core as mx
+    from mlx_lm.models import qwen3_5 as q35
+    from mlx_lm.models import qwen3_next as qn
+
+    if _prism_attention_class is None:
+        class _PrismAttention(q35.Attention):
+            def __call__(self, x, mask=None, cache=None):
+                B, L, _ = x.shape
+                xr = prism_pack.rotate(x, self._fused_block, self._fused_signs)
+                big = mlx_qmm_mma.qmm(xr, self._fused_w, self._fused_s, self._fused_b,
+                                      self._fused_gs, self._fused_bits)
+                q_out, keys, values = mx.split(
+                    big, [self._q_cols, self._q_cols + self._kv_cols], axis=-1)
+                queries, gate = mx.split(
+                    q_out.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1)
+                gate = gate.reshape(B, L, -1)
+                queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+                keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)
+                                   ).transpose(0, 2, 1, 3)
+                values = values.reshape(B, L, self.num_key_value_heads, -1
+                                        ).transpose(0, 2, 1, 3)
+                if cache is not None:
+                    queries = self.rope(queries, offset=cache.offset)
+                    keys = self.rope(keys, offset=cache.offset)
+                    keys, values = cache.update_and_fetch(keys, values)
+                else:
+                    queries = self.rope(queries)
+                    keys = self.rope(keys)
+                output = qn.scaled_dot_product_attention(
+                    queries, keys, values, cache=cache, scale=self.scale, mask=mask)
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(output * mx.sigmoid(gate))
+
+        _prism_attention_class = _PrismAttention
+
+    for layer in model.language_model.model.layers:
+        if layer.is_linear:
+            continue
+        at = layer.self_attn
+        if isinstance(at, _prism_attention_class):
+            continue
+        at._q_cols = int(at.q_proj.weight.shape[0])
+        at._kv_cols = int(at.k_proj.weight.shape[0])
+        _record_fuse(at, [at.q_proj, at.k_proj, at.v_proj])
+        at.__class__ = _prism_attention_class
+
+
+def _rot(x, block: int):
+    """The Hadamard alone, in the activation dtype — for compiled S=1 bodies,
+    whose sign vectors are folded into the weights upstream. One kernel; the fp32
+    version is three (two casts around it). CHAD_PRISM_ROT_FP32 keeps the pack's
+    fp32 rotation here too (an A/B arm)."""
+    import mlx.core as mx
+
+    if config.flag("CHAD_PRISM_ROT_FP32"):
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        return mx.hadamard_transform(x.reshape(-1, block),
+                                     scale=1 / math.sqrt(block)
+                                     ).reshape(x.shape).astype(dtype)
+    return mx.hadamard_transform(x.reshape(-1, block),
+                                 scale=1 / math.sqrt(block)).reshape(x.shape)
+
+
+def _signed(weight, signs):
+    """weight * signs, exact in weight's dtype (signs are ±1)."""
+    import mlx.core as mx
+
+    out = (weight.astype(mx.float32) * signs.astype(mx.float32)).astype(weight.dtype)
+    mx.eval(out)
+    return out
+
+
+def _prism_mlp_body(layer):
+    """post_attention_layernorm (input signs folded in) + rotation + fused swiglu
+    MLP (down_proj's signs folded into the gate) + rotation + residual."""
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    mlp = layer.mlp
+    ln_w = _signed(layer.post_attention_layernorm.weight, mlp._fused_signs)
+    ln_eps = layer.post_attention_layernorm.eps
+    fw, fs, fb = mlp._fused_w, mlp._fused_s, mlp._fused_b
+    gs_, bits = mlp._fused_gs, mlp._fused_bits
+    block_in = mlp._fused_block
+    dp = mlp.down_proj
+    block_mid = dp.block
+    s_mid = dp.signs.astype(ln_w.dtype)
+    mx.eval(s_mid)
+
+    def fwd(h):
+        x = _rot(mx.fast.rms_norm(h, ln_w, ln_eps), block_in)
+        gu = mx.quantized_matmul(x, fw, scales=fs, biases=fb, transpose=True,
+                                 group_size=gs_, bits=bits)
+        g, u = mx.split(gu, 2, axis=-1)
+        y = _rot(nn.silu(g) * u * s_mid, block_mid)
+        y = mx.quantized_matmul(y, dp.weight, scales=dp.scales, biases=dp.biases,
+                                transpose=True, group_size=dp.group_size, bits=dp.bits)
+        return h + y
+
+    return fwd
+
+
+def _prism_gdn_body(layer):
+    """input_layernorm (signs folded) + rotation + fused qkv|z, the b|a gates off
+    the same signed input (their weights re-signed to match) + the stock
+    recurrence + gated norm (out_proj's signs folded) + rotation + out_proj +
+    residual, with explicit (conv_state, recurrent_state) threading."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.models.qwen3_5 import gated_delta_update
+
+    gd = layer.linear_attn
+    ln_w = _signed(layer.input_layernorm.weight, gd._fused_signs)
+    ln_eps = layer.input_layernorm.eps
+    fw, fs, fb = gd._fused_w, gd._fused_s, gd._fused_b
+    gs_, bits = gd._fused_gs, gd._fused_bits
+    block_in = gd._fused_block
+    w_ba = _signed(gd._fused_ba, gd._fused_signs)      # columns re-signed
+    conv_w = gd.conv1d.weight
+    n_keep = gd.conv_kernel_size - 1
+    A_log, dt_bias = gd.A_log, gd.dt_bias
+    op = gd.out_proj
+    norm_w = gd.norm.weight
+    # The gated norm is per head (head_v_dim wide) while out_proj's sign vector
+    # spans every head, so these signs cannot fold into the norm weight; they ride
+    # on the fp32 elementwise gate below, which compile fuses into one kernel anyway.
+    s_out = op.signs.reshape(gd.num_v_heads, gd.head_v_dim).astype(mx.float32)
+    mx.eval(s_out)
+    block_out = op.block
+    Hk, Hv = gd.num_k_heads, gd.num_v_heads
+    Dk, Dv = gd.head_k_dim, gd.head_v_dim
+    key_dim, conv_dim = gd.key_dim, gd.conv_dim
+    eps = gd.layer_norm_epsilon
+
+    def fwd(xin, conv_state, rec_state):
+        inputs = mx.fast.rms_norm(xin, ln_w, ln_eps)
+        B, S, _ = inputs.shape
+        big = mx.quantized_matmul(_rot(inputs, block_in), fw, scales=fs, biases=fb,
+                                  transpose=True, group_size=gs_, bits=bits)
+        qkv, z = mx.split(big, [conv_dim], axis=-1)
+        b, a = mx.split(inputs @ w_ba.T, 2, axis=-1)
+        z = z.reshape(B, S, Hv, Dv)
+        conv_input = mx.concatenate([conv_state, qkv], axis=1)
+        new_conv = mx.contiguous(conv_input[:, -n_keep:, :])
+        conv_out = nn.silu(mx.conv1d(conv_input, conv_w, groups=conv_dim))
+        q, k, v = [t.reshape(B, S, h, d) for t, h, d in zip(
+            mx.split(conv_out, [key_dim, 2 * key_dim], -1),
+            [Hk, Hk, Hv], [Dk, Dk, Dv])]
+        inv_scale = Dk ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        out, new_rec = gated_delta_update(q, k, v, a, b, A_log, dt_bias,
+                                          rec_state, None, use_kernel=True)
+        # RMSNormGated, matching stock's fp32 _precise_swiglu exactly
+        xn = mx.fast.rms_norm(out, norm_w, eps).astype(mx.float32) * s_out
+        out = (nn.silu(z.astype(mx.float32)) * xn).astype(xin.dtype)
+        out = _rot(out.reshape(B, S, -1), block_out)
+        out = mx.quantized_matmul(out, op.weight, scales=op.scales, biases=op.biases,
                                   transpose=True, group_size=op.group_size,
                                   bits=op.bits)
         return xin + out, new_conv, new_rec

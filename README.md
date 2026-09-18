@@ -167,6 +167,7 @@ chad ships exactly one, downloaded once into the shared Hugging Face cache
 | Model | Quant | Footprint |
 |---|---|---|
 | [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~13 GB resident, 262k native context |
+| [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit) via `--model` | the same model, Hadamard-rotated ternary (2-bit g128); borrows the drafter above | ~8 GB resident; the window roughly doubles |
 
 Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
 parameter is on the critical path for every token and the quant is where decode speed comes
@@ -179,7 +180,9 @@ affine, not a llama.cpp k-quant. The drafter ships in the same repo, pre-quantiz
 `--model <repo or local dir>` runs different weights through the same engine and stays a
 first-class escape hatch. The drafter, the fused-attention coverage, the decode fastpath and
 the context governor are all fitted to the shipped checkpoint, so other weights run slower;
-they do not break.
+they do not break. The one exception is Prism's ternary pack of this same model, which the
+whole stack attaches to (64 tok/s drafted on the M4 Pro, ~114k-token window against ~56k);
+see [configuration](docs/configuration.md#the-ternary-alternative-prisms-hadamard-folded-pack).
 
 ## Installing & upgrading
 

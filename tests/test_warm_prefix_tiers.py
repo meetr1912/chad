@@ -209,6 +209,7 @@ class _Engine:
     def __init__(self):
         self.model_id = "chartok-test"
         self.effective_ctx = 24000
+        self.reasoning_effort_default = None
         self.cache_dir = None
         self._cached_ids = []
         self.tok = _CharTok()

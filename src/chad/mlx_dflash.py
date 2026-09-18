@@ -806,6 +806,42 @@ def bundle_dir(model_dir: str) -> Optional[str]:
     return d if os.path.isfile(os.path.join(d, "config.json")) else None
 
 
+# Drafters transfer across quantizations of one base model: a drafter reads the
+# target's residual stream at its tapped layers, which a different weight quantization
+# only perturbs (measured on the Prism ternary pack: 93% acceptance with the 3-bit
+# model's sidecar). A checkpoint that bundles no drafter borrows the one a sibling
+# repo bundles, keyed on the (hidden, layers, vocab) shape the tap needs anyway.
+DONORS: dict = {(5120, 64, 248320): "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX"}
+
+
+def _donor_file(repo_id: str, filename: str) -> str:
+    """The local path of one file of a hub repo: the cache when it holds it, a
+    download otherwise."""
+    from huggingface_hub import hf_hub_download, try_to_load_from_cache
+    hit = try_to_load_from_cache(repo_id, filename)
+    return hit if isinstance(hit, str) else hf_hub_download(repo_id, filename)
+
+
+def donor_bundle_dir(key, repo_id: Optional[str], donors: Optional[dict] = None,
+                     fetch: Optional[Callable[[str, str], str]] = None) -> Optional[str]:
+    """The sidecar dir a `donors` (default DONORS) sibling bundles for a target of
+    shape `key`, or None (no donor for the shape, the model IS the donor, or the
+    fetch failed). `fetch(repo_id, filename)` resolves one file; None = the hub."""
+    donor = (DONORS if donors is None else donors).get(key)
+    if not donor or donor == repo_id:
+        return None
+    resolve = fetch or _donor_file
+    try:
+        cfg = resolve(donor, f"{_BUNDLE}/config.json")
+        resolve(donor, f"{_BUNDLE}/model.safetensors")
+    except Exception as e:  # noqa: BLE001 — offline/gated: decode without the drafter
+        log.warning("DFlash drafter: donor bundle %s unavailable (%s); decoding "
+                    "without it", donor, e)
+        return None
+    log.info("DFlash drafter: no bundle with these weights; borrowing %s's", donor)
+    return os.path.dirname(cfg)
+
+
 def _complete(d: str) -> bool:
     return (os.path.isfile(os.path.join(d, "config.json"))
             and os.path.isfile(os.path.join(d, "model.safetensors")))
@@ -849,18 +885,22 @@ def ensure_bundle(model_dir: str, repo_id: Optional[str],
 
 
 def load_drafter(model: "nn.Module", model_dir: str, repo_id: Optional[str] = None,
-                 bits: int = 4, gs: int = 64) -> Optional["nn.Module"]:
+                 bits: int = 4, gs: int = 64, donors: Optional[dict] = None,
+                 fetch: Optional[Callable[[str, str], str]] = None) -> Optional["nn.Module"]:
     """Load the DFlash drafter bundled with the target's weights (or the dir
     CHAD_DFLASH_PATH names), bound to the target's embedding/lm_head, with the
     target tap installed. None when no drafter ships for this model or on any
     failure — DFlash is a pure speed feature, never load-bearing.
 
     `repo_id` is the model's HF repo when it came from the hub, so a bundle whose
-    weights the base download filtered out can be completed (see ensure_bundle)."""
+    weights the base download filtered out can be completed (see ensure_bundle).
+    `donors`/`fetch` are donor_bundle_dir's (tests inject them)."""
     try:
         key = _target_key(model)
         ensure_bundle(model_dir, repo_id)
         sdir = bundle_dir(model_dir)
+        if sdir is None and key is not None:
+            sdir = donor_bundle_dir(key, repo_id, donors, fetch)
         if key is None or sdir is None:
             return None
         if not _is_sidecar(sdir):

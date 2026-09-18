@@ -250,6 +250,42 @@ parses both that and JSON, and strips `<think>` blocks. The repo also carries th
 [speculative decoding](configuration.md#speculative-decoding--kernel-knobs). There are no
 model flags to pick from; you just run `chad`.
 
+### The ternary pack
+
+The one other checkpoint the whole stack attaches to is
+[`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
+(`--model`): the same Qwen3.8-27B, every projection Hadamard-rotated and stored as 2-bit
+g128 whose levels are ternary. See
+[configuration](configuration.md#the-ternary-alternative-prisms-hadamard-folded-pack)
+for what chad does to run it. Measured on the M4 Pro, one load per process, greedy,
+512-token prompt, 128-token decodes; "as loaded" is the pack's own forward with nothing
+of chad's attached (fp32 activations, stock 2-bit matmul, no drafter transfer):
+
+| | shipped 3-bit | ternary, as loaded | ternary, chad's stack |
+|---|---|---|---|
+| weights resident | 12.33 GB | 7.15 GB | 7.15 GB |
+| serial decode | 17.9 tok/s | 17.8 | **21.3** |
+| drafted decode (DFlash2) | ~60 tok/s | 12.1 (net loss) | **63.7** (94% accepted) |
+| width-8 verify forward | 2.2 × a step | 9.2 × | **2.2 ×** |
+| prefill, 5k prompt | ~104 tok/s | 89 | 99 |
+| peak at 5k / 32k | — / 16.8 GB | — / 13.3 GB | 11.8 GB / 15.5 GB³ |
+| governor window (24 GB) | ~56k tokens | — | **~114k** |
+| code NLL (1,535 tok, teacher-forced) | — | 1.500 | 1.502 |
+
+³ With the drafter resident and after the bench's earlier sections (active 9.6 GB going
+in, against 8.25 GB at a clean load); the 32k prefill ran at 90 tok/s and decode at 32k
+drafted 62 tok/s, no depth falloff. Running the compiled bodies' rotation in fp32
+(`CHAD_PRISM_ROT_FP32=1`) measured 63.6 drafted / 21.0 serial against 63.7 / 21.3: inside
+the noise, so the one-kernel native-dtype rotation stays the default.
+
+The "as loaded" drafted number is the S=2..8 wall: the stock 2-bit matmul re-pays the
+weight read per verify row, so an 8-wide verify cost 9× a decode step and never amortized.
+The small-M MMA kernel at 2-bit g128 is flat in width (0.35 ms at M=8 on the 5120→17408
+projection against 0.71 ms stock), which puts the block on the right side of the cliff.
+The serial step is bounded by mlx's 2-bit GEMV rate, not by dispatch, so the fast-path's
+kernel-count win is smaller here than on the 3-bit; the weights, the verify and the
+context are where the pack pays.
+
 ## Two throughput levers
 
 **Thinking budget.** This is a reasoning model, and its `<think>` blocks dominate what it
