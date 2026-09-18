@@ -19,16 +19,24 @@ opposite direction. One model and one set of silicon, taken to the max. Swap out
 ## Try it
 
 ```bash
-uvx chad-code          # runs anywhere; the command is still `chad`
-uvx chad-code prove    # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
+uv tool install git+https://github.com/meetr1912/chad@prism-hadamard-loader
+chad                   # runs anywhere
+chad prove             # offline smoke test: 4 tiny fix-it tasks, verified, timed 🗿
 ```
 
-The first run asks, then downloads the model once (~13 GB) into the shared Hugging
+> **This fork** ships the ternary `Ternary-Bonsai-2` pack instead of the 3-bit build:
+> 8.2 GB downloaded rather than 13, ~163k of compaction headroom rather than ~118k, at
+> 37 tok/s decode against the 3-bit build's 44 on the same machine. Its weights are
+> stored Hadamard-rotated and no stock loader reconstructs them, so `src/chad/mlx_prism.py`
+> applies the transforms; `uvx chad-code` is upstream and cannot load this model.
+> `CHAD_MODEL=nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX` selects the 3-bit build.
+
+The first run asks, then downloads the model once (~8.2 GB) into the shared Hugging
 Face cache. While it downloads, `cd` into a project and think of a scoped first ask:
 *"fix the failing test in `tests/test_x.py`"* lands, *"improve my codebase"* flails.
 
 chad targets 24 GB and nothing smaller. It runs below that and tells you it is doing so,
-but 13 GB of weights sit resident before a single token of context, so a 16 GB Mac gets a
+but 7 GB of weights sit resident before a single token of context, so a 16 GB Mac gets a
 window too small to work in.
 
 The PyPI package is `chad-code`. Bare `chad` is an unrelated squatted package.
@@ -58,6 +66,12 @@ resident at a time, each measured with its own benchmark on a 512-token prompt a
 
 A 200-token function body takes roughly 18 seconds at 10.9 tok/s and 3 at 63. You wait for
 the first one and you talk to the second.
+
+Those rows are upstream's, on the 3-bit build. This fork's default is the ternary pack,
+which is the smaller and slower of the two: measured here with `chad-bench` on one
+machine, 95 tok/s prefill and 37.3 decode, against 100 and 44.3 for the 3-bit build on
+that same machine. What it buys is resident footprint, and therefore context: compaction
+lands around 163k tokens rather than 118k.
 
 Ollama does not get its own row: it is llama.cpp underneath, measured without speculative
 decoding, and on the same GGUF (0.32.15, Modelfile `FROM` only) it measures 96 tok/s
@@ -161,12 +175,13 @@ forks a new branch rather than overwriting.
 
 ## The model
 
-chad ships exactly one, downloaded once into the shared Hugging Face cache
+chad ships one by default, downloaded once into the shared Hugging Face cache
 (`~/.cache/huggingface`, reused across every project). There is no picker and no size tier.
 
 | Model | Quant | Footprint |
 |---|---|---|
-| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~13 GB resident, 262k native context |
+| [Qwen3.8-27B `Ternary-Bonsai-2-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX) | ternary 2-bit group-128 in a Hadamard-rotated basis, bundled 4-bit DFlash2 drafter | ~8 GB resident, 262k native context |
+| [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) (`CHAD_MODEL`) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~13 GB resident, 262k native context |
 
 Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
 parameter is on the critical path for every token and the quant is where decode speed comes
