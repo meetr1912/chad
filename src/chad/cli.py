@@ -488,17 +488,17 @@ def _pick_model(spec=None, *, host: Host = HOST, local_model: str = _LOCAL_MODEL
         got = "undetectable" if ram is None else f"{ram:.0f} GB"
         sys.stderr.write(
             f"chad: RAM {got}, below the ~{_MIN_RAM_GB:.0f} GB chad is built for. The "
-            f"model needs ~12 GB resident plus its KV cache, so expect a small context "
+            f"model needs ~7 GB resident plus its KV cache, so expect a small context "
             f"window and possible thrashing. Proceeding.\n")
     return _resolve(local_model, _HF_MODEL), "default"
 
 
 def _model_download_gb(model_id):
     """Approximate download size in GiB for the shipped model (for the disk preflight
-    and the confirm prompt — display honesty, not accounting): ~12.1 GB of weights
-    plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is unknowable
-    ahead of the resolve, so it gets the same figure."""
-    return 13.2
+    and the confirm prompt — display honesty, not accounting): ~7.15 GB of ternary
+    weights plus the ~1.1 GB bundled DFlash2 drafter. An arbitrary `--model` is
+    unknowable ahead of the resolve, so it gets the same figure."""
+    return 8.3
 
 
 def _cached_weights_complete(
@@ -606,7 +606,7 @@ def _fail_model_load(model_id, err):
     else:
         sys.stderr.write(
             "  fix:   a partial/corrupt download or not enough free RAM. Re-run (the HF\n"
-            "         download resumes). chad needs ~12 GB resident for weights alone,\n"
+            "         download resumes). chad needs ~7 GB resident for weights alone,\n"
             "         so close other memory-hungry apps before retrying.\n")
     sys.exit(1)
 
