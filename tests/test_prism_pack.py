@@ -252,3 +252,23 @@ def test_mma_probe_sees_packed_and_fused_ternary_shapes():
     assert len(groups[(128, 256, 2, 128)]) == 3
     assert (128, 384, 2, 128) in groups          # fused qkv|z and fused q|k|v
     assert len(groups[(128, 128, 2, 128)]) == 4  # down x2, out_proj, o_proj
+
+
+def test_quiet_tokenizer_load_drops_only_the_model_type_mismatch(caplog):
+    """transformers warns that a model of the pack's type cannot instantiate a
+    transformers model; chad builds the MLX model itself, so inside the scope that one
+    record is dropped and every other transformers message still comes through."""
+    import logging
+
+    logger = logging.getLogger("transformers.configuration_utils")
+    with caplog.at_level(logging.WARNING, logger="transformers.configuration_utils"):
+        with prism_pack.quiet_tokenizer_load():
+            logger.warning("You are using a model of type `prism_hadamard_qwen35` to "
+                           "instantiate a model of type ``.")
+            logger.warning("some other transformers warning")
+        logger.warning("You are using a model of type `prism_hadamard_qwen35` to "
+                       "instantiate a model of type ``.")
+    msgs = [r.getMessage() for r in caplog.records]
+    assert msgs == ["some other transformers warning",
+                    "You are using a model of type `prism_hadamard_qwen35` to "
+                    "instantiate a model of type ``."]

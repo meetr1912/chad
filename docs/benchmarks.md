@@ -33,7 +33,9 @@ that appends ~16 tokens):
 
 | Model | Prefill (cold) | Decode | Warm-step prefill |
 |---|---|---|---|
-| **Qwen3.8-27B** `UD-Q3_K_XL-DFlash2` (shipped, default) | ~104 tok/s | ~59 tok/s | ~0.55 s (16 tok) |
+| **Qwen3.8-27B** `Ternary-Bonsai-2-DFlash2` (shipped, default) | ~97 tok/s | ~60 tok/s | ~0.56 s (16 tok) |
+| same, serial (`CHAD_NO_DFLASH=1`) | ~99 tok/s | ~21 tok/s | ~0.56 s (16 tok) |
+| Qwen3.8-27B `UD-Q3_K_XL-DFlash2` (3-bit, `--model`) | ~104 tok/s | ~59 tok/s | ~0.55 s (16 tok) |
 | same, serial (`CHAD_NO_DFLASH=1`) | ~105 tok/s | ~18 tok/s | ~0.55 s (16 tok) |
 
 > Measured on this machine with the command above. Run it on yours; these are hardware
@@ -74,8 +76,9 @@ does](#why-decode-sits-where-it-does).
 
 The question chad has to answer is what its engine buys over a generic local-model tool
 pointed at the **same weights on the same laptop**. So: Qwen3.8-27B at the `UD-Q3_K_XL`
-recipe (Unsloth's GGUF for llama.cpp, chad's MLX conversion of the same per-tensor bit map)
-on the same M4 Pro (24 GB), one engine resident at a time, each measured with its own native
+recipe (Unsloth's GGUF for llama.cpp, chad's MLX conversion of the same per-tensor bit map,
+the 3-bit alternative chad runs with `--model`; the shipped ternary build has no GGUF to
+compare against) on the same M4 Pro (24 GB), one engine resident at a time, each measured with its own native
 benchmark on a 512-token prompt and a 128-token generation. It was measured once on the same 
 GGUF (0.32.15, a `FROM`-only Modelfile, `num_ctx` 2048, temperature 0, timed from 
 `/api/generate`'s own counters) at 96 tok/s prefill and 10.9 tok/s decode, the llama.cpp 
@@ -190,8 +193,11 @@ The first-order answer is memory bandwidth: each token streams the resident weig
 the chip once, so `tok/s ≈ bandwidth / resident-bytes-per-token`. On a **dense** model that
 story is largely right, and it is why the quant is as aggressive as it is: every parameter
 is read for every token, so shrinking the weights is the only decode lever there is. ~12 GB
-against this M4 Pro's ~273 GB/s is the envelope the engine works inside, and no amount of
-kernel work moves that wall.
+(the 3-bit) against this M4 Pro's ~273 GB/s is the envelope the engine works inside, and no
+amount of kernel work moves that wall. The ternary build's 7.2 GB should sit further inside
+it than it does: mlx's 2-bit GEMV streams at ~140 GB/s, about half the roofline, which is
+why its serial step (21 tok/s) is not the 30+ the byte count implies, and why the drafter
+carries the speed story there.
 
 Inside the envelope, two things decide how close you get. Both were first measured on the
 retired 35B, whose sparse MoE made them unmissable; the *lessons* are what carried into
@@ -237,12 +243,15 @@ you're getting.
 
 ## The model: Qwen3.8-27B
 
-chad runs **one** model, [`Qwen3.8-27B UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX):
-a dense `qwen3_5` hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) quantized to
-3-bit group-64 with `lm_head` held at 5-bit, ~12 GB resident, 262k native context. One
-model, every machine, with no RAM-aware pick, no size tier and no flag. chad targets 24 GB Macs and
-nothing smaller. The vision tower is not present at all (it was dropped at conversion time;
-mlx-lm's `qwen3_5` loader would have discarded it at load anyway).
+chad runs **one** model, [`Qwen3.8-27B Ternary-Bonsai-2-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX):
+a dense `qwen3_5` hybrid (64 layers: 48 GatedDeltaNet + 16 full attention) in Prism ML's
+ternary build, every projection Hadamard-rotated and stored as 2-bit group-128 with levels
+{−s, 0, +s}, ~7.2 GB resident, 262k native context. One model, every machine, with no
+RAM-aware pick, no size tier and no flag. chad targets 24 GB Macs and nothing smaller. The
+vision tower is not present at all (dropped in the repack; the text-only loader would have
+skipped it anyway). The 3-bit
+[`UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX)
+quant of the same model is one `--model` away and is the quality reference below.
 
 It's a *thinking* model that emits tool calls in the XML `<function=…>` dialect; the harness
 parses both that and JSON, and strips `<think>` blocks. The repo also carries the
@@ -250,18 +259,15 @@ parses both that and JSON, and strips `<think>` blocks. The repo also carries th
 [speculative decoding](configuration.md#speculative-decoding--kernel-knobs). There are no
 model flags to pick from; you just run `chad`.
 
-### The ternary pack
+### Ternary against the 3-bit
 
-The one other checkpoint the whole stack attaches to is
-[`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
-(`--model`): the same Qwen3.8-27B, every projection Hadamard-rotated and stored as 2-bit
-g128 whose levels are ternary. See
-[configuration](configuration.md#the-ternary-alternative-prisms-hadamard-folded-pack)
-for what chad does to run it. Measured on the M4 Pro, one load per process, greedy,
-512-token prompt, 128-token decodes; "as loaded" is the pack's own forward with nothing
-of chad's attached (fp32 activations, stock 2-bit matmul, no drafter transfer):
+What the ternary build costs and buys against the 3-bit quant of the same model. See
+[configuration](configuration.md#what-the-engine-does-with-the-ternary-weights) for what
+chad does to run it. Measured on the M4 Pro, one load per process, greedy, 512-token prompt,
+128-token decodes; "as loaded" is the upstream pack's own forward with nothing of chad's
+attached (fp32 activations, stock 2-bit matmul, no drafter):
 
-| | shipped 3-bit | ternary, as loaded | ternary, chad's stack |
+| | 3-bit (`--model`) | ternary, as loaded | ternary, shipped |
 |---|---|---|---|
 | weights resident | 12.33 GB | 7.15 GB | 7.15 GB |
 | serial decode | 17.9 tok/s | 17.8 | **21.3** |
@@ -269,8 +275,13 @@ of chad's attached (fp32 activations, stock 2-bit matmul, no drafter transfer):
 | width-8 verify forward | 2.2 × a step | 9.2 × | **2.2 ×** |
 | prefill, 5k prompt | ~104 tok/s | 89 | 99 |
 | peak at 5k / 32k | — / 16.8 GB | — / 13.3 GB | 11.8 GB / 15.5 GB³ |
-| governor window (24 GB) | ~56k tokens | — | **~114k** |
-| code NLL (1,535 tok, teacher-forced) | — | 1.500 | 1.502 |
+| governor window (24 GB) | ~56k tokens | — | **~150k** (114k with the bench's residue resident) |
+| code NLL / ppl (1,535 tok, teacher-forced) | **1.383 / 3.99** | 1.500 / 4.48 | 1.502 / 4.49 |
+| private eval tiers (core, languages, hard, brutal, realworld, recovery) | 56/56 | — | 56/56 |
+
+The perplexity row is the honest cost: +12% on code against the 3-bit, which the task-level
+tiers do not resolve (56 tasks, no flip in either direction, at the shipped sampling preset). The window row is what it buys, and on this agent the window is what
+runs out first.
 
 ³ With the drafter resident and after the bench's earlier sections (active 9.6 GB going
 in, against 8.25 GB at a clean load); the 32k prefill ran at 90 tok/s and decode at 32k

@@ -4,15 +4,28 @@ Notable, user-visible changes.
 
 ## [Unreleased]
 
-**Prism's ternary Qwen3.8-27B runs with the whole stack attached.**
-`--model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` loads the Hadamard-folded 2-bit g128 pack
-through chad's own loader (mlx-lm's would decode garbage silently), and the decode
-fast-path, the small-M verify kernel and the DFlash2 drafter all engage: fused `gate|up`,
-`qkv|z` and `q|k|v` behind one rotation each, the MMA kernel extended to 2-bit g128, and
-the shipped model's drafter borrowed for any same-shape checkpoint with no bundle. On the
-M4 Pro: 7.15 GB of weights (was 12.33), 64 tok/s drafted greedy decode (the pack as loaded:
-12; the shipped quant: ~60), and a ~114k-token governor window against ~56k. The pack's
-template defaults `reasoning_effort` to xhigh; chad passes medium unless
+## [2.2.0] — 2026-09-17
+
+**Model bump: the shipped weights are now Prism ML's ternary build of Qwen3.8-27B.** A
+re-download is coming (~8 GB, against ~13); the old snapshot can be freed with `hf cache rm`.
+The new default is [`nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX):
+the same model with every projection Hadamard-rotated and stored at 2 bits (levels
+{−s, 0, +s}), repacked text-only with the base tokenizer and the DFlash2 drafter bundled.
+7.2 GB resident instead of 12.3, and on a dense model those 5 GB are context: the
+governor's window on a 24 GB Mac goes from ~56k tokens to ~150k. Decode holds: 64 tok/s
+drafted and 21 serial on the M4 Pro (the 3-bit: ~60 / 18). The cost is quality at the
+margin: teacher-forced perplexity on code is 4.49 against the 3-bit's 3.99 (+12%), while all six
+private eval tiers tie (56/56, no task flipped either way). The 3-bit quant stays one flag
+away: `--model nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`.
+
+What made it run at that speed rather than as a port: the rotated weights need their
+transform applied to the activations at runtime, and mlx-lm's plain loader would decode
+plausible garbage without raising, so chad routes the pack to its own loader. The decode
+fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind one rotation each; the small-M verify
+kernel now covers 2-bit g128 (mlx's stock 2-bit matmul made an 8-wide verify cost 9× a
+step and drafting a net loss); a checkpoint of the shipped shape with no bundled drafter
+borrows the shipped one, so pointing `--model` at the upstream `prism-ml` pack works too.
+The pack's chat template defaults `reasoning_effort` to xhigh; chad passes medium unless
 `CHAD_REASONING_EFFORT` is set. `CHAD_PRISM_ROT_FP32` is the A/B arm for the compiled
 bodies' rotation precision.
 

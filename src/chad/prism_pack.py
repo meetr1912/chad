@@ -38,7 +38,9 @@ stream, which the quantization only perturbs). Its chat template defaults
 template otherwise — so the engine carries `REASONING_EFFORT_DEFAULT` for it.
 """
 
+import contextlib
 import json
+import logging
 import math
 import os
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -61,6 +63,31 @@ REASONING_EFFORT_DEFAULT = "medium"
 
 def is_prism_pack(config: dict) -> bool:
     return config.get("model_type") == _MODEL_TYPE
+
+
+class _NotAModelMismatch(logging.Filter):
+    """Drops transformers' "model of type `prism_hadamard_qwen35` to instantiate a model
+    of type ``" warning. AutoTokenizer resolves the checkpoint's config to pick a
+    tokenizer class, finds no transformers model for the pack's model_type, falls back
+    to the base config and warns that the MODEL may not load. chad never instantiates
+    a transformers model (prism_pack.load builds the MLX model itself), so the warning
+    is about something that does not happen — and it printed across the banner."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _MODEL_TYPE not in record.getMessage()
+
+
+@contextlib.contextmanager
+def quiet_tokenizer_load():
+    """Scope for loading a Prism pack's tokenizer without the model-type mismatch
+    warning above; every other transformers message still comes through."""
+    logger = logging.getLogger("transformers.configuration_utils")
+    flt = _NotAModelMismatch()
+    logger.addFilter(flt)
+    try:
+        yield
+    finally:
+        logger.removeFilter(flt)
 
 
 def rotate(x, block: int, signs, inverse: bool = False):

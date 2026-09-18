@@ -811,7 +811,7 @@ def bundle_dir(model_dir: str) -> Optional[str]:
 # only perturbs (measured on the Prism ternary pack: 93% acceptance with the 3-bit
 # model's sidecar). A checkpoint that bundles no drafter borrows the one a sibling
 # repo bundles, keyed on the (hidden, layers, vocab) shape the tap needs anyway.
-DONORS: dict = {(5120, 64, 248320): "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX"}
+DONORS: dict = {(5120, 64, 248320): "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"}
 
 
 def _donor_file(repo_id: str, filename: str) -> str:

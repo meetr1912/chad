@@ -281,8 +281,9 @@ default:
 | Context | KV cache (8-bit, default) | Notes |
 |---|---|---|
 | 32k | 1.1 GB | |
-| ~56k | 2.0 GB | roughly where a 24 GB Mac's window lands |
-| 128k | 4.6 GB | needs a bigger box than the floor |
+| ~56k | 2.0 GB | roughly where a 24 GB Mac's window lands on the 3-bit `--model` alternative |
+| 128k | 4.6 GB | |
+| ~150k | 5.2 GB | roughly where a 24 GB Mac's window lands on the shipped ternary weights |
 | 262k (native) | 9.1 GB | the checkpoint's max; unreachable on 24 GB |
 
 That is **34,816 bytes per token**. A pure-attention transformer of the same shape (all 64
@@ -345,9 +346,11 @@ cost, then capped at the model's window. Three things are subtracted before the 
 the resident weights, a headroom band (`CHAD_CTX_SAFETY`), and the prefill transient, the attention scratch that is live at the same moment the cache is. That last one is fixed,
 not per-token: it climbs with context and then flattens once the adaptive chunker starts
 shrinking the chunk (measured: 1.8 GB at 8k, 4.15 GB at 49k, flat thereafter), and past
-that point peak memory grows at exactly the KV rate. On a 24 GB Mac the model's 12.3 GB of
-weights plus that 4.3 GB transient spend 87% of the budget before the first cached token,
-which is why it lands near ~56k rather than its 262k native window. It
+that point peak memory grows at exactly the KV rate. On a 24 GB Mac the shipped ternary
+weights (7.2 GB) plus the drafter (1.1 GB) and that 4.3 GB transient spend ~72% of the
+budget before the first cached token, which is why it lands around ~150k rather than the
+262k native window; the 3-bit alternative's 12.3 GB of weights spent 87% and landed near
+~56k. It
 self-calibrates per machine: less RAM compacts sooner, more RAM runs nearer the full
 window. `CHAD_CTX_LIMIT` forces an
 exact threshold (used by tests); `CHAD_CTX_SAFETY` (default 0.975) is the single
@@ -379,35 +382,52 @@ that the Metal budget can't see) and is re-checked between turns.
 
 ### The model
 
-chad ships exactly one: [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`][model], a dense
-`qwen3_5` hybrid (64 layers: 48 GatedDeltaNet, 16 full attention) quantized to 3-bit
-group-64 with `lm_head` held at 5-bit. ~12 GB resident, 262k native context. The repo also
-carries the DFlash2 block drafter, pre-quantized to 4-bit in `dflash/` (~1.1 GB resident),
-so one download gets the model and its
+chad ships exactly one: [`nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX`][model],
+Qwen3.8-27B (a dense `qwen3_5` hybrid: 64 layers, 48 GatedDeltaNet and 16 full attention)
+in Prism ML's ternary build. Every projection is Hadamard-rotated offline and stored as
+2-bit affine group-128 whose three levels are {−s, 0, +s}: **7.2 GB resident**, 262k native
+context. The repo also carries the DFlash2 block drafter, pre-quantized to 4-bit in
+`dflash/` (~1.1 GB resident), so one download gets the model and its
 [speculative decoder](#speculative-decoding--kernel-knobs) with nothing built on first run.
 
-[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
+[model]: https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX
+[q3]: https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX
+
+The rotation is folded into the weights, so the matching transform has to hit the
+activations at runtime and be inverted after the embedding lookup. mlx-lm's plain affine
+loader finds tensors of exactly the right shapes, skips it, and returns plausible garbage
+without raising; chad routes the pack on its declared `model_type` to its own loader
+(`prism_pack.py`), which does not import the Python the upstream pack bundles. The repo
+is chad's repack of [`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)
+(Apache-2.0; created using Bonsai by Prism ML): text-only (the pack's vision tower
+dropped), the base model's tokenizer in place of the pack's (same vocabulary, different
+merges: the pack's trips transformers' regex warning and diverges on combining marks),
+the chat template's `reasoning_effort` defaulting to medium rather than xhigh, and the
+drafter bundled. Pointing `--model` at the upstream pack directly also works: the loader,
+the fast-path and the verify kernel attach the same way, the drafter is borrowed from the
+shipped repo (`mlx_dflash.DONORS`), and the engine passes medium unless
+`CHAD_REASONING_EFFORT` says otherwise, since think-token decode is two thirds of wall on
+this model.
 
 **chad targets 24 GB Apple Silicon and nothing smaller.** There is no low-RAM fallback,
 because there is no second model to fall back to. On a smaller box chad prints a one-line
-warning at startup and runs anyway (it advises, it does not gate), but ~12 GB of weights
-plus the ~4.3 GB prefill transient leave almost nothing for a KV cache, so the window
-collapses toward its floor. Even at 24 GB the honest figure is roughly ~56k of the model's 262k
+warning at startup and runs anyway (it advises, it does not gate), but ~8 GB of weights and
+drafter plus the ~4.3 GB prefill transient leave little for a KV cache, so the window
+shrinks toward its floor. At 24 GB the honest figure is roughly ~150k of the model's 262k
 window; the banner states what you actually got, and the
 [context window](#context-window-agentic-coding-needs-room) section explains the sizing.
 
-Where the bits went, since a 3-bit model invites the question. On a dense model every
-parameter is on the critical path for every token, so there is no expert redundancy to
-absorb quantization error and no free lunch, but shrinking the weights is also the only
-decode lever available. The recipe follows what the calibrated GGUF builds of this same
-checkpoint agree on: `lm_head` is a second full 1.27B-param tensor (vocab 248,320,
-`tie_word_embeddings` false) and is where protection is worth buying, while `embed_tokens`
-is a lookup table whose per-row error never compounds through a matmul and is the cheapest
-tier to cut. Holding both high, as a uniform "sensitive tier" would, spends ~0.78 GB on the
-tier the evidence says needs it least. That is not an abstract saving: the governor divides
-free bytes by the measured 34,816 B/token, so a gigabyte of weights *is* about **29k tokens
-of context**, and the 0.78 GB in question is ~22k tokens, a third of what a 24 GB Mac gets
-to work in.
+**The 3-bit alternative.** [`nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX`][q3] is the
+same model at 3-bit group-64 with `lm_head` held at 5-bit (the bit map follows what the
+calibrated GGUF builds of this checkpoint agree on: the head is a second full 1.27B-param
+tensor worth protecting, the embedding a lookup table that is cheapest to cut), ~12.3 GB
+resident, the same drafter bundled, and ~56k of window on 24 GB. It is one flag away
+(`--model`), and it is the quality reference: on code, teacher-forced perplexity is 3.99
+against the ternary's 4.49 (+12%), while the private eval tiers tie at 56/56. Every projection's
+weights are on the critical path for every token on a dense model, so the governor's
+34,816 B/token prices a gigabyte of weights at about **29k tokens of context**; the 5 GB the
+ternary build gives back is where its window comes from, and its speed matches because the
+verify kernel and the drafter carry over.
 
 To run different weights through the same engine:
 
@@ -423,45 +443,23 @@ shipped checkpoint (the DFlash2 drafter, the fused-attention coverage, the fastp
 check, the measured per-token KV cost the governor sizes against) either declines to
 install or falls back to a stock path. The harness itself does not change.
 
-#### The ternary alternative: Prism's Hadamard-folded pack
+#### What the engine does with the ternary weights
 
-One other checkpoint runs with the whole stack attached rather than falling back:
-[`prism-ml/Ternary-Bonsai-2-27B-mlx-2bit`](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit),
-the same Qwen3.8-27B with every projection stored in a Hadamard-rotated basis and
-quantized to 2-bit affine g128 whose three levels are the ternary set {−s, 0, +s}.
-**7.15 GB of weights** against the shipped 12.33.
-
-```bash
-uv run chad --model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit
-```
-
-The rotation is folded into the weights offline, so the matching transform has to hit
-the activations at runtime; mlx-lm's plain affine loader would find weights of exactly the
-right shapes, skip it, and return plausible garbage without raising. chad routes the pack
-on its declared `model_type` to its own loader (`prism_pack.py`), which does not import
-the pack's bundled `runtime/` Python. What the rest of the stack does with it:
-
-- the decode fast-path fuses `gate|up`, `qkv|z` and (new for this pack) `q|k|v` behind
-  **one** rotation each, and folds the sign vectors into the RMSNorm weights and the
-  elementwise gates inside its compiled S=1 bodies, so a rotation costs one kernel;
+- the decode fast-path fuses `gate|up`, `qkv|z` and `q|k|v` behind **one** rotation each,
+  and folds the sign vectors into the RMSNorm weights and the elementwise gates inside its
+  compiled S=1 bodies, so a rotation costs one kernel; the uncompiled prefill path keeps the
+  pack's fp32 rotation. `CHAD_PRISM_ROT_FP32=1` runs the compiled bodies' rotation in fp32
+  too (an A/B arm; measured inside the noise);
 - the small-M verify kernel (`mlx_qmm_mma.py`) covers 2-bit g128, which is what makes an
-  8-wide DFlash2 verify cost ~2.2 serial steps here too (the stock 2-bit matmul made it
-  9×, and drafting was a net loss);
-- the pack bundles no drafter (and declares `mtp: false`), so `mlx_dflash` borrows the
-  shipped model's DFlash2 sidecar: a drafter reads the target's residual stream, which a
-  different quantization only perturbs (94% acceptance, same as on the 3-bit);
-- the pack's chat template is the shipped model's with `reasoning_effort` defaulting to
-  xhigh instead of medium; the engine passes medium unless `CHAD_REASONING_EFFORT` says
-  otherwise, since think-token decode is two thirds of wall on this model.
-
-Measured on the 24 GB M4 Pro, one load per process (`docs/benchmarks.md` has the table):
-greedy decode 21 tok/s serial and **64 tok/s drafted** (the shipped quant: 18 / ~60),
-5k prefill 99 tok/s, and the governor's window **~114k tokens** against ~56k on the
-shipped quant, because the 5.2 GB the weights give back is context at 34,816 B/token.
-Teacher-forced NLL on code is unchanged against the pack's own fp32-activation forward
-(1.502 vs 1.500). The tokenizer is the same vocab with different merges, identical on code,
-SQL, CJK and emoji and diverging only on combining marks. `CHAD_PRISM_ROT_FP32=1` runs the
-compiled bodies' rotation in fp32 like the uncompiled path does (an A/B arm).
+  8-wide DFlash2 verify cost ~2.2 serial steps here as on the 3-bit. mlx's stock 2-bit
+  matmul re-pays the weight read per row, made that verify 9× a decode step, and turned
+  drafting into a net loss (12 tok/s against 18 serial) until the kernel covered it;
+- the residual stream runs in bf16. As the upstream pack ships, its fp32 norms and fp16
+  scales promote every activation to fp32 from the first RMSNorm on; the loader casts the
+  side tensors once, as mlx-lm's own loader does, at no cost in NLL (1.502 vs 1.500);
+- the serial step is bounded by mlx's 2-bit GEMV rate rather than by dispatch, so the
+  fast-path's kernel-count win is smaller here than on the 3-bit (21 vs 18 tok/s); the
+  weights, the verify and the window are where the build pays.
 
 ### Smoke test (`chad prove`)
 
@@ -719,7 +717,7 @@ CHAD_PROTECT_GIT=1          uv run chad  # also write-DENY .git inside the yolo 
 - `CHAD_NO_FASTPATH`: disables the fused-projection + compiled decode step installed
   at load for the dense `qwen3_5` hybrid (`mlx_fastpath.py`): the MLP `gate|up` concat, the
   GDN `in_proj` concat, and the compiled S=1 layer step; on the
-  [Prism ternary pack](#the-ternary-alternative-prisms-hadamard-folded-pack) also the
+  [shipped ternary weights](#what-the-engine-does-with-the-ternary-weights) also the
   `q|k|v` concat and the one-rotation-per-fused-matmul bodies. It is a silent no-op on any
   other checkpoint, so an arbitrary `--model` neither gains nor loses anything here. Pure speed,
   no behavior change, so this is an A/B and bisection knob rather than something to run
@@ -781,14 +779,14 @@ CHAD_QMM_MMA_RECAL=1      uv run chad  # re-probe the small-M matmul kernel on t
   rejection sampling: every emitted token is the target's own choice and sampled output
   keeps the model's true distribution at any temperature (to kernel rounding; see the
   exactness note above: greedy runs follow serial until the first near-tie). Measured on an
-  M4 Pro with the shipped 3-bit quant, 10 prompts × 384-token decodes, medians: greedy
+  M4 Pro with the 3-bit quant, 10 prompts × 384-token decodes, medians: greedy
   serial 17.7 → **47.7 tok/s** (2.7×); at the thinking sampling preset (temp 1.0, top_p
   0.95, top_k 20) 22.4 → **41.4**; non-thinking 23.7 → 42-43; code 24 → 35-37. It engages
-  when the drafter ships with the loaded weights: the shipped model does; a checkpoint of
-  the same shape with no bundle borrows the shipped model's (`mlx_dflash.DONORS`, keyed on
-  hidden size, layer count and vocab, which is how the Prism ternary pack drafts); any
-  other `--model` decodes serially unless you point `CHAD_DFLASH_PATH` at a drafter built
-  for it.
+  when the drafter ships with the loaded weights: the shipped model and the 3-bit
+  alternative both bundle it; a checkpoint of the same shape with no bundle (the upstream
+  Prism pack) borrows the shipped model's (`mlx_dflash.DONORS`, keyed on hidden size, layer
+  count and vocab); any other `--model` decodes serially unless you point
+  `CHAD_DFLASH_PATH` at a drafter built for it.
 - `CHAD_DFLASH_DRAFT` / `CHAD_DFLASH_ADAPTIVE`: the verified width. The drafter always
   proposes its full block of 7; by default a per-round schedule (a cost model over the
   measured round costs and recent acceptance) picks how many of those proposals to verify,
