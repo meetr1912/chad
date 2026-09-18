@@ -85,7 +85,8 @@ if TYPE_CHECKING:  # mlx is imported lazily inside the functions so the module l
 M_MAX = 8            # one MMA tile
 N_MIN = 4096         # fewer output columns = too few threadgroups to fill the GPU
 _CACHE_DIR = os.path.expanduser("~/.cache/chad/qmm_mma")
-_SUPPORTED_BITS = (3, 4, 5, 6, 8)
+_SUPPORTED_BITS = (2, 3, 4, 5, 6, 8)
+_SUPPORTED_GROUPS = (64, 128)
 
 _SRC = r"""
     const int K = KD, N = ND, M = MD;
@@ -150,8 +151,11 @@ _SRC = r"""
             int n = n0 + t * 8 + fm;
             bool ok = n < N;
             int nn = ok ? n : 0;
-            float s  = (float)sc[(size_t)nn * (K / 64) + g];
-            float bb = (float)bi[(size_t)nn * (K / 64) + g];
+            // The K loop walks 64-value windows; a group of GS covers GS/64 of them,
+            // so the affine pair is indexed by the group this window falls in.
+            int gq = g / (GS / 64);
+            float s  = (float)sc[(size_t)nn * (K / GS) + gq];
+            float bb = (float)bi[(size_t)nn * (K / GS) + gq];
             const device uint* wr = w + (size_t)nn * (K * BITS / 32) + (size_t)g * GW;
             ulong win0, win1;
             if (WPH == 1) {
@@ -206,7 +210,7 @@ _SRC = r"""
 _SG = 8                  # simdgroups per threadgroup (split-K factor)
 _TILES = 4               # 8-column tiles per simdgroup
 _TG = 32 * _SG
-_KERNEL_VERSION = 4      # bump when the kernel changes: the probe cache is keyed on it
+_KERNEL_VERSION = 5      # bump when the kernel changes: the probe cache is keyed on it
 _kernels: dict = {}
 
 
@@ -224,26 +228,37 @@ def _kernel(bits: int):
     return k
 
 
-def mma(x, wq, sc, bi, M: int, N: int, K: int, bits: int):
-    """Raw kernel call: x is (M, K) bf16, M <= 8 (rows past M are zero in-kernel),
-    returns (M, N) bf16."""
+def mma(x, wq, sc, bi, M: int, N: int, K: int, bits: int, group_size: int = 64):
+    """Raw kernel call: x is (M, K), M <= 8 (rows past M are zero in-kernel), returns
+    (M, N) in x's dtype.
+
+    The MMA operands are bfloat16 by construction — the weight values are built as bf16
+    bit patterns — so a float16 activation is cast in and the result cast back. That
+    costs the activation 3 mantissa bits on the way into a matmul whose weights carry
+    2, which the calibration probe checks against the stock kernel like any other.
+    """
+    import mlx.core as mx
+    dtype = x.dtype
+    if dtype != mx.bfloat16:
+        x = x.astype(mx.bfloat16)
     cols = 8 * _TILES
     (out,) = _kernel(bits)(
         inputs=[x, wq, sc, bi],
-        template=[("KD", K), ("ND", N), ("MD", M), ("TILES", _TILES), ("SG", _SG)],
+        template=[("KD", K), ("ND", N), ("MD", M), ("TILES", _TILES), ("SG", _SG),
+                  ("GS", group_size)],
         output_shapes=[(M, N)], output_dtypes=[x.dtype],
         grid=(((N + cols - 1) // cols) * _TG, 1, 1), threadgroup=(_TG, 1, 1),
     )
-    return out
+    return out if out.dtype == dtype else out.astype(dtype)
 
 
 def shape_ok(K: int, N: int, bits: int, group_size: int) -> bool:
-    return (bits in _SUPPORTED_BITS and group_size == 64 and N >= N_MIN
-            and K % 512 == 0)
+    return (bits in _SUPPORTED_BITS and group_size in _SUPPORTED_GROUPS
+            and N >= N_MIN and K % 512 == 0)
 
 
-# Verified dispatch table: (K, N, bits) -> smallest M the kernel wins at (M_MAX
-# bounds the top). Empty until calibrate() runs; a missing shape runs stock.
+# Verified dispatch table: (K, N, bits, group_size) -> smallest M the kernel wins at
+# (M_MAX bounds the top). Empty until calibrate() runs; a missing shape runs stock.
 _WINS: dict = {}
 
 
@@ -252,16 +267,16 @@ def qmm(x, wq, sc, bi, group_size: int, bits: int):
     group_size=group_size, bits=bits)`` that takes the MMA kernel on verified
     (shape, width) pairs and the stock kernel everywhere else."""
     import mlx.core as mx
-    if _WINS and x.dtype == mx.bfloat16:
+    if _WINS and x.dtype in (mx.bfloat16, mx.float16):
         K = x.shape[-1]
         N = wq.shape[0]
-        m_min = _WINS.get((K, N, bits))
+        m_min = _WINS.get((K, N, bits, group_size))
         if m_min is not None:
             M = 1
             for d in x.shape[:-1]:
                 M *= d
             if m_min <= M <= M_MAX:
-                return mma(x.reshape(M, K), wq, sc, bi, M, N, K, bits
+                return mma(x.reshape(M, K), wq, sc, bi, M, N, K, bits, group_size
                            ).reshape(*x.shape[:-1], N)
     return mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
                                group_size=group_size, bits=bits)
@@ -321,9 +336,12 @@ def _time_chain(step, x0) -> float:
 
 
 def _eligible_groups(*models) -> dict:
-    """(K, N, bits) -> [(wq, sc, bi), ...] for every eligible QuantizedLinear AND
-    every fused weight the fastpath stacked (they are plain arrays, not modules)."""
+    """(K, N, bits, group_size) -> [(wq, sc, bi), ...] for every eligible
+    QuantizedLinear, every Hadamard-rotated Packed projection, and every fused weight
+    the fastpath stacked (they are plain arrays, not modules)."""
     import mlx.nn as nn
+
+    from .mlx_prism import Packed
     groups: dict = {}
 
     def add(wq, sc, bi, gs, bits):
@@ -333,7 +351,7 @@ def _eligible_groups(*models) -> dict:
         N = int(wq.shape[0])
         K = int(wq.shape[1]) * 32 // bits
         if shape_ok(K, N, bits, gs):
-            groups.setdefault((K, N, bits), []).append((wq, sc, bi))
+            groups.setdefault((K, N, bits, gs), []).append((wq, sc, bi))
 
     for model in models:
         if model is None:
@@ -342,6 +360,8 @@ def _eligible_groups(*models) -> dict:
             if (isinstance(mod, nn.QuantizedLinear)
                     and mod.mode == "affine"
                     and "biases" in mod):
+                add(mod["weight"], mod["scales"], mod["biases"], mod.group_size, mod.bits)
+            elif isinstance(mod, Packed) and not mod.embedding:
                 add(mod["weight"], mod["scales"], mod["biases"], mod.group_size, mod.bits)
             if hasattr(mod, "_fused_w"):
                 add(mod._fused_w, mod._fused_s, mod._fused_b, mod._fused_gs,
@@ -372,14 +392,17 @@ def measure(groups: dict, verbose: bool = False) -> dict:
     shape that never wins is absent)."""
     import mlx.core as mx
     wins: dict = {}
-    for (K, N, bits), ws in groups.items():
+    for (K, N, bits, gs), ws in groups.items():
         wq, sc, bi = ws[0]
+        # Probe in the dtype the model will actually feed: a float16 pack goes through
+        # the kernel's cast, and its numerics have to clear the tolerance on that path.
+        dt = sc.dtype if sc.dtype in (mx.bfloat16, mx.float16) else mx.bfloat16
         ok = True
         for M in range(2, M_MAX + 1):
-            x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+            x = (mx.random.normal((M, K)) * 0.1).astype(dt)
             ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
-                                      group_size=64, bits=bits).astype(mx.float32)
-            got = mma(x, wq, sc, bi, M, N, K, bits).astype(mx.float32)
+                                      group_size=gs, bits=bits).astype(mx.float32)
+            got = mma(x, wq, sc, bi, M, N, K, bits, gs).astype(mx.float32)
             diff = mx.max(mx.abs(ref - got))
             scale = mx.max(mx.abs(ref))
             mx.eval(diff, scale)
@@ -389,21 +412,21 @@ def measure(groups: dict, verbose: bool = False) -> dict:
                 ok = False
                 break
         if not ok:
-            log.warning("qmm_mma: %dx%d b%d rejected (numerics)", K, N, bits)
+            log.warning("qmm_mma: %dx%d b%d g%d rejected (numerics)", K, N, bits, gs)
             continue
         ratios = {}
         for M in range(2, M_MAX + 1):
-            x = (mx.random.normal((M, K)) * 0.1).astype(mx.bfloat16)
+            x = (mx.random.normal((M, K)) * 0.1).astype(dt)
             mx.eval(x)
 
-            def q_step(xx, t, _ws=ws, _b=bits):
+            def q_step(xx, t, _ws=ws, _b=bits, _g=gs):
                 w = _ws[t % len(_ws)]
                 return mx.quantized_matmul(xx, w[0], scales=w[1], biases=w[2],
-                                           transpose=True, group_size=64, bits=_b)
+                                           transpose=True, group_size=_g, bits=_b)
 
-            def k_step(xx, t, _ws=ws, _M=M, _N=N, _K=K, _b=bits):
+            def k_step(xx, t, _ws=ws, _M=M, _N=N, _K=K, _b=bits, _g=gs):
                 w = _ws[t % len(_ws)]
-                return mma(xx, w[0], w[1], w[2], _M, _N, _K, _b)
+                return mma(xx, w[0], w[1], w[2], _M, _N, _K, _b, _g)
 
             tq = min(_time_chain(q_step, x), _time_chain(q_step, x))
             tk = min(_time_chain(k_step, x), _time_chain(k_step, x))
@@ -413,13 +436,18 @@ def measure(groups: dict, verbose: bool = False) -> dict:
                      None)
         msg = " ".join(f"M{M}={r:.2f}x" for M, r in ratios.items())
         if first is not None:
-            wins[(K, N, bits)] = first
-        log.info("qmm_mma: %dx%d b%d %s -> %s", K, N, bits, msg,
+            wins[(K, N, bits, gs)] = first
+        log.info("qmm_mma: %dx%d b%d g%d %s -> %s", K, N, bits, gs, msg,
                  f"on from M={first}" if first else "off")
         if verbose:
-            print(f"  qmm_mma {K}x{N} b{bits}: {msg} -> "
+            print(f"  qmm_mma {K}x{N} b{bits}g{gs}: {msg} -> "
                   f"{'on from M=%d' % first if first else 'off'}", flush=True)
     return wins
+
+
+def _ckey(k) -> str:
+    """Probe-cache key for a (K, N, bits, group_size) shape."""
+    return "%dx%db%dg%d" % k
 
 
 def calibrate(*models, verbose: bool = False) -> dict:
@@ -429,7 +457,7 @@ def calibrate(*models, verbose: bool = False) -> dict:
     groups = _eligible_groups(*models)
     if not groups:
         return {}
-    keys = sorted(f"{K}x{N}b{b}" for (K, N, b) in groups)
+    keys = sorted(f"{K}x{N}b{b}g{g}" for (K, N, b, g) in groups)
     os.makedirs(_CACHE_DIR, exist_ok=True)
     path = os.path.join(_CACHE_DIR, _cache_key() + ".json")
     cached: dict = {}
@@ -439,27 +467,28 @@ def calibrate(*models, verbose: bool = False) -> dict:
                 cached = json.load(f)
         except Exception:  # noqa: BLE001
             cached = {}
-    missing = {k: v for k, v in groups.items() if f"{k[0]}x{k[1]}b{k[2]}" not in cached}
+    missing = {k: v for k, v in groups.items() if _ckey(k) not in cached}
     if missing:
         t0 = time.time()
         fresh = measure(missing, verbose=verbose)
         for k in missing:
-            cached[f"{k[0]}x{k[1]}b{k[2]}"] = fresh.get(k, 0)
+            cached[_ckey(k)] = fresh.get(k, 0)
         try:
             with open(path, "w") as f:
                 json.dump(cached, f, indent=1, sort_keys=True)
         except Exception:  # noqa: BLE001
             pass
         log.info("qmm_mma: probed %d shape(s) in %.1fs", len(missing), time.time() - t0)
-    wins = {k: int(cached[f"{k[0]}x{k[1]}b{k[2]}"]) for k in groups
-            if int(cached.get(f"{k[0]}x{k[1]}b{k[2]}", 0) or 0) > 0}
+    wins = {k: int(cached[_ckey(k)]) for k in groups
+            if int(cached.get(_ckey(k), 0) or 0) > 0}
     _WINS.clear()
     _WINS.update(wins)
     if wins:
         _install_patch()
         log.info("qmm_mma: small-M MMA verify kernel on for %d/%d shapes (%s)",
                  len(wins), len(keys),
-                 ", ".join(f"{K}x{N}b{b}@M>={m}" for (K, N, b), m in sorted(wins.items())))
+                 ", ".join(f"{K}x{N}b{b}g{g}@M>={m}"
+                           for (K, N, b, g), m in sorted(wins.items())))
     return wins
 
 

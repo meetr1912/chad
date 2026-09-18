@@ -31,6 +31,11 @@ import mlx.nn as nn
 
 MODEL_TYPE = "prism_hadamard_qwen35"
 _BLOCKS = (512, 1024, 2048, 4096)
+# The pack's own dtype. bfloat16 was measured here for the sake of mlx_qmm_mma's MMA
+# kernel, which takes bfloat16 operands: the quantized matmuls are indifferent to the
+# choice, but the rest of the step is not, and the model decoded at 10.8 tok/s against
+# float16's 24.4. The MMA path casts at its own call site instead.
+_COMPUTE_DTYPE = mx.float16
 
 
 def is_prism_pack(config: dict) -> bool:
@@ -61,9 +66,15 @@ def fwht(x, block, signs, inverse=False):
 class Packed(nn.Module):
     """A rotated affine 2-bit projection (or embedding), transform included."""
 
+    group_size = 128
+    bits = 2
+
     def __init__(self, arrays, block=0, signs=None, embedding=False, dtype=mx.float16):
         super().__init__()
         self.weight, self.scales, self.biases = [mx.array(a) for a in arrays]
+        if self.scales.dtype != dtype:
+            self.scales = self.scales.astype(dtype)
+            self.biases = self.biases.astype(dtype)
         if signs is not None:
             self.signs = mx.array(signs)
         self.block, self.embedding, self.dtype = block, embedding, dtype
@@ -78,8 +89,8 @@ class Packed(nn.Module):
                     self.weight[indices],
                     self.scales[indices],
                     self.biases[indices],
-                    group_size=128,
-                    bits=2,
+                    group_size=self.group_size,
+                    bits=self.bits,
                 )
                 .reshape(*shape, -1)
                 .astype(self.dtype)
@@ -87,9 +98,12 @@ class Packed(nn.Module):
             return fwht(out, self.block, signs, inverse=True) if self.block else out
         if self.block:
             x = fwht(x, self.block, signs)
-        return mx.quantized_matmul(
-            x, self.weight, self.scales, self.biases,
-            transpose=True, group_size=128, bits=2,
+        # mlx_qmm_mma.qmm is mx.quantized_matmul plus the small-M MMA kernel on the
+        # shapes and widths where it was measured to win — which is the speculative
+        # verify band, where the stock kernel re-reads the weights once per row.
+        from . import mlx_qmm_mma
+        return mlx_qmm_mma.qmm(
+            x, self.weight, self.scales, self.biases, self.group_size, self.bits
         )
 
 
@@ -119,6 +133,37 @@ def _validate(original, record, arrays, signs) -> None:
             raise ValueError("Invalid sign values")
     elif signs is not None:
         raise ValueError("Unexpected sign vector")
+
+
+# Parameters that stay float32 after the compute-dtype cast. The recurrence's decay
+# terms are float32 by the checkpoint's own `mamba_ssm_dtype`, and the sign vectors are
+# consumed inside fwht's float32 region, where a float16 copy would only be upcast again.
+_KEEP_F32 = ("A_log", "dt_bias", "signs")
+
+
+def _cast_compute_dtype(model: nn.Module, dtype=_COMPUTE_DTYPE) -> int:
+    """Put the unquantized parameters in the pack's compute dtype.
+
+    The pack stores its norms, convolutions and the two small GDN input projections as
+    float32 while its affine parameters are float16. Left alone, the first rms_norm
+    promotes the activation to float32 and every op downstream of it — including the
+    quantized matmuls — runs wide for the rest of the model. Costs 34% of a decode step
+    and 2.6x of an S=8 verify forward, which is most of what makes speculative decoding
+    not pay on this pack.
+    """
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    # tree_flatten's stub widens to str; a parameter tree always flattens to pairs.
+    flat = cast(list[tuple[str, mx.array]], tree_flatten(model.parameters()))
+    updates = [
+        (k, v.astype(dtype))
+        for k, v in flat
+        if v.dtype == mx.float32 and k.split(".")[-1] not in _KEEP_F32
+    ]
+    if updates:
+        model.update(tree_unflatten(updates))
+        mx.eval(model.parameters())
+    return len(updates)
 
 
 def load(
@@ -182,7 +227,7 @@ def load(
                 block if rotate else 0,
                 signs if rotate else None,
                 record["embedding"],
-                mx.float16,
+                _COMPUTE_DTYPE,
             ),
         )
 
@@ -193,6 +238,7 @@ def load(
         if rotate or not k.endswith(".signs")
     ]
     model.load_weights(items, strict=True)
+    _cast_compute_dtype(model)
     model.eval()
     mx.eval(model.parameters())
     info = {

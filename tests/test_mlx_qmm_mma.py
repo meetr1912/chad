@@ -25,7 +25,7 @@ def _weights(bits, seed=0):
     return wq, sc, bi
 
 
-@pytest.mark.parametrize("bits", [3, 4, 5, 6, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 def test_matches_stock_kernel_at_every_width(bits):
     wq, sc, bi = _weights(bits)
     for M in range(1, q.M_MAX + 1):
@@ -56,7 +56,7 @@ def test_partial_last_tile_is_guarded():
 
 def test_qmm_dispatch_gate():
     wq, sc, bi = _weights(4)
-    q.set_wins({(K, N, 4): 3})
+    q.set_wins({(K, N, 4, 64): 3})
     try:
         for M, expect_kernel in ((1, False), (2, False), (3, True), (8, True), (9, False)):
             x = (mx.random.normal((1, M, K)) * 0.1).astype(mx.bfloat16)
@@ -68,11 +68,15 @@ def test_qmm_dispatch_gate():
             # stock path is bit-identical to itself; the kernel is only ulp-close
             if not expect_kernel:
                 assert same == 0.0, (M, same)
-        # an unverified shape / fp16 input always take stock
+        # float16 routes too (the kernel casts at its own boundary), so it is only
+        # ulp-close; an unverified shape still takes stock exactly.
         x16 = (mx.random.normal((8, K)) * 0.1).astype(mx.float16)
         ref16 = mx.quantized_matmul(x16, wq, scales=sc, biases=bi, transpose=True,
-                                    group_size=64, bits=4)
-        assert float(mx.max(mx.abs(q.qmm(x16, wq, sc, bi, 64, 4) - ref16))) == 0.0
+                                    group_size=64, bits=4).astype(mx.float32)
+        got16 = q.qmm(x16, wq, sc, bi, 64, 4).astype(mx.float32)
+        assert got16.dtype == mx.float32 and got16.shape == ref16.shape
+        rel16 = float(mx.max(mx.abs(ref16 - got16))) / float(mx.max(mx.abs(ref16)))
+        assert rel16 < 0.02, rel16
     finally:
         q.disable()
 
@@ -85,7 +89,7 @@ def test_quantized_linear_patch_routes_only_verified_shapes():
                                 biases=lin["biases"], transpose=True,
                                 group_size=64, bits=4)
     stock2 = lin2(x)
-    q.set_wins({(K, N, 4): 2})
+    q.set_wins({(K, N, 4, 64): 2})
     try:
         y = lin(x)
         assert y.shape == stock.shape
@@ -103,8 +107,10 @@ def test_shape_gate():
     assert q.shape_ok(5120, 248320, 5, 64)
     assert not q.shape_ok(5120, 1024, 4, 64)      # too few columns
     assert not q.shape_ok(5000, 17408, 4, 64)     # K not a multiple of 512
-    assert not q.shape_ok(5120, 17408, 4, 128)    # group size
-    assert not q.shape_ok(5120, 17408, 2, 64)     # unsupported width
+    assert q.shape_ok(5120, 17408, 4, 128)        # group 128 indexes the same windows
+    assert not q.shape_ok(5120, 17408, 4, 32)     # group size
+    assert q.shape_ok(5120, 17408, 2, 64)         # ternary packs
+    assert not q.shape_ok(5120, 17408, 7, 64)     # unsupported width
 
 
 def test_eligible_groups_skips_fastpath_placeholders():
@@ -124,9 +130,9 @@ def test_eligible_groups_skips_fastpath_placeholders():
             self._fused_gs, self._fused_bits = 64, 4
 
     groups = q._eligible_groups(_Fused())
-    assert list(groups) == [(K, N, 4)] and len(groups[(K, N, 4)]) == 1
+    assert list(groups) == [(K, N, 4, 64)] and len(groups[(K, N, 4, 64)]) == 1
     # a placeholder module must also never be routed by the class patch
-    q.set_wins({(K, N, 4): 2})
+    q.set_wins({(K, N, 4, 64): 2})
     try:
         m = _Fused()
         x = (mx.random.normal((1, 8, K)) * 0.1).astype(mx.bfloat16)
@@ -134,3 +140,23 @@ def test_eligible_groups_skips_fastpath_placeholders():
             m.lin(x)          # stock path on garbage weights raises; the patch fell through
     finally:
         q.disable()
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_group128_matches_stock(dtype):
+    """Ternary packs are group-128. The kernel still walks the weights in 64-value
+    windows and just indexes the affine pair by the group a window falls in, so a
+    group-128 shape has to reconstruct exactly as group-64 does — in either
+    activation dtype, since float16 rides through the kernel's own cast."""
+    bits = 2
+    mx.random.seed(3)
+    w = (mx.random.normal((N, K)) * 0.02).astype(dtype)
+    wq, sc, bi = mx.quantize(w, group_size=128, bits=bits)
+    mx.eval(wq, sc, bi)
+    for M in (2, 5, 8):
+        x = (mx.random.normal((M, K)) * 0.1).astype(dtype)
+        ref = mx.quantized_matmul(x, wq, scales=sc, biases=bi, transpose=True,
+                                  group_size=128, bits=bits).astype(mx.float32)
+        got = q.mma(x, wq, sc, bi, M, N, K, bits, 128).astype(mx.float32)
+        rel = float(mx.max(mx.abs(ref - got))) / max(float(mx.max(mx.abs(ref))), 1e-6)
+        assert rel < 0.02, (dtype, M, rel)
