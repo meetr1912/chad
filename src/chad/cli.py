@@ -55,7 +55,15 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_HERE))
 # of this same checkpoint are unanimous that it is the tier worth protecting while
 # embed_tokens — a lookup table, whose per-row error never compounds through a matmul
 # — is the cheapest. ~12.1 GB resident.
-_HF_MODEL = "nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX"
+#
+# Superseded here by the ternary Bonsai-2 repack of the same checkpoint: 7.15 GB of
+# weights against ~12.1, which buys back enough of the Metal budget to raise the
+# compaction threshold from ~118k to ~163k tokens on this machine. Its projections are
+# stored Hadamard-rotated, so it loads through mlx_prism.py rather than mlx_lm — and
+# the decode fast-path in mlx_fastpath.py does not cover the rotated modules, so this
+# trades some decode speed for the larger window. For the stock path, set CHAD_MODEL to
+# nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX, which the paragraph above describes.
+_HF_MODEL = "nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX"
 # A dev clone that already built the weights locally should use them rather than
 # re-download — prefer this dir when present.
 _LOCAL_MODEL = os.path.join(_PROJECT_ROOT, "models", "Qwen3.8-27B-q3_e3h5")

@@ -662,10 +662,21 @@ class Engine:
         does, including the tokenizer's stop ids from the model config (which folds in
         generation_config.json; the override never touches them)."""
         model_path = _download(path)
-        eos = load_config(model_path).get("eos_token_id")
+        cfg = load_config(model_path)
+        eos = cfg.get("eos_token_id")
         self.tok = load_tokenizer(model_path, eos_token_ids=eos)
         override, self.effective_ctx = self._ctx_override(path)
-        self.model, _ = load_model(model_path, model_config=override)
+        from . import mlx_prism
+        if mlx_prism.is_prism_pack(cfg):
+            # Hadamard-rotated pack: mlx_lm has no loader for it, and the shapes are
+            # exactly those of an ordinary affine checkpoint, so the generic path would
+            # load it without complaint and decode garbage. The override targets the
+            # text model, which is where this family keeps its rope settings.
+            if override:
+                cfg = {**cfg, "text_config": {**cfg["text_config"], **override}}
+            self.model, _ = mlx_prism.load(model_path, config=cfg)
+        else:
+            self.model, _ = load_model(model_path, model_config=override)
 
     def _read_model_shape(self, path: str) -> None:
         """Capture the config facts the adaptive prefill chunk needs:
