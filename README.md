@@ -182,6 +182,15 @@ chad ships one by default, downloaded once into the shared Hugging Face cache
 |---|---|---|
 | [Qwen3.8-27B `Ternary-Bonsai-2-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-Ternary-Bonsai-2-DFlash2-MLX) | ternary 2-bit group-128 in a Hadamard-rotated basis, bundled 4-bit DFlash2 drafter | ~8 GB resident, 262k native context |
 | [Qwen3.8-27B `UD-Q3_K_XL-DFlash2`](https://huggingface.co/nathansutton/Qwen3.8-27B-UD-Q3_K_XL-DFlash2-MLX) (`CHAD_MODEL`) | 3-bit group-64 body, 5-bit `lm_head`, bundled 4-bit DFlash2 drafter | ~13 GB resident, 262k native context |
+| [`Ternary-Bonsai-8B`](https://huggingface.co/prism-ml/Ternary-Bonsai-8B-mlx-2bit) (`CHAD_MODEL`) | ternary 2-bit group-128, unrotated, no drafter | ~2.5 GB resident |
+
+The 8B is the speed option and needs no loader work — it is ordinary `qwen3`, which stock
+mlx-lm reads, and the 2-bit MMA kernel this fork added covers it. Measured on the same
+prompt and machine as the 27B: 338 tok/s prefill against 95, and 53.6 tok/s decode against
+17.5. It is also visibly weaker at the job. On the same one-line fix the 27B edited and
+verified first time, the 8B first ran the test twice without editing anything, and on a
+retry made the correct edit but claimed verification it never ran. Reach for it when you
+want throughput and are reading every diff anyway.
 
 Qwen3.8-27B is **dense** (64 layers: 48 GatedDeltaNet + 16 full attention), so every
 parameter is on the critical path for every token and the quant is where decode speed comes
