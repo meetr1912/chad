@@ -624,7 +624,11 @@ class Engine:
         # dense qwen3_5 hybrid; silent no-op on any other model or on failure.
         from . import mlx_fastpath
         _log_mlx_provenance()
-        mlx_fastpath.install(self.model, model_path=path)
+        if not mlx_fastpath.install(self.model, model_path=path):
+            # A rotated pack has no concatenable projections, so the fused decode path
+            # cannot install — but speculative rollback still needs the GDN checkpoint
+            # capture, without which every rejection pays a full re-feed forward.
+            mlx_fastpath.install_gdn_capture(self.model)
         # Fused quantized-KV decode attention: makes kv_bits=8 a speed win
         # instead of a loss. Patches mlx_lm's quantized SDPA branch
         # only; inert unless a QuantizedKVCache is actually in play.

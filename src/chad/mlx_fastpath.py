@@ -72,6 +72,29 @@ def install(model: "nn.Module", model_path: Optional[str] = None) -> bool:
         return False
 
 
+def install_gdn_capture(model: "nn.Module") -> bool:
+    """Install only the GDN checkpoint capture, for a model the fused path skipped.
+
+    Returns True if this model has GatedDeltaNet layers the patch can serve. The patch
+    is a class method, so it is installed once globally and stays inert on any instance
+    that has neither fused weights nor an armed collector.
+    """
+    if config.flag("CHAD_NO_FASTPATH"):
+        return False
+    try:
+        from mlx_lm.models import qwen3_5 as q35
+        layers = model.language_model.model.layers
+        if not any(isinstance(getattr(l, "linear_attn", None), q35.GatedDeltaNet)
+                   for l in layers):
+            return False
+        _patch_gdn_call()
+        log.info("GDN checkpoint capture installed (no fused decode path)")
+        return True
+    except Exception as e:  # noqa: BLE001 — a speed path must never break loading
+        log.warning("gdn capture install failed (%s); rollback will re-feed", e)
+        return False
+
+
 def _looks_like_hybrid_dense(model) -> bool:
     """True only for the qwen3_5 DENSE hybrid (Qwen3.8-27B class): per-layer
     [GDN|attention] + a plain quantized swiglu MLP, no experts anywhere."""
@@ -212,7 +235,14 @@ GDN_COLLECTOR = None
 
 def _patch_gdn_call() -> None:
     """Stock-graph GDN forward using the fused in_proj (used for S>1; the S==1
-    decode path is replaced again by the compiled step in _install_layer_fastpath)."""
+    decode path is replaced again by the compiled step in _install_layer_fastpath).
+
+    Also installed on its own, without any fused weights, for a model whose
+    projections this module cannot concatenate — a Hadamard-rotated pack, where each
+    projection carries its own transform. Fusing four matmuls into one is then off the
+    table, but the checkpoint capture below is not, and that is what a rejection costs
+    an entire extra forward without.
+    """
     global _gdn_call
     import mlx.core as mx
     import mlx.nn as nn
@@ -223,14 +253,20 @@ def _patch_gdn_call() -> None:
     stock_call = q35.GatedDeltaNet.__call__
 
     def call(self, inputs, mask=None, cache=None):
-        if not hasattr(self, "_fused_w"):
+        fused = hasattr(self, "_fused_w")
+        if not fused and GDN_COLLECTOR is None:
+            # Nothing to fuse and nothing to capture: stock is the cheaper graph.
             return stock_call(self, inputs, mask=mask, cache=cache)
         B, S, _ = inputs.shape
-        big = mlx_qmm_mma.qmm(inputs, self._fused_w, self._fused_s, self._fused_b,
-                              self._fused_gs, self._fused_bits)
-        qkv, z, b, a = mx.split(
-            big, [self.conv_dim, self.conv_dim + self.value_dim,
-                  self.conv_dim + self.value_dim + self.num_v_heads], axis=-1)
+        if fused:
+            big = mlx_qmm_mma.qmm(inputs, self._fused_w, self._fused_s, self._fused_b,
+                                  self._fused_gs, self._fused_bits)
+            qkv, z, b, a = mx.split(
+                big, [self.conv_dim, self.conv_dim + self.value_dim,
+                      self.conv_dim + self.value_dim + self.num_v_heads], axis=-1)
+        else:
+            qkv, z = self.in_proj_qkv(inputs), self.in_proj_z(inputs)
+            b, a = self.in_proj_b(inputs), self.in_proj_a(inputs)
         z = z.reshape(B, S, self.num_v_heads, self.head_v_dim)
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
